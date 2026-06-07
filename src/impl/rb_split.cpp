@@ -1,7 +1,7 @@
 // RabbitBin module: rb_split.cpp
 
 static void marker_guided_split(BinMap &cls) {
-  if (seedMarkerFile.empty()) return;
+  if (marker_seed_file.empty()) return;
 
   // contig name -> unified index (large: i; small: j + nobs)
   std::unordered_map<std::string, size_t> name2idx;
@@ -15,9 +15,9 @@ static void marker_guided_split(BinMap &cls) {
   for (size_t i = 0; i < nobs; ++i)  add_name(contig_names[i], i);
   for (size_t j = 0; j < nobs1; ++j) add_name(small_contig_names[j], j + nobs);
 
-  std::ifstream fin(seedMarkerFile);
+  std::ifstream fin(marker_seed_file);
   if (!fin) {
-    cerr << "[Warn] cannot open --seedMarkers file: " << seedMarkerFile
+    cerr << "[Warn] cannot open --marker-seed file: " << marker_seed_file
          << " (skipping marker-guided split)\n";
     return;
   }
@@ -41,24 +41,24 @@ static void marker_guided_split(BinMap &cls) {
     }
     if (any) ++marker_id;
   }
-  if (marker_id == 0 || nABD < 1) {
+  if (marker_id == 0 || num_depth_samples < 1) {
     verbose_message("Marker-guided split: no usable markers (%d) — skipped\n",
                     marker_id);
     return;
   }
 
-  // Both ABD and small_ABD are rank-transformed in place during the pipeline,
+  // Both depth_matrix and small_depth_matrix are rank-transformed in place during the pipeline,
   // so read the raw-mean snapshots taken before those transforms.
-  auto abd_at = [&](size_t c, size_t i) -> double {
+  auto depth_at = [&](size_t c, size_t i) -> double {
     if (c < nobs) {
-      if (!g_large_means.empty() && c * (size_t)nABD + i < g_large_means.size())
-        return (double)g_large_means[c * nABD + i];
-      return (double)ABD(c, i);
+      if (!g_large_means.empty() && c * (size_t)num_depth_samples + i < g_large_means.size())
+        return (double)g_large_means[c * num_depth_samples + i];
+      return (double)depth_matrix(c, i);
     }
     size_t s = c - nobs;
-    if (!g_small_means.empty() && s * (size_t)nABD + i < g_small_means.size())
-      return (double)g_small_means[s * nABD + i];
-    return (double)small_ABD(s, i);
+    if (!g_small_means.empty() && s * (size_t)num_depth_samples + i < g_small_means.size())
+      return (double)g_small_means[s * num_depth_samples + i];
+    return (double)small_depth_matrix(s, i);
   };
 
   auto bin_bp = [&](const ContigVector &contigs) -> size_t {
@@ -74,9 +74,8 @@ static void marker_guided_split(BinMap &cls) {
   size_t n_split = 0, n_kept = 0, n_drop = 0;
   for (auto &kv : cls) {
     const ContigVector &contigs = kv.second;
-    // Size gate: only refine bins that would pass the minClsSize output filter
-    // (mirrors evaluating split products on top of standard MetaBAT2 output).
-    if (bin_bp(contigs) < minClsSize) { ++n_drop; continue; }
+    // Size gate: only refine bins that would pass the min_bin_bp output filter.
+    if (bin_bp(contigs) < min_bin_bp) { ++n_drop; continue; }
     // marker multiplicity within this bin
     std::unordered_map<int, int> mc;
     int mult = 1;
@@ -90,11 +89,11 @@ static void marker_guided_split(BinMap &cls) {
     }
     int k = std::min((int)contigs.size(), std::min(mult, splitMaxK));
     const size_t n = contigs.size();
-    std::vector<std::vector<float>> X(n, std::vector<float>(nABD));
+    std::vector<std::vector<float>> X(n, std::vector<float>(num_depth_samples));
     for (size_t r = 0; r < n; ++r)
-      for (size_t i = 0; i < nABD; ++i)
-        X[r][i] = (float)std::log(abd_at(contigs[r], i) + 1.0);
-    std::vector<int> labels = fkmv_kmeans(X, k, rng);
+      for (size_t i = 0; i < num_depth_samples; ++i)
+        X[r][i] = (float)std::log(depth_at(contigs[r], i) + 1.0);
+    std::vector<int> labels = rb_kmeans(X, k, rng);
     std::vector<ContigVector> sub(k);
     for (size_t r = 0; r < n; ++r) sub[labels[r]].push_back(contigs[r]);
     for (int t = 0; t < k; ++t)
@@ -103,15 +102,15 @@ static void marker_guided_split(BinMap &cls) {
   }
   cls.swap(out);
   verbose_message("Marker-guided split: %d markers (%zu hits), %zu kept, "
-                  "%zu split, %zu dropped(<minClsSize) -> %d bins\n",
+                  "%zu split, %zu dropped(<min_bin_bp) -> %d bins\n",
                   marker_id, hits, n_kept, n_split, n_drop, next);
-  // Split products may be < minClsSize; they are legitimate genome bins, so
+  // Split products may be < min_bin_bp; they are legitimate genome bins, so
   // disable the size filter in output_bins (the base bins were already gated).
-  minClsSize = 0;
+  min_bin_bp = 0;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Marker-FREE bin splitting (Phase 2; --abdSplit) — abundance multimodality
+// Marker-FREE bin splitting (Phase 2; --split-bins) — abundance multimodality
 // ═══════════════════════════════════════════════════════════════════════════
 // Mean silhouette of a labeling over feature rows X (Euclidean).  O(n^2 d); for
 // large bins we sample up to g_sil_sample_cap rows so this stays cheap.
@@ -169,20 +168,20 @@ static double fkmv_silhouette(const std::vector<std::vector<float>> &X,
 // Re-split internally multi-modal bins using per-sample log-abundance KMeans,
 // choosing k by silhouette.  No markers / gene prediction needed.
 static void abundance_guided_split(BinMap &cls) {
-  if (nABD < 1) {
+  if (num_depth_samples < 1) {
     verbose_message("Abundance split: needs >=1 abundance sample — skipped\n");
     return;
   }
-  auto abd_at = [&](size_t c, size_t i) -> double {
+  auto depth_at = [&](size_t c, size_t i) -> double {
     if (c < nobs) {
-      if (!g_large_means.empty() && c * (size_t)nABD + i < g_large_means.size())
-        return (double)g_large_means[c * nABD + i];
-      return (double)ABD(c, i);
+      if (!g_large_means.empty() && c * (size_t)num_depth_samples + i < g_large_means.size())
+        return (double)g_large_means[c * num_depth_samples + i];
+      return (double)depth_matrix(c, i);
     }
     size_t s = c - nobs;
-    if (!g_small_means.empty() && s * (size_t)nABD + i < g_small_means.size())
-      return (double)g_small_means[s * nABD + i];
-    return (double)small_ABD(s, i);
+    if (!g_small_means.empty() && s * (size_t)num_depth_samples + i < g_small_means.size())
+      return (double)g_small_means[s * num_depth_samples + i];
+    return (double)small_depth_matrix(s, i);
   };
   auto bin_bp = [&](const ContigVector &contigs) -> size_t {
     size_t bp = 0;
@@ -201,7 +200,7 @@ static void abundance_guided_split(BinMap &cls) {
   for (auto &kv : cls) binList.push_back(&kv.second);
   const size_t nbins = binList.size();
 
-  // kind: 0 = dropped (<minClsSize), 1 = kept whole, 2 = split into emit[]
+  // kind: 0 = dropped (<min_bin_bp), 1 = kept whole, 2 = split into emit[]
   struct BinResult { std::vector<ContigVector> emit; int kind = 1; };
   std::vector<BinResult> results(nbins);
 
@@ -210,14 +209,14 @@ static void abundance_guided_split(BinMap &cls) {
     const ContigVector &contigs = *binList[bi];
     BinResult &res = results[bi];
 
-    if (bin_bp(contigs) < minClsSize) { res.kind = 0; continue; }
+    if (bin_bp(contigs) < min_bin_bp) { res.kind = 0; continue; }
     const size_t n = contigs.size();
     if ((int)n < splitMinContigs) { res.kind = 1; res.emit.push_back(contigs); continue; }
 
-    std::vector<std::vector<float>> X(n, std::vector<float>(nABD));
+    std::vector<std::vector<float>> X(n, std::vector<float>(num_depth_samples));
     for (size_t r = 0; r < n; ++r)
-      for (size_t i = 0; i < (size_t)nABD; ++i)
-        X[r][i] = (float)std::log(abd_at(contigs[r], i) + 1.0);
+      for (size_t i = 0; i < (size_t)num_depth_samples; ++i)
+        X[r][i] = (float)std::log(depth_at(contigs[r], i) + 1.0);
 
     // Per-bin RNG: thread-count-independent, reproducible.
     std::mt19937 rng((unsigned)((seed ? (uint64_t)seed : 1ULL)
@@ -225,7 +224,7 @@ static void abundance_guided_split(BinMap &cls) {
     int best_k = 1; double best_sil = -1.0; std::vector<int> best_labels;
     int kmax = std::min((int)n - 1, splitMaxK);
     for (int k = 2; k <= kmax; ++k) {
-      std::vector<int> lab = fkmv_kmeans(X, k, rng);
+      std::vector<int> lab = rb_kmeans(X, k, rng);
       int seen = 0; { std::vector<char> u(k, 0); for (int l : lab) if (!u[l]) { u[l] = 1; ++seen; } }
       if (seen < 2) continue;
       double s = fkmv_silhouette(X, lab, k, rng);
@@ -237,7 +236,7 @@ static void abundance_guided_split(BinMap &cls) {
       for (size_t r = 0; r < n; ++r) sub[best_labels[r]].push_back(contigs[r]);
       for (int t = 0; t < best_k; ++t) {
         if (sub[t].empty()) continue;
-        if (bin_bp(sub[t]) < minClsSize) continue;  // drop tiny sub-products
+        if (bin_bp(sub[t]) < min_bin_bp) continue;  // drop tiny sub-products
         res.emit.push_back(std::move(sub[t]));
       }
       if (!res.emit.empty()) res.kind = 2;
@@ -259,10 +258,10 @@ static void abundance_guided_split(BinMap &cls) {
   }
   cls.swap(out);
   verbose_message("Abundance split (sil>=%.2f): %zu kept, %zu split, "
-                  "%zu dropped(<minClsSize) -> %d bins\n",
+                  "%zu dropped(<min_bin_bp) -> %d bins\n",
                   g_split_sil, n_kept, n_split, n_drop, next);
-  // Sub-products may be < minClsSize; base bins were already gated above.
-  minClsSize = 0;
+  // Sub-products may be < min_bin_bp; base bins were already gated above.
+  min_bin_bp = 0;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

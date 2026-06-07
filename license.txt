@@ -1,5 +1,13 @@
 **********
 
+RabbitBin Copyright (c) 2024-2026 RabbitBin contributors.
+All rights reserved.
+
+RabbitBin is a sketch-based metagenome binning tool.  See the project README
+for usage and citation guidance.
+
+**********
+
 MetaBAT v1.0 to v2.0 Copyright (c) 2014, The Regents of the University of
 California, through Lawrence Berkeley National Laboratory (subject to receipt of
 any required approvals from the U.S. Dept. of Energy).  All rights reserved.

@@ -1,5 +1,5 @@
 /**
- * fkmv_embed.h  –  self-contained single-header FastKMV sketch
+ * rabbit_sketch.h  –  self-contained single-header k-mer sketch
  *
  * Representation: One-Permutation MinHash (OPH) with optimal densification,
  * projected to a 1-bit-per-bucket packed signature.
@@ -7,23 +7,21 @@
  * Rationale (vs. the original bottom-k / KMV merge):
  *   - Sketch build  : single O(1) min-update per k-mer (no sorted insert/memmove).
  *   - Jaccard       : pure SIMD XOR + popcount over a tiny m/8-byte bitset,
- *                     branchless and extremely cache-friendly. This is the key
- *                     to beating TNF's 136-float dot product on the hot
+ *                     branchless and extremely cache-friendly on the hot
  *                     all-pairs loop.
  *   - Centroid merge: element-wise min over the registers.
  *
- * Public API is unchanged from the previous bottom-k version so callers stay
- * drop-in compatible:
- *   fkmv_embed::FastKMV sk(num_buckets, kmer_size);
+ * Public API:
+ *   rabbit_sketch::KmerSketch sk(num_buckets, kmer_size);
  *   sk.update(seq_cstr, length);
  *   double j = sk.jaccard(other);      // Jaccard in [0,1]
- *   FastKMV merged = sk.merge(other);  // centroid sketch
+ *   KmerSketch merged = sk.merge(other);  // centroid sketch
  *
  * No external dependencies beyond the C++ standard library and SIMD headers.
  */
 
-#ifndef FKMV_EMBED_H_
-#define FKMV_EMBED_H_
+#ifndef RABBIT_SKETCH_H_
+#define RABBIT_SKETCH_H_
 
 #include <cstdint>
 #include <cstring>
@@ -37,7 +35,7 @@
 #include <vector>
 #include <immintrin.h>
 
-namespace fkmv_embed {
+namespace rabbit_sketch {
 
 // ═══════════════════════════════════════════════════════════════════════════
 // murmur3_fmix  (from hash_int.h, MetaCache, André Müller, GPL3)
@@ -55,7 +53,7 @@ static inline uint64_t murmur3_fmix(uint64_t x, uint64_t seed) noexcept {
 // ═══════════════════════════════════════════════════════════════════════════
 // 2-bit lex encoding LUT  (A/a→0, C/c→1, G/g→2, T/t→3; else→255)
 // ═══════════════════════════════════════════════════════════════════════════
-static const uint8_t FKMV_ENC_LUT[256] = {
+static const uint8_t RB_BASE_ENC_LUT[256] = {
     255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,
     255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,
     255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,
@@ -64,7 +62,6 @@ static const uint8_t FKMV_ENC_LUT[256] = {
     255,255,255,255,  3,255,255,255,255,255,255,255,255,255,255,255,
     255,  0,255,  1,255,255,255,  2,255,255,255,255,255,255,255,255,
     255,255,255,255,  3,255,255,255,255,255,255,255,255,255,255,255,
-    255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,
     255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,
     255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,
     255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,
@@ -73,22 +70,22 @@ static const uint8_t FKMV_ENC_LUT[256] = {
     255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,
     255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,255,
 };
-#define FKMV_ENC(c)   (FKMV_ENC_LUT[(uint8_t)(c)])
-#define FKMV_COMP(e)  ((uint8_t)((e) <= 3 ? 3-(e) : 255))
-#define FKMV_VALID(e) ((e) <= 3)
+#define RB_BASE_ENC(c)   (RB_BASE_ENC_LUT[(uint8_t)(c)])
+#define RB_BASE_COMP(e)  ((uint8_t)((e) <= 3 ? 3-(e) : 255))
+#define RB_BASE_VALID(e) ((e) <= 3)
 
 // ═══════════════════════════════════════════════════════════════════════════
-// FastKMV  –  one-permutation MinHash with 1-bit packed signature
+// KmerSketch  –  one-permutation MinHash with 1-bit packed signature
 // ═══════════════════════════════════════════════════════════════════════════
-class FastKMV {
+class KmerSketch {
 public:
     static constexpr uint32_t REG_EMPTY = UINT32_MAX;
 
     // `k` is reinterpreted as the number of OPH buckets. `b` is the number of
     // packed bits stored per bucket (bit-planes); more bits => lower variance
     // / lower collision baseline at the cost of a larger signature.
-    explicit FastKMV(uint32_t k = 1000, int kmer_size = 21,
-                     uint32_t b = 1, uint64_t seed = 42)
+    explicit KmerSketch(uint32_t k = 1000, int kmer_size = 21,
+                        uint32_t b = 1, uint64_t seed = 42)
         : m_(k < 2 ? 2 : k), kmer_size_(kmer_size),
           b_(b < 1 ? 1 : (b > 24 ? 24 : b)), seed_(seed),
           nwords_((m_ + 63) / 64),
@@ -101,7 +98,7 @@ public:
         std::fill(reg_.get(), reg_.get() + m_, REG_EMPTY);
     }
 
-    FastKMV(const FastKMV& o)
+    KmerSketch(const KmerSketch& o)
         : m_(o.m_), kmer_size_(o.kmer_size_), b_(o.b_), seed_(o.seed_),
           nwords_(o.nwords_),
           reg_(new uint32_t[o.m_]),
@@ -113,7 +110,7 @@ public:
         std::copy(o.bits_.get(), o.bits_.get() + (size_t)nwords_ * b_, bits_.get());
     }
 
-    FastKMV& operator=(FastKMV other) {
+    KmerSketch& operator=(KmerSketch other) {
         std::swap(m_,         other.m_);
         std::swap(kmer_size_, other.kmer_size_);
         std::swap(b_,         other.b_);
@@ -126,24 +123,24 @@ public:
         return *this;
     }
 
-    FastKMV(FastKMV&&) = default;
-    // operator=(FastKMV) covers both copy and move (copy-and-swap idiom)
-    ~FastKMV() = default;
+    KmerSketch(KmerSketch&&) = default;
+    // operator=(KmerSketch) covers both copy and move (copy-and-swap idiom)
+    ~KmerSketch() = default;
 
     // ── sketch building ──────────────────────────────────────────────────
     void update(const char* seq, uint64_t length);
     void finalize() {}  // no-op
 
     // ── similarity / distance ────────────────────────────────────────────
-    double jaccard(const FastKMV& other, double min_jaccard = 0.0) const;
-    double distance(const FastKMV& other,
+    double jaccard(const KmerSketch& other, double min_jaccard = 0.0) const;
+    double distance(const KmerSketch& other,
                     double max_distance = std::numeric_limits<double>::infinity()) const;
-    double ani(const FastKMV& other) const;
-    double containment(const FastKMV& other) const;
+    double ani(const KmerSketch& other) const;
+    double containment(const KmerSketch& other) const;
     double cardinality() const;
 
     // ── merge (element-wise register min = union) ────────────────────────
-    FastKMV merge(const FastKMV& other) const;
+    KmerSketch merge(const KmerSketch& other) const;
 
     // ── accessors ────────────────────────────────────────────────────────
     const uint64_t* getSignature() const { ensureSig(); return bits_.get(); }
@@ -194,12 +191,12 @@ private:
 };
 
 // ─── reduce a 64-bit hash to [0, m) via Lemire's multiply-shift ──────────
-static inline uint32_t fkmv_reduce(uint64_t h, uint32_t m) {
+static inline uint32_t rb_sketch_reduce(uint64_t h, uint32_t m) {
     return (uint32_t)(((h >> 32) * (uint64_t)m) >> 32);
 }
 
 // ─── update  (2-bit lex rolling + murmur3_fmix + scatter min into bucket) ─
-inline void FastKMV::update(const char* seq, uint64_t length) {
+inline void KmerSketch::update(const char* seq, uint64_t length) {
     const int K = kmer_size_;
     if (length < static_cast<uint64_t>(K)) return;
 
@@ -209,10 +206,10 @@ inline void FastKMV::update(const char* seq, uint64_t length) {
     uint64_t fwd_h = 0, rc_h = 0;
     int inv = 0;
     for (int k = 0; k < K; ++k) {
-        uint8_t ef = FKMV_ENC(seq[k]);
-        if (!FKMV_VALID(ef)) ++inv;
-        fwd_h = ((fwd_h << 2) | (FKMV_VALID(ef) ? (ef & 3u) : 0u)) & kmer_mask;
-        uint8_t er = FKMV_VALID(ef) ? (FKMV_COMP(ef) & 3u) : 0u;
+        uint8_t ef = RB_BASE_ENC(seq[k]);
+        if (!RB_BASE_VALID(ef)) ++inv;
+        fwd_h = ((fwd_h << 2) | (RB_BASE_VALID(ef) ? (ef & 3u) : 0u)) & kmer_mask;
+        uint8_t er = RB_BASE_VALID(ef) ? (RB_BASE_COMP(ef) & 3u) : 0u;
         rc_h  = (rc_h >> 2) | (static_cast<uint64_t>(er) << (2*(K-1)));
     }
 
@@ -223,7 +220,7 @@ inline void FastKMV::update(const char* seq, uint64_t length) {
         if (inv == 0) {
             uint64_t canon = (fwd_h < rc_h) ? fwd_h : rc_h;
             uint64_t h     = murmur3_fmix(canon, loc_seed);
-            uint32_t b     = fkmv_reduce(h, m_);
+            uint32_t b     = rb_sketch_reduce(h, m_);
             uint32_t v     = (uint32_t)h;
             if (v < reg[b]) {
                 if (reg[b] == REG_EMPTY) ++nonempty_;
@@ -231,12 +228,12 @@ inline void FastKMV::update(const char* seq, uint64_t length) {
             }
         }
         if (i >= N_body) break;
-        uint8_t ef_out = FKMV_ENC(seq[i]);
-        uint8_t ef_in  = FKMV_ENC(seq[i + K]);
-        if (!FKMV_VALID(ef_out)) --inv;
-        if (!FKMV_VALID(ef_in))  ++inv;
-        fwd_h = ((fwd_h << 2) | (FKMV_VALID(ef_in) ? (ef_in & 3u) : 0u)) & kmer_mask;
-        uint8_t er_in = FKMV_VALID(ef_in) ? (FKMV_COMP(ef_in) & 3u) : 0u;
+        uint8_t ef_out = RB_BASE_ENC(seq[i]);
+        uint8_t ef_in  = RB_BASE_ENC(seq[i + K]);
+        if (!RB_BASE_VALID(ef_out)) --inv;
+        if (!RB_BASE_VALID(ef_in))  ++inv;
+        fwd_h = ((fwd_h << 2) | (RB_BASE_VALID(ef_in) ? (ef_in & 3u) : 0u)) & kmer_mask;
+        uint8_t er_in = RB_BASE_VALID(ef_in) ? (RB_BASE_COMP(ef_in) & 3u) : 0u;
         rc_h  = (rc_h >> 2) | (static_cast<uint64_t>(er_in) << (2*(K-1)));
     }
 
@@ -247,14 +244,14 @@ inline void FastKMV::update(const char* seq, uint64_t length) {
 // Deterministic probe sequence shared by all sketches, so two sketches that
 // are both empty at bucket i borrow consistently. The hop count is mixed into
 // the returned value to decorrelate distinct empty buckets.
-inline uint32_t FastKMV::densify(uint32_t i) const {
+inline uint32_t KmerSketch::densify(uint32_t i) const {
     const uint32_t* reg = reg_.get();
     uint64_t base = murmur3_fmix(i, seed_ ^ UINT64_C(0xA5A5A5A5DEADBEEF));
     uint64_t step = murmur3_fmix(i, seed_ ^ UINT64_C(0x123456789ABCDEF0)) | 1ULL;
     uint64_t cur  = base;
     for (uint32_t t = 1; t <= m_; ++t) {
         cur += step;
-        uint32_t cand = fkmv_reduce(cur, m_);
+        uint32_t cand = rb_sketch_reduce(cur, m_);
         uint32_t v = reg[cand];
         if (v != REG_EMPTY)
             return v ^ (uint32_t)murmur3_fmix(t, UINT64_C(0x9E3779B97F4A7C15));
@@ -263,7 +260,7 @@ inline uint32_t FastKMV::densify(uint32_t i) const {
 }
 
 // ─── buildSig  (densify + pack low b_ bits of each register into planes) ──
-inline void FastKMV::buildSig() const {
+inline void KmerSketch::buildSig() const {
     uint64_t* b = bits_.get();
     std::fill(b, b + (size_t)nwords_ * b_, 0ULL);
     if (nonempty_ != 0) {
@@ -281,7 +278,7 @@ inline void FastKMV::buildSig() const {
 }
 
 // ─── jaccard  (1-bit MinHash estimator via SIMD popcount) ─────────────────
-inline double FastKMV::jaccard(const FastKMV& other, double min_jaccard) const {
+inline double KmerSketch::jaccard(const KmerSketch& other, double min_jaccard) const {
     assert(m_ == other.m_ && b_ == other.b_);
     if (nonempty_ == 0 || other.nonempty_ == 0) return 0.0;
     ensureSig(); other.ensureSig();
@@ -319,7 +316,7 @@ inline double FastKMV::jaccard(const FastKMV& other, double min_jaccard) const {
 }
 
 // ─── cardinality  (linear counting over empty buckets) ────────────────────
-inline double FastKMV::cardinality() const {
+inline double KmerSketch::cardinality() const {
     if (nonempty_ == 0) return 0.0;
     if (nonempty_ >= m_) return (double)m_;
     const double empty = (double)(m_ - nonempty_);
@@ -327,7 +324,7 @@ inline double FastKMV::cardinality() const {
 }
 
 // ─── containment ─────────────────────────────────────────────────────────
-inline double FastKMV::containment(const FastKMV& other) const {
+inline double KmerSketch::containment(const KmerSketch& other) const {
     const double card_a = cardinality();
     if (card_a <= 0.0) return 0.0;
     const double j = jaccard(other);
@@ -337,7 +334,7 @@ inline double FastKMV::containment(const FastKMV& other) const {
 }
 
 // ─── distance (Mash) ─────────────────────────────────────────────────────
-inline double FastKMV::distance(const FastKMV& other, double max_distance) const {
+inline double KmerSketch::distance(const KmerSketch& other, double max_distance) const {
     (void)max_distance;
     const double j = jaccard(other);
     if (j <= 0.0) return std::numeric_limits<double>::infinity();
@@ -346,7 +343,7 @@ inline double FastKMV::distance(const FastKMV& other, double max_distance) const
 }
 
 // ─── ani ─────────────────────────────────────────────────────────────────
-inline double FastKMV::ani(const FastKMV& other) const {
+inline double KmerSketch::ani(const KmerSketch& other) const {
     const double j = jaccard(other);
     if (j <= 0.0) return 0.0;
     if (j >= 1.0) return 1.0;
@@ -354,9 +351,9 @@ inline double FastKMV::ani(const FastKMV& other) const {
 }
 
 // ─── merge (element-wise register min = set union) ───────────────────────
-inline FastKMV FastKMV::merge(const FastKMV& other) const {
+inline KmerSketch KmerSketch::merge(const KmerSketch& other) const {
     assert(m_ == other.m_ && kmer_size_ == other.kmer_size_);
-    FastKMV ret(m_, kmer_size_, b_, seed_);
+    KmerSketch ret(m_, kmer_size_, b_, seed_);
     const uint32_t* __restrict__ x = reg_.get();
     const uint32_t* __restrict__ y = other.reg_.get();
     uint32_t* __restrict__ z = ret.reg_.get();
@@ -371,10 +368,10 @@ inline FastKMV FastKMV::merge(const FastKMV& other) const {
     return ret;
 }
 
-#undef FKMV_ENC
-#undef FKMV_COMP
-#undef FKMV_VALID
+#undef RB_BASE_ENC
+#undef RB_BASE_COMP
+#undef RB_BASE_VALID
 
-} // namespace fkmv_embed
+} // namespace rabbit_sketch
 
-#endif // FKMV_EMBED_H_
+#endif // RABBIT_SKETCH_H_

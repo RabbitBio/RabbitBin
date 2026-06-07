@@ -1,5 +1,4 @@
-// module load samtools boost
-// g++ -g -O3 -Wall -I$BOOST_DIR/include -I$SAMTOOLS_DIR/include/bam -L$SAMTOOLS_DIR/lib -o jgi_summarize_bam_contig_depths jgi_summarize_bam_contig_depths.cpp -lpthread -lz -lbam -fopenmp
+// rabbit_overlap.cpp — compute cross-assembly contig overlap from BAM FOFNs.
 
 #include <unistd.h>
 #include <assert.h>
@@ -34,8 +33,8 @@ static struct option long_options[] = {
 };
 
 void usage() {
-	fprintf(stderr, "ContigOverlaps %s %s\n"
-			"Usage: contigOverlaps <options> firstAssemblyBams.fofn secondAssemblyBams.fofn [ ... ]\n"
+	fprintf(stderr, "rabbit_overlap %s %s\n"
+			"Usage: rabbit_overlap <options> firstAssemblyBams.fofn secondAssemblyBams.fofn [ ... ]\n"
 			"where options include:\n"
 			"\t--help              print out this message\n"
 			"\t--percentIdentity   arg  The minimum end-to-end %% identity of qualifying reads (default: 97)\n"

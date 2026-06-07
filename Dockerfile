@@ -25,7 +25,7 @@ COPY . /src/RabbitBin
 RUN cd /src/RabbitBin && \
     mkdir build && cd build && \
     cmake -DCMAKE_INSTALL_PREFIX=/usr/local .. && \
-    make -j$(nproc) rabbitbin && \
+    make -j$(nproc) rabbitbin rabbit_depth rabbit_overlap && \
     make install && \
     rm -rf build
 

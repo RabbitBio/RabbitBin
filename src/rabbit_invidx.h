@@ -1,8 +1,7 @@
 /**
- * inv_index_embed.h  –  self-contained CSR inverted index for OPH sketch keys.
+ * rabbit_invidx.h  –  self-contained CSR inverted index for OPH sketch keys.
  *
- * Uses phmap::flat_hash_map (copied from RabbitSketch) for the posting-list
- * map, matching the implementation used by FastKMV / RabbitSketch exactly.
+ * Uses phmap::flat_hash_map for the posting-list map.
  *
  * Memory-efficient design
  * -----------------------
@@ -29,8 +28,8 @@
  * traversal work.
  */
 
-#ifndef INV_INDEX_EMBED_H_
-#define INV_INDEX_EMBED_H_
+#ifndef RABBIT_INVIDX_H_
+#define RABBIT_INVIDX_H_
 
 #include "phmap.h"
 
@@ -40,7 +39,7 @@
 #include <vector>
 #include <algorithm>
 
-namespace fkmv_invidx {
+namespace rabbit_invidx {
 
 struct PostRange { size_t off; uint32_t cnt; };
 
@@ -160,6 +159,6 @@ private:
     std::vector<ThreadMap> threadMaps_;
 };
 
-} // namespace fkmv_invidx
+} // namespace rabbit_invidx
 
-#endif // INV_INDEX_EMBED_H_
+#endif // RABBIT_INVIDX_H_

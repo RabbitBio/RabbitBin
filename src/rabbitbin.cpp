@@ -1,29 +1,23 @@
 /**
- * metabat2_fkmv.cpp
+ * rabbitbin.cpp
  *
- * MetaBAT2 with the TNF distance metric replaced by FastKMV k-mer Jaccard
- * similarity.  FastKMV code is embedded from fkmv_embed.h (no library
- * dependency).
+ * RabbitBin: sketch-based metagenome binning.
+ * Builds a composition–abundance similarity graph from contig sketches and
+ * coverage profiles, then clusters with label propagation.
  *
- * Key differences from metabat2.cpp:
- *   • Each contig is sketched with a K Minimum Values (KMV) sketch of
- *     canonical k-mers (lex-rolling 2-bit hash + murmur3 finalizer).
- *   • Pairwise similarity = KMV Jaccard ∈ [0, 1].  Higher = more similar.
- *   • Cluster centroids are formed by merging the bottom-k union sketch.
- *   • Two new CLI options:  --fkmvK (k-mer size, default 8)
- *                           --fkmvM (PMH registers, default 500)
- *   • Defaults (override via FKMV_* env): PMH on, GC_NORM=1, NEG_ABD=-0.3,
- *     WSTNF=0.5, MUTUAL_KNN on.
- *   • simCutoff / pSim semantics unchanged (0 = auto-calibrate, 1-99 = manual %).
- *   • Minimum similarity floor lowered to 5 % (50/1000) since Jaccard of
- *     21-mers on short metagenomic contigs is much smaller than typical TNF
- *     "probability" values.
+ * Composition similarity uses k-mer sketches and/or weighted ProbMinHash
+ * (embedded in rabbit_sketch.h / probmh.h; no external sketch library).
+ *
+ * Pipeline: FASTA + depth TSV → sketch → graph → label propagation →
+ *           recruit small contigs → optional abundance split → output bins.
+ *
+ * Tune via RABBIT_* environment variables (see README).
  */
 
-// ── FastKMV (self-contained, no external deps) ───────────────────────────
-#include "fkmv_embed.h"
-#include "inv_index_embed.h"
-// ── ProbMinHash4 weighted path (RabbitSketch), selectable via FKMV_PMH=1 ──
+// ── K-mer sketch (self-contained, no external deps) ──────────────────────
+#include "rabbit_sketch.h"
+#include "rabbit_invidx.h"
+// ── ProbMinHash4 weighted path (RabbitSketch), selectable via RABBIT_PMH=1 ──
 #include "probmh.h"
 #include <queue>
 #include <cstring>
@@ -42,50 +36,48 @@
 #include <unistd.h>
 #include <cstdio>   // sysconf(_SC_NPROCESSORS_ONLN) for true online-CPU count
 
-// ── MetaBAT2 infrastructure ───────────────────────────────────────────────
 #include "rabbitbin.h"
 #include <iomanip>
 
-// ── FastKMV global parameters ─────────────────────────────────────────────
+// ── Sketch global parameters ────────────────────────────────────────────────
 static int      sketch_kmer_size  = 8;     // k-mer size for sketching (8 gives best coverage)
-static uint32_t sketch_size = 500;  // PMH registers (--fkmvM; CAMI-high default)
+static uint32_t sketch_size = 500;  // PMH registers (--sketch-m; CAMI-high default)
 static uint32_t sketch_bits        = 2;    // bits per OPH bucket (bit-planes)
 
-// ── Marker-guided bin splitting (Phase 2; --seedMarkers <file>) ────────────
+// ── Marker-guided bin splitting (Phase 2; --marker-seed <file>) ─────────────
 // Seed file (MetaDecoder format): one line per single-copy marker:
 //   <marker>\t<contig>\t<contig>...
 // A marker present on >=2 contigs in one output bin => that bin merged >=2
 // genomes (contamination); such bins are re-split with abundance KMeans
 // (k = min(marker multiplicity, splitMaxK)). Empty file => disabled.
-static std::string seedMarkerFile;
+static std::string marker_seed_file;
 static int         splitMaxK        = 6;  // cap on sub-clusters per split bin
 static int         splitMinContigs  = 6;  // min contigs in a bin to consider
-// ── Marker-FREE Phase-2 split (--abdSplit) ─────────────────────────────────
+// ── Marker-FREE Phase-2 split (--split-bins) ──────────────────────────────
 // Splits internally multi-modal bins using only the multi-sample abundance
 // already computed (no gene prediction / HMM / seed file).  A bin is split
 // into k sub-clusters (k chosen by silhouette over k=2..splitMaxK) when the
 // best silhouette >= g_split_sil.  Recovers the marker-guided split accuracy
 // at zero extra cost (fits the ~4s binning budget).
-static bool        g_abd_split      = true;  // ON by default; --noAbdSplit disables
-static bool        g_no_abd_split   = false; // --noAbdSplit
-static double      g_split_sil      = 0.70;  // silhouette threshold (FKMV_SPLIT_SIL)
+static bool        g_split_abundance      = true;  // ON by default; --noAbdSplit disables
+static bool        g_no_split_abundance   = false; // --noAbdSplit
+static double      g_split_sil      = 0.70;  // silhouette threshold (RABBIT_SPLIT_SIL)
 static size_t      g_sil_sample_cap = 600;   // sample cap for O(n^2) silhouette
-// Raw per-sample mean depths of small contigs, snapshotted BEFORE small_ABD is
+// Raw per-sample mean depths of small contigs, snapshotted BEFORE small_depth_matrix is
 // rank-transformed in place during recruitment, so marker_guided_split sees the
-// same coverage values as the large-contig ABD (means, not ranks).
-static std::vector<float> g_small_means;  // nobs1 × nABD (means)
-static std::vector<float> g_large_means;  // nobs  × nABD (means, pre-rank)
+// same coverage values as the large-contig depth_matrix (means, not ranks).
+static std::vector<float> g_small_means;  // nobs1 × num_depth_samples (means)
+static std::vector<float> g_large_means;  // nobs  × num_depth_samples (means, pre-rank)
 
 // Minimum similarity floor (×1000) used during auto-calibration.
-// Original TNF code used 700 (0.70).  For 21-mer Jaccard on metagenomic
-// contigs the practical range is 0-0.3, so we lower this to 50 (0.05).
+// Sketch Jaccard on short metagenomic contigs typically spans 0–0.3.
 static const size_t RB_SIM_FLOOR = 50;
 
 // Per-contig KMV sketches (indexed 0..nobs-1)
-static std::vector<fkmv_embed::FastKMV *> g_sketches;
+static std::vector<rabbit_sketch::KmerSketch *> g_sketches;
 
 // Per-cluster centroid sketches (indexed by cluster slot, built on demand)
-static std::vector<fkmv_embed::FastKMV *> g_centroids;
+static std::vector<rabbit_sketch::KmerSketch *> g_centroids;
 
 // Contiguous signature flat array: g_sig_flat[i * g_sig_nw * g_sig_np ... ]
 // Laid out as: sketch i, plane p, word w → g_sig_flat[i*(nw*np) + p*nw + w]
@@ -96,18 +88,17 @@ static uint32_t g_sig_nw = 0;  // nwords_ per sketch
 static uint32_t g_sig_np = 0;  // bit-planes per sketch (b_)
 static uint32_t g_sig_m  = 0;  // m_ (bucket count)
 
-// ── Weighted ProbMinHash4 path (FKMV_PMH=1) ───────────────────────────────
-// When enabled, the large-contig similarity graph + pSim auto-calibration use
-// a frequency-weighted ProbMinHash4 sketch (small k, k-mer counts as weights)
+// ── Weighted ProbMinHash4 path (RABBIT_PMH=1) ─────────────────────────────
+// When enabled, the large-contig similarity graph + sim-cutoff auto-calibration
+// use a frequency-weighted ProbMinHash4 sketch (small k, k-mer counts as weights)
 // instead of the OPH b-bit signature.  This estimates the weighted Jaccard
-// Σmin(wA,wB)/Σmax(wA,wB) over the small-k composition spectrum — a sketch
-// analogue of MetaBAT2's tetranucleotide-frequency (TNF) distance.
+// Σmin(wA,wB)/Σmax(wA,wB) over the small-k composition spectrum.
 //
 // Similarity = (# registers with the same winning element) / m, read from a
 // per-contig contiguous winners array (m × uint64).  The downstream centroid /
-// leftover / small-contig steps (off by default) keep using FastKMV.
-static bool     g_pmh_mode = true;        // FKMV_PMH (default on; FKMV_PMH=0 disables)
-static int      g_pmh_k    = 4;           // PMH k-mer size (env FKMV_PMHK, default 4)
+// leftover / small-contig steps (off by default) keep using KmerSketch.
+static bool     g_pmh_mode = true;        // RABBIT_PMH (default on; RABBIT_PMH=0 disables)
+static int      g_pmh_k    = 4;           // PMH k-mer size (env RABBIT_PMHK, default 4)
 static uint32_t g_pmh_m    = 0;           // = sketch_size (registers)
 static uint64_t g_pmh_seed = 42;
 // Set to true when PMH winners were built on-the-fly during the kseq streaming
@@ -125,7 +116,7 @@ static std::vector<uint64_t> g_win64_flat; // nobs × g_pmh_m full 64-bit winner
 // median winner-match over random — i.e. mostly unrelated — pairs) and rescale
 //   s' = (s - b0) / (1 - b0)
 // so the unrelated mode maps to ~0 and identical composition to ~1.
-static bool   g_pmh_base_on  = true;      // env FKMV_PMH_BASE (default 1)
+static bool   g_pmh_base_on  = true;      // env RABBIT_PMH_BASE (default 1)
 static double g_pmh_baseline = 0.0;       // estimated chance-collision baseline b0
 // Precomputed reciprocals to replace per-pair divisions in the O(N²) hot loop
 // with multiplications.  g_inv_pmh_m = 1/m (m constant); g_inv_one_minus_b0 =
@@ -134,67 +125,64 @@ static double g_inv_pmh_m        = 0.0;   // 1.0 / g_pmh_m
 static double g_inv_one_minus_b0 = 1.0;   // 1.0 / (1.0 - g_pmh_baseline)
 
 // Edge-weight blend of composition (sComp) vs abundance correlation:
-//   w = alpha*sComp + (1-alpha)*corr     (alpha = FKMV_WSTNF, default 0.5)
-// alpha=0.5 reproduces MetaBAT2's (sComp+corr)/2 exactly.
+//   w = alpha*sComp + (1-alpha)*corr     (alpha = RABBIT_W_COMP, default 0.5)
 static double g_w_comp = 0.5;
 
 // Graph precision (CAMI-high tuned defaults; override via env):
-//   FKMV_MUTUAL_KNN     default on (FKMV_MUTUAL_KNN=0 disables)
-//   FKMV_NEG_ABD        default -0.3 (set <-0.99 to disable abd gate)
-//   FKMV_EDGE_POWER=<p> raise composite edge weight to power p before LPA
+//   RABBIT_MUTUAL_KNN     default on (RABBIT_MUTUAL_KNN=0 disables)
+//   RABBIT_NEG_DEPTH      default -0.3 (set <-0.99 to disable depth gate)
+//   RABBIT_EDGE_POWER=<p> raise composite edge weight to power p before LPA
 static bool   g_mutual_knn  = true;
-static double g_neg_abd_thr = -0.3;
+static double g_neg_depth_thr = -0.3;
 static double g_edge_power  = 1.0;     // applied to composite w; 1.0 = no-op
-// GC-content normalization for PMH k-mer weights (FKMV_GC_NORM=1):
+// GC-content normalization for PMH k-mer weights (RABBIT_GC_NORM=1):
 //   Instead of using raw k-mer frequency as weight, use enrichment ratio:
 //     weight(v) = observed_freq(v) / expected_freq(v | composition)
 //
-//   FKMV_GC_NORM=1  per-base independence model: expected(ABCDEF) = P(A)P(B)P(C)P(D)P(E)P(F)
-//                   Removes GC-content bias.
-//   FKMV_GC_NORM=2  first-order Markov (dinucleotide) model:
-//                     expected(ABCDEF) = P(A)·P(B|A)·P(C|B)·P(D|C)·P(E|D)·P(F|E)
-//                   P(b|a) estimated from the contig's own dinucleotide counts.
-//                   Removes both GC and dinucleotide-context bias (CpG suppression etc.)
-//                   — the same information used by MetaBAT2's TNF normalisation.
-//   Enrichment ratios are capped at FKMV_GC_NORM_CAP (default 20).
-static int    g_gc_norm     = 1;    // FKMV_GC_NORM: 0=off, 1=per-base, 2=dinucleotide
+//   RABBIT_GC_NORM=1  per-base independence model: expected(ABCDEF) = P(A)P(B)P(C)P(D)P(E)P(F)
+//                     Removes GC-content bias.
+//   RABBIT_GC_NORM=2  first-order Markov (dinucleotide) model:
+//                       expected(ABCDEF) = P(A)·P(B|A)·P(C|B)·P(D|C)·P(E|D)·P(F|E)
+//                     P(b|a) estimated from the contig's own dinucleotide counts.
+//                     Removes both GC and dinucleotide-context bias (CpG suppression etc.)
+//   Enrichment ratios are capped at RABBIT_GC_NORM_CAP (default 20).
+static int    g_gc_norm     = 1;    // RABBIT_GC_NORM: 0=off, 1=per-base, 2=dinucleotide
 static double g_gc_norm_cap = 20.0;
 
 // Env helpers: CAMI-high best (C_w050_mut). Unset = default; *=0 disables when noted.
-static const char *rabbit_env(const char *rabbit_key, const char *legacy_key) {
-  const char *e = getenv(rabbit_key);
-  if (e && e[0]) return e;
-  return getenv(legacy_key);
+static const char *rb_getenv(const char *key) {
+  const char *e = getenv(key);
+  return (e && e[0]) ? e : nullptr;
 }
 
 static bool rb_env_pmh_on() {
-  const char *e = rabbit_env("RABBIT_PMH", "FKMV_PMH");
+  const char *e = rb_getenv("RABBIT_PMH");
   return !e || e[0] != '0';
 }
 static bool rb_env_mutual_knn_on() {
-  const char *e = rabbit_env("RABBIT_MUTUAL_KNN", "FKMV_MUTUAL_KNN");
+  const char *e = rb_getenv("RABBIT_MUTUAL_KNN");
   return !e || e[0] != '0';
 }
 static int rb_env_gc_norm() {
-  const char *e = rabbit_env("RABBIT_GC_NORM", "FKMV_GC_NORM");
+  const char *e = rb_getenv("RABBIT_GC_NORM");
   return e ? std::atoi(e) : 1;
 }
-static double rb_env_neg_abd_thr() {
-  const char *e = rabbit_env("RABBIT_NEG_ABD", "FKMV_NEG_ABD");
+static double rb_env_neg_depth_thr() {
+  const char *e = rb_getenv("RABBIT_NEG_DEPTH");
   return e ? std::atof(e) : -0.3;
 }
 static double rb_env_w_comp() {
-  const char *e = rabbit_env("RABBIT_W_COMP", "FKMV_WSTNF");
+  const char *e = rb_getenv("RABBIT_W_COMP");
   double v = e ? std::atof(e) : 0.5;
   return (v < 0.0) ? 0.0 : (v > 1.0 ? 1.0 : v);
 }
 static double rb_env_split_sil() {
-  const char *e = rabbit_env("RABBIT_SPLIT_SIL", "FKMV_SPLIT_SIL");
+  const char *e = rb_getenv("RABBIT_SPLIT_SIL");
   return e ? std::atof(e) : 0.70;
 }
 
 // IDF (inverse document frequency) normalization for PMH k-mer weights.
-// Controlled by FKMV_IDF_NORM=1 (requires g_gc_norm>0 and k==4).
+// Controlled by RABBIT_IDF_NORM=1 (requires g_gc_norm>0 and k==4).
 //
 // After building per-contig GC-normalized frequency vectors, computes a
 // global IDF weight for each canonical 4-mer:
@@ -206,12 +194,11 @@ static double rb_env_split_sil() {
 static bool              g_idf_norm = false;
 static std::vector<float> g_k4freq_flat; // nobs × 256, non-canonical entries=0
 
-// Exact k=4 cosine similarity mode (FKMV_EXACT_COS=1, requires g_gc_norm>0 and k==4).
+// Exact k=4 cosine similarity mode (RABBIT_EXACT_COS=1, requires g_gc_norm>0 and k==4).
 //
 // Replaces PMH Jaccard with exact dot-product of L2-normalised GC-norm k=4
 // frequency vectors (size nobs×256, non-canonical entries=0).  More accurate
-// than sketch-based approximation; analogous to TNF's Euclidean distance on
-// normalised tetranucleotide frequency profiles.
+// than sketch-based approximation on normalised k-mer frequency profiles.
 // Storage: ~30 MB for N=30k contigs.  Comparison cost: 256 FMAs per pair.
 static bool              g_exact_cos_cmp = false;
 static std::vector<float> g_k4cosine_flat; // nobs × 256, L2-normalised GC-norm freqs
@@ -447,8 +434,8 @@ static inline double k4_cosine_sim(const float * __restrict__ a,
 }
 
 // Unified pairwise similarity dispatcher used by calibration + the all-pairs
-// graph build.  Selects the weighted-ProbMinHash winners path (FKMV_PMH=1),
-// exact k=4 cosine similarity (FKMV_EXACT_COS=1), or the default OPH path.
+// graph build.  Selects the weighted-ProbMinHash winners path (RABBIT_PMH=1),
+// exact k=4 cosine similarity (RABBIT_EXACT_COS=1), or the default OPH path.
 static inline double graph_sim(size_t i, size_t j) {
   if (g_exact_cos_cmp && !g_k4cosine_flat.empty()) {
     const float *a = g_k4cosine_flat.data() + i * 256;
@@ -472,7 +459,7 @@ static inline double graph_sim(size_t i, size_t j) {
 // Build a frequency-weighted ProbMinHash4 sketch for one contig and copy its
 // winner-identity array into out_winners[0..m).  k-mer counts (canonical) are
 // used as element weights, so the resulting jaccard_weighted ≈ weighted Jaccard
-// over the small-k composition spectrum (TNF analogue).  `scratch` is a caller
+// over the small-k composition spectrum.  `scratch` is a caller
 // owned reusable buffer (avoids per-contig reallocation in the parallel loop).
 // out_winners32: folded 32-bit winners (for SIMD pmh_match_frac kernel)
 // out_winners64: full 64-bit winners (for inverted-index key lookup), may be null
@@ -501,7 +488,7 @@ static void build_pmh_winners(const char *seq, size_t len, int k, uint32_t m,
       uint64_t dinuc_cnt[4][4] = {};
       uint8_t  prev_base = 255;
       for (size_t i = 0; i < len; ++i) {
-        const uint8_t b = fkmv_embed::FKMV_ENC_LUT[(uint8_t)seq[i]];
+        const uint8_t b = rabbit_sketch::RB_BASE_ENC_LUT[(uint8_t)seq[i]];
         if (b == 255) { valid = 0; fwd = 0; rev = 0; prev_base = 255; continue; }
         base_cnt[b]++;
         if (prev_base != 255) dinuc_cnt[prev_base][b]++;
@@ -543,7 +530,7 @@ static void build_pmh_winners(const char *seq, size_t len, int k, uint32_t m,
             }
           }
         } else {
-          // Mode 2: first-order Markov (dinucleotide) model — same bias removal as TNF.
+          // Mode 2: first-order Markov (dinucleotide) model.
           // P(ABCDEF) = P(A) × P(B|A) × P(C|B) × P(D|C) × P(E|D) × P(F|E)
           // P(b|a) estimated from contig's own dinucleotide counts (+ pseudocount=1).
           // Complement mapping A(0)↔T(3), C(1)↔G(2), i.e. comp = 3-b.
@@ -584,7 +571,7 @@ static void build_pmh_winners(const char *seq, size_t len, int k, uint32_t m,
     } else {
       scratch.clear();
       for (size_t i = 0; i < len; ++i) {
-        const uint8_t b = fkmv_embed::FKMV_ENC_LUT[(uint8_t)seq[i]];
+        const uint8_t b = rabbit_sketch::RB_BASE_ENC_LUT[(uint8_t)seq[i]];
         if (b == 255) { valid = 0; fwd = 0; rev = 0; continue; }
         fwd = ((fwd << 2) | b) & mask;
         rev = (rev >> 2) | ((uint64_t)(3u ^ b) << hishift);
@@ -616,16 +603,16 @@ static void build_pmh_winners(const char *seq, size_t len, int k, uint32_t m,
   }
 }
 
-// OPH inverted index built inline during sketch construction (FKMV_GRAPH_INDEX=1).
+// OPH inverted index built inline during sketch construction (RABBIT_GRAPH_INDEX=1).
 // Nullptr when not in use (default: all-pairs path).
-static std::unique_ptr<fkmv_invidx::InvertedIndex> g_inv_idx;
+static std::unique_ptr<rabbit_invidx::InvertedIndex> g_inv_idx;
 
-// PMH-winner inverted index (FKMV_PMH=1, default ON).
+// PMH-winner inverted index (RABBIT_PMH=1, default ON).
 // Key = ((uint64_t)register_pos << 32) | folded_winner_32bit.
 // Collision count between two contigs = PMH match numerator → raw_sim = count/m.
 // Built inline during sketch loop, used for both calibration and graph build.
 // Eliminates both O(N²) calibration sweeps and the all-pairs graph scan.
-static std::unique_ptr<fkmv_invidx::InvertedIndex> g_pmh_idx;
+static std::unique_ptr<rabbit_invidx::InvertedIndex> g_pmh_idx;
 
 // ── OMP reduction operators (must be visible before parallel loops) ───────
 #pragma omp declare reduction (merge_size_t : std::vector<size_t> : omp_out.insert(omp_out.end(), omp_in.begin(), omp_in.end()) )
@@ -633,7 +620,7 @@ static std::unique_ptr<fkmv_invidx::InvertedIndex> g_pmh_idx;
 #pragma omp declare reduction (merge_storeddist : std::vector<StoredDistance> : omp_out.insert(omp_out.end(), omp_in.begin(), omp_in.end()) )
 
 // Precomputed per-contig "has any abundance sample > minCV" flag.
-// is_nz(i,j) == (g_anynz[i] || g_anynz[j]); collapses the per-pair O(nABD)
+// is_nz(i,j) == (g_anynz[i] || g_anynz[j]); collapses the per-pair O(num_depth_samples)
 // matrix scan (run N²/2 times in the hot graph loop) into two byte loads.
 // Empty when not yet built (is_nz then falls back to the scalar scan).
 static std::vector<uint8_t> g_anynz;
@@ -659,7 +646,7 @@ std::ifstream::pos_type filesize(const char *filename) {
 //
 // Two modes selected automatically based on compressed file size:
 //
-//  Small file  (compressed < FKMV_LIBDEFLATE_MAXGB, default 2 GB):
+//  Small file  (compressed < RABBIT_LIBDEFLATE_MAXGB, default 2 GB):
 //    libdeflate one-shot — 2× faster than zlib, but loads the entire
 //    decompressed buffer into RAM (up to ~4× file size).  Safe when the
 //    machine has enough free memory.
@@ -668,7 +655,7 @@ std::ifstream::pos_type filesize(const char *filename) {
 //    Streaming zlib (gzread) — zero extra memory overhead, processes the
 //    file chunk-by-chunk.  Mandatory for multi-GB assemblies to avoid OOM.
 //
-// Override threshold: FKMV_LIBDEFLATE_MAXGB=<N>  (0 = always stream)
+// Override threshold: RABBIT_LIBDEFLATE_MAXGB=<N>  (0 = always stream)
 // ═══════════════════════════════════════════════════════════════════════════
 struct FastaRecord {
   std::string name;  // header up to first whitespace
@@ -761,7 +748,7 @@ static bool parse_fasta_mmap_parallel(
     const std::string   &path,
     int                  nthreads,
     size_t               minContig_arg,
-    size_t               minSmallContig_arg,
+    size_t               min_small_contig_arg,
     bool                 fullHeader_arg,
     bool                 stream_pmh_arg,
     bool                 no_store_seqs_arg,
@@ -770,7 +757,7 @@ static bool parse_fasta_mmap_parallel(
     // outputs  ──────────────────────────────────────────────────────────
     std::vector<ContigRec> &large_out,   // large contigs, file order
     std::vector<ContigRec> &small_out,   // small contigs, file order
-    std::vector<std::pair<std::string,std::string>> &tiny_out, // <minSmall (name,seq)
+    std::vector<std::pair<std::string,std::string>> &tiny_out, // <min_small_contig (name,seq)
     size_t               &num_seqs_out
 ) {
   // ── 1. mmap ─────────────────────────────────────────────────────────────
@@ -914,7 +901,7 @@ static bool parse_fasta_mmap_parallel(
         if (!no_store_seqs_arg)
           rec.seq = std::move(seq_str);
         my_large.push_back(std::move(rec));
-      } else if (seq_len >= minSmallContig_arg) {
+      } else if (seq_len >= min_small_contig_arg) {
         ContigRec rec;
         rec.name = std::move(name);
         rec.len  = seq_len;
@@ -1096,19 +1083,19 @@ static bool libdeflate_read_gz(const std::string& path,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Async ABD (abundance/depth) pre-parser
+// Async depth_matrix (abundance/depth) pre-parser
 // ─────────────────────────────────────────────────────────────────────────
 // Parses the depth/abundance file into a hash map (name → coverage values)
 // independently of FASTA parsing.  This lets the two I/O phases run in
 // parallel: the main thread decompresses and parses FASTA while this runs
 // on a background thread.  After FASTA is done the caller merges the result.
 // ─────────────────────────────────────────────────────────────────────────
-struct RawAbdEntry {
+struct RawDepthEntry {
   std::vector<float> means;
   std::vector<float> vars;
 };
 
-// parse_abd_async – reads abdFile and returns a name→RawAbdEntry map.
+// parse_depth_async – reads depth_file and returns a name→RawDepthEntry map.
 // Called via std::async before FASTA decompression starts.
 //
 // Parallel mmap parser: the depth matrix can be huge (e.g. 244 MB, 1.47 M rows
@@ -1117,14 +1104,14 @@ struct RawAbdEntry {
 // file, split it into per-thread line-aligned chunks, and parse each field with
 // strtof (no stringstream, no exceptions, no locale). Field separators are tabs;
 // strtof stops cleanly at the tab/newline that follows each number.
-static phmap::flat_hash_map<std::string, RawAbdEntry>
-parse_abd_async(const std::string& abdFile, bool cvExt, int nABD, bool fullHeader,
+static phmap::flat_hash_map<std::string, RawDepthEntry>
+parse_depth_async(const std::string& depth_file, bool cvExt, int num_depth_samples, bool fullHeader,
                 int nthreads) {
-  using Map = phmap::flat_hash_map<std::string, RawAbdEntry>;
+  using Map = phmap::flat_hash_map<std::string, RawDepthEntry>;
   Map result;
   if (nthreads < 1) nthreads = 1;
 
-  int fd = ::open(abdFile.c_str(), O_RDONLY);
+  int fd = ::open(depth_file.c_str(), O_RDONLY);
   if (fd < 0) return result;
   struct stat st;
   if (fstat(fd, &st) != 0 || st.st_size <= 0) { ::close(fd); return result; }
@@ -1152,7 +1139,7 @@ parse_abd_async(const std::string& abdFile, bool cvExt, int nABD, bool fullHeade
     bounds[t] = nl ? nl + 1 : data_end;
   }
 
-  std::vector<std::vector<std::pair<std::string, RawAbdEntry>>> tl(nthreads);
+  std::vector<std::vector<std::pair<std::string, RawDepthEntry>>> tl(nthreads);
 
 #pragma omp parallel for num_threads(nthreads) schedule(static, 1)
   for (int t = 0; t < nthreads; ++t) {
@@ -1188,15 +1175,15 @@ parse_abd_async(const std::string& abdFile, bool cvExt, int nABD, bool fullHeade
         c = tabp + 1;
       }
 
-      RawAbdEntry entry;
-      entry.means.resize(nABD, 0.f);
-      if (!cvExt) entry.vars.resize(nABD, 0.f);
+      RawDepthEntry entry;
+      entry.means.resize(num_depth_samples, 0.f);
+      if (!cvExt) entry.vars.resize(num_depth_samples, 0.f);
 
       auto next_field = [&](const char* cur) -> const char* {
         const char* tp = (const char*)memchr(cur, tab_delim, (size_t)(line_end - cur));
         return tp ? tp + 1 : line_end;
       };
-      for (int i = 0; i < nABD; ++i) {
+      for (int i = 0; i < num_depth_samples; ++i) {
         if (c >= line_end) break;
         char* ep = nullptr;
         entry.means[i] = strtof(c, &ep);  // stops at the trailing tab/newline
@@ -1218,7 +1205,7 @@ parse_abd_async(const std::string& abdFile, bool cvExt, int nABD, bool fullHeade
   result.reserve(total);
   for (auto& v : tl) {
     for (auto& kv : v) result.emplace(std::move(kv.first), std::move(kv.second));
-    std::vector<std::pair<std::string, RawAbdEntry>>().swap(v);
+    std::vector<std::pair<std::string, RawDepthEntry>>().swap(v);
   }
   return result;
 }
@@ -1227,9 +1214,9 @@ parse_abd_async(const std::string& abdFile, bool cvExt, int nABD, bool fullHeade
 // Marker-guided bin splitting (Phase 2) — C++ port of post_split.py
 // ═══════════════════════════════════════════════════════════════════════════
 // Lightweight dependency-free KMeans (k-means++ init, Lloyd iterations, a few
-// restarts, best inertia). Features are small (n ≤ few hundred, dim = nABD,
+// restarts, best inertia). Features are small (n ≤ few hundred, dim = num_depth_samples,
 // k ≤ splitMaxK) so this is microseconds per bin.
-static std::vector<int> fkmv_kmeans(const std::vector<std::vector<float>> &X,
+static std::vector<int> rb_kmeans(const std::vector<std::vector<float>> &X,
                                     int k, std::mt19937 &rng) {
   const size_t n = X.size();
   const size_t d = X.empty() ? 0 : X[0].size();
@@ -1308,25 +1295,25 @@ int main(int ac, char *av[]) {
       ("help,h", "Show help")
       ("assembly,a", po::value<std::string>(&inFile), "Contig FASTA assembly (gzip ok) [required]")
       ("output,o", po::value<std::string>(&outFile), "Output path prefix [required]")
-      ("depth,d", po::value<std::string>(&abdFile), "Coverage depth TSV")
+      ("depth,d", po::value<std::string>(&depth_file), "Coverage depth TSV")
       ("min-contig,m", po::value<size_t>(&minContig)->default_value(2500), "Minimum contig length (>=1500)")
-      ("min-small-contig", po::value<size_t>(&minSmallContig)->default_value(1000), "Min length for small-contig recruiting")
-      ("max-posterior", po::value<Similarity>(&maxP)->default_value(95), "Well-connected contig percent for calibration")
-      ("min-edge-score", po::value<Similarity>(&minS)->default_value(60), "Minimum edge weight (1-99)")
+      ("min-small-contig", po::value<size_t>(&min_small_contig)->default_value(1000), "Min length for small-contig recruiting")
+      ("max-posterior", po::value<Similarity>(&calib_connected_pct)->default_value(95), "Well-connected contig percent for calibration")
+      ("min-edge-score", po::value<Similarity>(&min_edge_weight)->default_value(60), "Minimum edge weight (1-99)")
       ("max-edges", po::value<size_t>(&maxEdges)->default_value(200), "Max neighbors per contig")
       ("sim-cutoff", po::value<Similarity>(&simCutoff)->default_value(0), "Composition similarity cutoff x100 (0=auto)")
       ("sketch-k", po::value<int>(&sketch_kmer_size)->default_value(8), "Sketch k-mer size")
       ("sketch-m", po::value<uint32_t>(&sketch_size)->default_value(500), "Sketch size (PMH registers)")
       ("sketch-b", po::value<uint32_t>(&sketch_bits)->default_value(2), "MinHash bucket bits")
-      ("no-recruit", po::value<bool>(&noAdd)->zero_tokens(), "Disable small-contig recruiting")
+      ("no-recruit", po::value<bool>(&no_recruit)->zero_tokens(), "Disable small-contig recruiting")
       ("min-recruit-cluster", po::value<size_t>(&minCS)->default_value(10), "Min cluster size for recruiting")
-      ("recruit-abd-centroid", po::value<bool>(&recruitToAbdCentroid)->default_value(false)->zero_tokens(), "Recruit using abundance centroid")
+      ("recruit-abd-centroid", po::value<bool>(&recruit_to_depth_centroid)->default_value(false)->zero_tokens(), "Recruit using abundance centroid")
       ("recruit-cutoff", po::value<Distance>(&recruitSimFactor)->default_value(0.0), "Recruit sim factor x sim-cutoff (0=off)")
       ("depth-no-variance", po::value<bool>(&cvExt)->zero_tokens(), "Depth file has no variance columns")
       ("full-header", po::value<bool>(&fullHeader)->zero_tokens(), "Keep full FASTA headers")
       ("min-coverage,x", po::value<Distance>(&minCV)->default_value(1), "Min per-sample mean coverage")
       ("min-coverage-sum", po::value<Distance>(&minCVSum)->default_value(1), "Min total mean coverage")
-      ("min-bin-size,s", po::value<size_t>(&minClsSize)->default_value(200000), "Min output bin size (bp)")
+      ("min-bin-size,s", po::value<size_t>(&min_bin_bp)->default_value(200000), "Min output bin size (bp)")
       ("threads,t", po::value<size_t>(&numThreads)->default_value(0), "Threads (0=all online CPUs)")
       ("labels-only,l", po::value<bool>(&onlyLabel)->zero_tokens(), "Output contig names only")
       ("save-matrix", po::value<bool>(&saveCls)->zero_tokens(), "Save membership matrix")
@@ -1334,55 +1321,17 @@ int main(int ac, char *av[]) {
       ("no-bin-fasta", po::value<bool>(&noBinOut)->zero_tokens(), "Skip per-bin FASTA output")
       ("no-sample-depths", po::value<bool>(&noSampleDepths)->zero_tokens(), "Omit per-sample depths in headers")
       ("seed", po::value<unsigned long long>(&seed)->default_value(0), "Random seed (0=time)")
-      ("marker-seed", po::value<std::string>(&seedMarkerFile)->default_value(""), "Optional marker seed file")
+      ("marker-seed", po::value<std::string>(&marker_seed_file)->default_value(""), "Optional marker seed file")
       ("split-max-k", po::value<int>(&splitMaxK)->default_value(6), "Max sub-clusters per split bin")
-      ("split-bins", po::value<bool>(&g_abd_split)->zero_tokens(), "Abundance bin splitting (default ON)")
-      ("no-split", po::value<bool>(&g_no_abd_split)->zero_tokens(), "Disable abundance splitting")
+      ("split-bins", po::value<bool>(&g_split_abundance)->zero_tokens(), "Abundance bin splitting (default ON)")
+      ("no-split", po::value<bool>(&g_no_split_abundance)->zero_tokens(), "Disable abundance splitting")
       ("split-silhouette", po::value<double>(&g_split_sil)->default_value(rb_env_split_sil()), "Silhouette split threshold")
-      ("metaBAT-compat", po::value<bool>(&g_metabat_compat)->zero_tokens(), "Legacy MetaBAT names/options")
       ("debug", po::value<bool>(&debug)->zero_tokens(), "Debug output")
       ("quiet,q", po::value<bool>(&quiet)->zero_tokens(), "Less verbose")
       ("verbose,v", po::value<bool>(&verbose)->zero_tokens(), "Verbose progress (default ON)");
 
-  po::options_description hidden("Hidden compatibility options");
-  hidden.add_options()
-      ("inFile,i", po::value<std::string>(&inFile))
-      ("outFile", po::value<std::string>(&outFile))
-      ("abdFile", po::value<std::string>(&abdFile))
-      ("minContig", po::value<size_t>(&minContig))
-      ("minSmallContig", po::value<size_t>(&minSmallContig))
-      ("maxP", po::value<Similarity>(&maxP))
-      ("minS", po::value<Similarity>(&minS))
-      ("maxEdges", po::value<size_t>(&maxEdges))
-      ("simCutoff", po::value<Similarity>(&simCutoff))
-      ("fkmvK", po::value<int>(&sketch_kmer_size))
-      ("fkmvM", po::value<uint32_t>(&sketch_size))
-      ("fkmvB", po::value<uint32_t>(&sketch_bits))
-      ("noAdd", po::value<bool>(&noAdd)->zero_tokens())
-      ("minRecruitingSize", po::value<size_t>(&minCS))
-      ("recruitToAbdCentroid", po::value<bool>(&recruitToAbdCentroid)->zero_tokens())
-      ("recruitWithTNF", po::value<Distance>(&recruitSimFactor))
-      ("cvExt", po::value<bool>(&cvExt)->zero_tokens())
-      ("fullHeader", po::value<bool>(&fullHeader)->zero_tokens())
-      ("minCV", po::value<Distance>(&minCV))
-      ("minCVSum", po::value<Distance>(&minCVSum))
-      ("minClsSize", po::value<size_t>(&minClsSize))
-      ("numThreads", po::value<size_t>(&numThreads))
-      ("onlyLabel", po::value<bool>(&onlyLabel)->zero_tokens())
-      ("saveCls", po::value<bool>(&saveCls)->zero_tokens())
-      ("noBinOut", po::value<bool>(&noBinOut)->zero_tokens())
-      ("noSampleDepths", po::value<bool>(&noSampleDepths)->zero_tokens())
-      ("seedMarkers", po::value<std::string>(&seedMarkerFile))
-      ("splitMaxK", po::value<int>(&splitMaxK))
-      ("abdSplit", po::value<bool>(&g_abd_split)->zero_tokens())
-      ("noAbdSplit", po::value<bool>(&g_no_abd_split)->zero_tokens())
-      ("splitSil", po::value<double>(&g_split_sil));
-
-  po::options_description all_opts;
-  all_opts.add(desc).add(hidden);
-
   po::variables_map vm;
-  po::store(po::command_line_parser(ac, av).options(all_opts).positional({}).run(), vm);
+  po::store(po::command_line_parser(ac, av).options(desc).positional({}).run(), vm);
   po::notify(vm);
 
   if (vm.count("help") || inFile.empty() || outFile.empty()) {
@@ -1404,11 +1353,11 @@ int main(int ac, char *av[]) {
   if (seed == 0) seed = time(0);
   srand(seed);
 
-  if (maxP <= 0 || maxP >= 100) {
-    cerr << "[Error!] maxP should be > 0 and < 100\n"; return 1;
+  if (calib_connected_pct <= 0 || calib_connected_pct >= 100) {
+    cerr << "[Error!] calib_connected_pct should be > 0 and < 100\n"; return 1;
   }
-  if (minS <= 1 || minS >= 100) {
-    cerr << "[Error!] minS should be > 1 and < 100\n"; return 1;
+  if (min_edge_weight <= 1 || min_edge_weight >= 100) {
+    cerr << "[Error!] min_edge_weight should be > 1 and < 100\n"; return 1;
   }
   if (simCutoff < 0 || simCutoff >= 100) {
     cerr << "[Error!] --sim-cutoff should be >= 0 and < 100\n"; return 1;
@@ -1416,7 +1365,7 @@ int main(int ac, char *av[]) {
   if (minContig < 1500) {
     cerr << "[Error!] Contig length < 1500 is not allowed.\n"; return 1;
   }
-  if (minSmallContig < 500) {
+  if (min_small_contig < 500) {
     cerr << "[Error!] Min small contig length < 500 is not allowed.\n"; return 1;
   }
   if (minCV < 0) {
@@ -1428,7 +1377,7 @@ int main(int ac, char *av[]) {
   if (sketch_size < 2) {
     cerr << "[Error!] --sketch-m must be >= 2\n"; return 1;
   }
-  if (g_no_abd_split) g_abd_split = false;  // explicit opt-out
+  if (g_no_split_abundance) g_split_abundance = false;  // explicit opt-out
   minCVSum = std::max(minCV, minCVSum);
 
   boost::filesystem::path dir(outFile);
@@ -1448,12 +1397,12 @@ int main(int ac, char *av[]) {
   }
 
   print_message("RabbitBin (%s) using minContig %d, minCV %2.1f, "
-                "minCVSum %2.1f, maxP %2.0f%%, minS %2.0f, maxEdges %d, "
-                "minClsSize %d, sketch-k %d, sketch-m %d, seed=%lld\n",
-                version.c_str(), minContig, minCV, minCVSum, maxP, minS,
-                maxEdges, minClsSize, sketch_kmer_size, sketch_size, seed);
+                "minCVSum %2.1f, calib_connected_pct %2.0f%%, min_edge_weight %2.0f, maxEdges %d, "
+                "min_bin_bp %d, sketch-k %d, sketch-m %d, seed=%lld\n",
+                version.c_str(), minContig, minCV, minCVSum, calib_connected_pct, min_edge_weight,
+                maxEdges, min_bin_bp, sketch_kmer_size, sketch_size, seed);
 
-  maxP /= 100.;  minS /= 100.;
+  calib_connected_pct /= 100.;  min_edge_weight /= 100.;
 
   // Thread count: honor the user's explicit `-t N`, capping only to the number
   // of CPUs physically online on the host. We deliberately IGNORE the OMP-based
@@ -1474,7 +1423,7 @@ int main(int ac, char *av[]) {
   omp_set_dynamic(0);  // disable runtime auto-reduction of the team size
   verbose_message("Executing with %d threads\n", numThreads);
 
-  // ── (TNF LUT initialisation removed; FastKMV needs no pre-computation) ─
+  // ── (KmerSketch needs no LUT pre-computation) ─
 
   nobs = 0; nobs1 = 0;
 
@@ -1482,32 +1431,32 @@ int main(int ac, char *av[]) {
   std::unordered_map<std::string, size_t> small_contigs;
 
   const int nNonFeat = cvExt ? 1 : 3;
-  bool hasABD = abdFile.length() > 0;
+  bool has_depth = depth_file.length() > 0;
 
   // ── Validate FASTA / depth files ─────────────────────────────────────────
-  // abd_future: async pre-parse of the ABD file into a name→values map.
+  // depth_future: async pre-parse of the depth_matrix file into a name→values map.
   // Launched immediately after the header scan so it runs in parallel with
   // the FASTA decompression (the main bottleneck).
-  using AbdMap = phmap::flat_hash_map<std::string, RawAbdEntry>;
-  std::future<AbdMap> abd_future;
+  using DepthMap = phmap::flat_hash_map<std::string, RawDepthEntry>;
+  std::future<DepthMap> depth_future;
   {
-    if (hasABD) {
+    if (has_depth) {
       verbose_message("Parsing abundance file header [%.1fGb / %.1fGb]\n",
                       getUsedPhysMem(), getTotalPhysMem() / 1024 / 1024);
-      nABD = ncols(abdFile.c_str(), 1) - nNonFeat;
+      num_depth_samples = ncols(depth_file.c_str(), 1) - nNonFeat;
       if (!cvExt) {
-        if (nABD % 2 != 0) {
+        if (num_depth_samples % 2 != 0) {
           cerr << "[Error!] Number of columns (excluding the first column) in "
                   "abundance data file is not even.\n";
           exit(1);
         }
-        nABD /= 2;
+        num_depth_samples /= 2;
       }
-      // Launch ABD pre-parse on a background thread.  It runs while
+      // Launch depth_matrix pre-parse on a background thread.  It runs while
       // libdeflate decompresses and parses the FASTA below.
-      abd_future = std::async(std::launch::async,
-                              parse_abd_async,
-                              abdFile, cvExt, nABD, fullHeader, (int)numThreads);
+      depth_future = std::async(std::launch::async,
+                              parse_depth_async,
+                              depth_file, cvExt, num_depth_samples, fullHeader, (int)numThreads);
     }
 
     verbose_message("Parsing assembly file [%.1fGb / %.1fGb]\n",
@@ -1519,12 +1468,12 @@ int main(int ac, char *av[]) {
     const bool is_gz = (inFile.size() >= 3 &&
                         inFile.compare(inFile.size()-3, 3, ".gz") == 0);
 
-    // Threshold: compressed file must be < FKMV_LIBDEFLATE_MAXGB GB to use
+    // Threshold: compressed file must be < RABBIT_LIBDEFLATE_MAXGB GB to use
     // libdeflate one-shot.  Larger files use streaming zlib to avoid OOM.
     // Default 2 GB → decompressed peak ≈ 9-12 GB, safe on most servers.
-    // Set FKMV_LIBDEFLATE_MAXGB=0 to always use streaming zlib.
+    // Set RABBIT_LIBDEFLATE_MAXGB=0 to always use streaming zlib.
     size_t libdeflate_max_bytes = 2ULL * 1024 * 1024 * 1024;
-    if (const char *ev = rabbit_env("RABBIT_LIBDEFLATE_MAXGB", "FKMV_LIBDEFLATE_MAXGB"))
+    if (const char *ev = rb_getenv("RABBIT_LIBDEFLATE_MAXGB"))
       libdeflate_max_bytes = (size_t)(atof(ev) * 1024.0 * 1024 * 1024);
     const size_t gz_file_bytes = is_gz ? (size_t)filesize(inFile.c_str()) : 0;
     const bool use_libdeflate  = is_gz && (gz_file_bytes <= libdeflate_max_bytes);
@@ -1559,7 +1508,7 @@ int main(int ac, char *av[]) {
             if (!fullHeader) trim_fasta_label(name);
 
             if (seq_len >= (size_t)minContig) {
-              if (hasABD && contigs.find(name) != contigs.end()) {
+              if (has_depth && contigs.find(name) != contigs.end()) {
                 if (debug) verbose_message("Skipping duplicate contig: %s\n", name.c_str());
                 nskip++;
                 return;
@@ -1569,8 +1518,8 @@ int main(int ac, char *av[]) {
               seqs.emplace_back(seq_ptr, seq_len);
               seq_lens.push_back(seq_len);
               nobs++;
-            } else if (seq_len >= (size_t)minSmallContig) {
-              if (hasABD && small_contigs.find(name) != small_contigs.end()) {
+            } else if (seq_len >= (size_t)min_small_contig) {
+              if (has_depth && small_contigs.find(name) != small_contigs.end()) {
                 nskip1++;
                 return;
               }
@@ -1596,7 +1545,7 @@ int main(int ac, char *av[]) {
       }
     } else if (is_gz && !use_libdeflate) {
       verbose_message("Large .gz file (%.0fMB > %.0fMB threshold): using streaming zlib "
-                      "[set FKMV_LIBDEFLATE_MAXGB=<N> to adjust]\n",
+                      "[set RABBIT_LIBDEFLATE_MAXGB=<N> to adjust]\n",
                       gz_file_bytes / 1048576.0, libdeflate_max_bytes / 1048576.0);
     }
 
@@ -1607,19 +1556,19 @@ int main(int ac, char *av[]) {
     if (!parsed_ok && !is_gz) {
       const bool stream_pmh_mmap = rb_env_pmh_on();
       const bool no_store_seqs_mmap = [&]() -> bool {
-        const char *e = rabbit_env("RABBIT_NOSTORE_SEQS", "FKMV_NOSTORE_SEQS"); return e && e[0] == '1';
+        const char *e = rb_getenv("RABBIT_NOSTORE_SEQS"); return e && e[0] == '1';
       }();
       const int pmh_k_mmap = [&]() -> int {
-        const char *e = rabbit_env("RABBIT_PMHK", "FKMV_PMHK"); return e ? std::atoi(e) : 4;
+        const char *e = rb_getenv("RABBIT_PMHK"); return e ? std::atoi(e) : 4;
       }();
       const uint32_t pmh_m_mmap = sketch_size;
       // Read precision-tuning globals early so build_pmh_winners (called inline
       // in parse_fasta_mmap_parallel) already sees the correct settings.
       g_gc_norm      = rb_env_gc_norm();
-      g_gc_norm_cap  = [] { const char *e = rabbit_env("RABBIT_GC_NORM_CAP", "FKMV_GC_NORM_CAP");
+      g_gc_norm_cap  = [] { const char *e = rb_getenv("RABBIT_GC_NORM_CAP");
                             double v = e ? std::atof(e) : 20.0; return (v < 1.0) ? 20.0 : v; }();
-      g_idf_norm     = [] { const char *e = rabbit_env("RABBIT_IDF_NORM", "FKMV_IDF_NORM"); return e && e[0] == '1'; }();
-      g_exact_cos_cmp = [] { const char *e = rabbit_env("RABBIT_EXACT_COS", "FKMV_EXACT_COS");
+      g_idf_norm     = [] { const char *e = rb_getenv("RABBIT_IDF_NORM"); return e && e[0] == '1'; }();
+      g_exact_cos_cmp = [] { const char *e = rb_getenv("RABBIT_EXACT_COS");
                              return e && std::atoi(e) >= 1; }();
 
       if (no_store_seqs_mmap) onlyLabel = true;
@@ -1632,7 +1581,7 @@ int main(int ac, char *av[]) {
 
       if (parse_fasta_mmap_parallel(
               inFile, (int)numThreads,
-              minContig, minSmallContig,
+              minContig, min_small_contig,
               fullHeader,
               stream_pmh_mmap, no_store_seqs_mmap,
               pmh_m_mmap, pmh_k_mmap,
@@ -1659,7 +1608,7 @@ int main(int ac, char *av[]) {
         // Merge results into global arrays (serial, but O(nobs) and fast)
         size_t nskip = 0, nskip1 = 0;
         for (auto &rec : mmap_large) {
-          if (hasABD && contigs.find(rec.name) != contigs.end()) { nskip++; continue; }
+          if (has_depth && contigs.find(rec.name) != contigs.end()) { nskip++; continue; }
           const size_t r = nobs++;
           contigs[rec.name] = r + nskip;
           contig_names.push_back(rec.name);
@@ -1675,7 +1624,7 @@ int main(int ac, char *av[]) {
           }
         }
         for (auto &rec : mmap_small) {
-          if (hasABD && small_contigs.find(rec.name) != small_contigs.end()) { nskip1++; continue; }
+          if (has_depth && small_contigs.find(rec.name) != small_contigs.end()) { nskip1++; continue; }
           small_contigs[rec.name] = nobs1 + nskip1;
           small_contig_names.push_back(rec.name);
           small_seqs.push_back(std::move(rec.seq));
@@ -1745,15 +1694,13 @@ int main(int ac, char *av[]) {
         }
 
         // Exact cosine mode: L2-normalise (optionally z-score) → g_k4cosine_flat
-        // FKMV_EXACT_COS=1: cosine of raw GC-norm freqs (each centred at 1.0 avg)
-        // FKMV_EXACT_COS=2: cosine of z-score = (GC_norm_freq - 1.0), emphasising
-        //                   k-mers that deviate from their per-base expected frequency.
-        //                   More analogous to TNF's Euclidean distance on normalised
-        //                   tetranucleotide deviation profiles.
+        // RABBIT_EXACT_COS=1: cosine of raw GC-norm freqs (each centred at 1.0 avg)
+        // RABBIT_EXACT_COS=2: cosine of z-score = (GC_norm_freq - 1.0), emphasising
+        //                     k-mers that deviate from their per-base expected frequency.
         if (g_exact_cos_cmp && !g_k4freq_flat.empty()) {
           g_k4freq_flat.resize((size_t)nobs * 256);
           g_k4cosine_flat.resize((size_t)nobs * 256);
-          const bool use_zscore = ([] { const char *e = rabbit_env("RABBIT_EXACT_COS", "FKMV_EXACT_COS");
+          const bool use_zscore = ([] { const char *e = rb_getenv("RABBIT_EXACT_COS");
                                        return e ? std::atoi(e) : 0; }() >= 2);
           #pragma omp parallel for schedule(static) num_threads(numThreads)
           for (int r = 0; r < (int)nobs; ++r) {
@@ -1784,20 +1731,20 @@ int main(int ac, char *av[]) {
     // ── streaming zlib fallback (plain FASTA, large .gz, or libdeflate error) ─
     // Borrows RabbitTClust's ThreadPool concept: one kseq reader thread produces
     // records; N-1 OMP task threads build PMH sketches concurrently (overlap
-    // decompression with computation).  Only active when FKMV_PMH=1.
+    // decompression with computation).  Only active when RABBIT_PMH=1.
     if (!parsed_ok) {
       // ── Detect streaming sketch mode early (before kseq loop) ────────────
       // We read env vars here so g_win_flat can be pre-reserved before any
       // task is spawned (prevents reallocation while tasks hold data pointers).
       const bool stream_pmh = rb_env_pmh_on();
       const bool no_store_seqs = [&]() -> bool {
-        // FKMV_NOSTORE_SEQS=1: skip in-RAM sequence storage (saves 100GB+ for
+        // RABBIT_NOSTORE_SEQS=1: skip in-RAM sequence storage (saves 100GB+ for
         // huge assemblies); forces label-only output since sequences are gone.
-        const char *e = rabbit_env("RABBIT_NOSTORE_SEQS", "FKMV_NOSTORE_SEQS"); return e && e[0] == '1';
+        const char *e = rb_getenv("RABBIT_NOSTORE_SEQS"); return e && e[0] == '1';
       }();
       const uint32_t s_pmh_m = sketch_size;
       const int s_pmh_k = [&]() -> int {
-        const char *e = rabbit_env("RABBIT_PMHK", "FKMV_PMHK"); return e ? std::atoi(e) : 4;
+        const char *e = rb_getenv("RABBIT_PMHK"); return e ? std::atoi(e) : 4;
       }();
       // Per-thread scratch buffers for build_pmh_winners (reused across tasks
       // on the same thread; tasks on one thread are non-concurrent → safe).
@@ -1816,7 +1763,7 @@ int main(int ac, char *av[]) {
                         est_nobs * s_pmh_m * 4.0 / (1 << 20), est_nobs);
         if (no_store_seqs) {
           onlyLabel = true;
-          verbose_message("FKMV_NOSTORE_SEQS=1: sequences not stored; "
+          verbose_message("RABBIT_NOSTORE_SEQS=1: sequences not stored; "
                           "output will be label-only (saves ~100GB+ RAM)\n");
         }
       }
@@ -1853,7 +1800,7 @@ int main(int ac, char *av[]) {
             std::string name(seq->name.s);
             if (!fullHeader) trim_fasta_label(name);
             if (seq->seq.l >= minContig) {
-              if (hasABD && contigs.find(name) != contigs.end()) {
+              if (has_depth && contigs.find(name) != contigs.end()) {
                 if (debug) verbose_message("Skipping duplicate contig: %s\n", name.c_str());
                 nskip++;
                 continue;
@@ -1895,8 +1842,8 @@ int main(int ac, char *av[]) {
                   free(sc);
                 }
               }
-            } else if (seq->seq.l >= minSmallContig) {
-              if (hasABD && small_contigs.find(name) != small_contigs.end()) {
+            } else if (seq->seq.l >= min_small_contig) {
+              if (has_depth && small_contigs.find(name) != small_contigs.end()) {
                 nskip1++;
                 continue;
               }
@@ -1936,23 +1883,23 @@ int main(int ac, char *av[]) {
     }
     if (os) { os->close(); delete os; }
 
-    // ── Merge pre-parsed ABD data (async result) into ABD matrices ───────
-    // abd_future was launched before FASTA decompression and should be
+    // ── Merge pre-parsed depth_matrix data (async result) into depth_matrix matrices ───────
+    // depth_future was launched before FASTA decompression and should be
     // complete (or nearly so) by the time we reach here.
-    if (hasABD) {
+    if (has_depth) {
       verbose_message("Merging abundance data [%.1fGb / %.1fGb]\n",
                       getUsedPhysMem(), getTotalPhysMem() / 1024 / 1024);
 
-      AbdMap abd_map = abd_future.get();   // blocks only if not yet done
+      DepthMap depth_map = depth_future.get();   // blocks only if not yet done
 
       size_t r = 0, r1 = 0;
       size_t num = 0, nskip = 0;
       size_t num1 = 0, nskip1 = 0;
       size_t ignored_too_small = 0;
 
-      ABD.resize(nobs, nABD, false);
-      ABD_VAR.resize(nobs, nABD, false);
-      small_ABD.resize(nobs1, nABD, false);
+      depth_matrix.resize(nobs, num_depth_samples, false);
+      depth_var_matrix.resize(nobs, num_depth_samples, false);
+      small_depth_matrix.resize(nobs1, num_depth_samples, false);
 
       // Iterate large contigs in order (preserves original row semantics)
       for (size_t ci = 0; ci < contig_names.size(); ++ci) {
@@ -1963,13 +1910,13 @@ int main(int ac, char *av[]) {
         size_t row = idx - nskip;
         if (row >= nobs) continue;
 
-        auto jt = abd_map.find(name);
-        if (jt == abd_map.end()) { ignored_too_small++; continue; }
-        const RawAbdEntry& entry = jt->second;
+        auto jt = depth_map.find(name);
+        if (jt == depth_map.end()) { ignored_too_small++; continue; }
+        const RawDepthEntry& entry = jt->second;
 
-        for (int i = 0; i < nABD; ++i) {
-          ABD(row, i) = entry.means[i];
-          if (!cvExt) ABD_VAR(row, i) = entry.vars[i];
+        for (int i = 0; i < num_depth_samples; ++i) {
+          depth_matrix(row, i) = entry.means[i];
+          if (!cvExt) depth_var_matrix(row, i) = entry.vars[i];
         }
         r++;  num++;  totalSize += seq_lens[idx];
       }
@@ -1983,12 +1930,12 @@ int main(int ac, char *av[]) {
         size_t row = idx - nskip1;
         if (row >= nobs1) continue;
 
-        auto jt = abd_map.find(name);
-        if (jt == abd_map.end()) { ignored_too_small++; continue; }
-        const RawAbdEntry& entry = jt->second;
+        auto jt = depth_map.find(name);
+        if (jt == depth_map.end()) { ignored_too_small++; continue; }
+        const RawDepthEntry& entry = jt->second;
 
-        for (int i = 0; i < nABD; ++i) {
-          small_ABD(row, i) = entry.means[i];
+        for (int i = 0; i < num_depth_samples; ++i) {
+          small_depth_matrix(row, i) = entry.means[i];
         }
         r1++;  num1++;  totalSize1 += small_seq_lens[idx];
       }
@@ -2009,24 +1956,24 @@ int main(int ac, char *av[]) {
       contig_names.erase(std::remove(contig_names.begin(), contig_names.end(), ""), contig_names.end());
       small_contig_names.erase(std::remove(small_contig_names.begin(), small_contig_names.end(), ""), small_contig_names.end());
 
-      ABD.resize(nobs, nABD, true);
-      ABD_VAR.resize(nobs, nABD, true);
-      small_ABD.resize(nobs1, nABD, true);
+      depth_matrix.resize(nobs, num_depth_samples, true);
+      depth_var_matrix.resize(nobs, num_depth_samples, true);
+      small_depth_matrix.resize(nobs1, num_depth_samples, true);
 
       verbose_message("Merged %d contigs and %d coverages from %s "
                       "[%.1fGb / %.1fGb]. Ignored %d too-small contigs.\n",
-                      r, nABD, abdFile.c_str(),
+                      r, num_depth_samples, depth_file.c_str(),
                       getUsedPhysMem(), getTotalPhysMem() / 1024 / 1024,
                       ignored_too_small);
     } else {
-      // No ABD file - set totalSize from sequence lengths
+      // No depth_matrix file - set totalSize from sequence lengths
       for (auto l : seq_lens)       totalSize  += l;
       for (auto l : small_seq_lens) totalSize1 += l;
       contigs.clear();
       small_contigs.clear();
-      ABD.resize(nobs, 1, false);
-      ABD_VAR.resize(nobs, 1, false);
-      small_ABD.resize(nobs1, 1, false);
+      depth_matrix.resize(nobs, 1, false);
+      depth_var_matrix.resize(nobs, 1, false);
+      small_depth_matrix.resize(nobs1, 1, false);
     }
   }
 
@@ -2040,31 +1987,31 @@ int main(int ac, char *av[]) {
     return 1;
   }
 
-  // ── Build FastKMV sketches (replaces TNF computation) ─────────────────
-  // When the inverted-index graph build is active (FKMV_GRAPH_INDEX=1) we also
+  // ── Build composition sketches ────────────────────────────────────────
+  // When the inverted-index graph build is active (RABBIT_GRAPH_INDEX=1) we also
   // insert each sketch's (bucket, min-value) keys directly into a per-thread
   // phmap accumulator here, so the index is fully populated by the time sketch
   // building finishes.  This eliminates the separate N × m skKeys array.
   const bool build_index = []() -> bool {
-    const char *e = rabbit_env("RABBIT_GRAPH_INDEX", "FKMV_GRAPH_INDEX");
+    const char *e = rb_getenv("RABBIT_GRAPH_INDEX");
     return e && e[0] == '1';
   }();
 
   verbose_message("Building composition sketches%s. nobs=%zd k=%d m=%d\n",
-                  (nABD > 1 ? " + abundance ranking" : ""),
+                  (num_depth_samples > 1 ? " + abundance ranking" : ""),
                   nobs, sketch_kmer_size, sketch_size);
 
   // ── Weighted ProbMinHash4 path setup must come BEFORE builder creation ──
   g_pmh_mode    = rb_env_pmh_on();
-  g_pmh_k       = [] { const char *e = rabbit_env("RABBIT_PMHK", "FKMV_PMHK"); return e ? std::atoi(e) : 4; }();
-  g_pmh_base_on = [] { const char *e = rabbit_env("RABBIT_PMH_BASE", "FKMV_PMH_BASE"); return !e || e[0] != '0'; }();
+  g_pmh_k       = [] { const char *e = rb_getenv("RABBIT_PMHK"); return e ? std::atoi(e) : 4; }();
+  g_pmh_base_on = [] { const char *e = rb_getenv("RABBIT_PMH_BASE"); return !e || e[0] != '0'; }();
   g_w_comp      = rb_env_w_comp();
   g_mutual_knn  = rb_env_mutual_knn_on();
-  g_neg_abd_thr = rb_env_neg_abd_thr();
-  g_edge_power  = [] { const char *e = rabbit_env("RABBIT_EDGE_POWER", "FKMV_EDGE_POWER"); double v = e ? std::atof(e) : 1.0;
+  g_neg_depth_thr = rb_env_neg_depth_thr();
+  g_edge_power  = [] { const char *e = rb_getenv("RABBIT_EDGE_POWER"); double v = e ? std::atof(e) : 1.0;
                        return (v < 0.1) ? 1.0 : v; }();
   g_gc_norm     = rb_env_gc_norm();
-  g_gc_norm_cap = [] { const char *e = rabbit_env("RABBIT_GC_NORM_CAP", "FKMV_GC_NORM_CAP"); double v = e ? std::atof(e) : 20.0;
+  g_gc_norm_cap = [] { const char *e = rb_getenv("RABBIT_GC_NORM_CAP"); double v = e ? std::atof(e) : 20.0;
                        return (v < 1.0) ? 20.0 : v; }();
   if (g_pmh_mode) {
     g_pmh_m    = sketch_size;
@@ -2073,29 +2020,29 @@ int main(int ac, char *av[]) {
     if (g_pmh_built_streaming) {
       // g_win_flat already populated during the kseq streaming pass;
       // skip re-allocation and re-computation.
-      verbose_message("FKMV_PMH=1 (streaming pre-built): "
+      verbose_message("RABBIT_PMH=1 (streaming pre-built): "
                       "skipping g_win_flat allocation (already %zu entries)\n",
                       g_win_flat.size() / g_pmh_m);
     } else {
       g_win_flat.assign((size_t)nobs * g_pmh_m, 0u);
       g_win64_flat.assign((size_t)nobs * g_pmh_m, 0ULL);
     }
-    verbose_message("FKMV_PMH=1: weighted ProbMinHash4 graph metric "
+    verbose_message("RABBIT_PMH=1: weighted ProbMinHash4 graph metric "
                     "(k=%d, m=%u, count-weighted Jaccard, baseline_corr=%d)\n",
                     g_pmh_k, g_pmh_m, (int)g_pmh_base_on);
   }
 
   // Construct the builders before the parallel loop so threads can call insert().
-  std::unique_ptr<fkmv_invidx::InvertedIndexBuilder> idx_builder;
+  std::unique_ptr<rabbit_invidx::InvertedIndexBuilder> idx_builder;
   if (build_index)
-    idx_builder = std::make_unique<fkmv_invidx::InvertedIndexBuilder>(
+    idx_builder = std::make_unique<rabbit_invidx::InvertedIndexBuilder>(
         (int)numThreads);
 
-  // PMH-winner inverted index builder (active whenever FKMV_PMH=1).
+  // PMH-winner inverted index builder (active whenever RABBIT_PMH=1).
   // Built in the same parallel loop — no extra pass over seqs[].
-  std::unique_ptr<fkmv_invidx::InvertedIndexBuilder> pmh_idx_builder;
+  std::unique_ptr<rabbit_invidx::InvertedIndexBuilder> pmh_idx_builder;
   if (g_pmh_mode)
-    pmh_idx_builder = std::make_unique<fkmv_invidx::InvertedIndexBuilder>(
+    pmh_idx_builder = std::make_unique<rabbit_invidx::InvertedIndexBuilder>(
         (int)numThreads);
 
   // ── Fusion B+E: sketch update + buildSig + sig_flat copy + freeReg
@@ -2107,7 +2054,7 @@ int main(int ac, char *av[]) {
   g_sig_flat.resize(nobs * sig_stride);
 
   // Spearman scratch buffer (one per thread, reused across iterations)
-  std::vector<StoredDistance> rowMat_proto(nABD);
+  std::vector<StoredDistance> rowMat_proto(num_depth_samples);
   std::vector<std::vector<StoredDistance>> threadRowMat(numThreads, rowMat_proto);
 
   // Per-thread reusable k-mer code buffer for the weighted ProbMinHash path.
@@ -2118,17 +2065,17 @@ int main(int ac, char *av[]) {
   g_sketches.resize(nobs, nullptr);
   // In weighted-ProbMinHash mode the OPH (k=21) b-bit sketch is never read
   // (graph_sim uses the PMH winners), so skip building it entirely unless an
-  // OPH-consuming option is active (inverted index or TNF-min recruitment).
+  // OPH-consuming option is active (inverted index or composition-min recruitment).
   // This removes a full per-contig MinHash pass + 30k heap allocations.
   const bool oph_needed = !g_pmh_mode || build_index || (recruitSimFactor > 0.0);
 
   // Snapshot raw per-sample mean depths BEFORE the loop below rank-transforms
-  // ABD in place (Fusion E / Spearman). marker_guided_split needs raw means.
-  if ((!seedMarkerFile.empty() || g_abd_split) && nABD >= 1) {
-    g_large_means.assign((size_t)nobs * nABD, 0.0f);
+  // depth_matrix in place (Fusion E / Spearman). marker_guided_split needs raw means.
+  if ((!marker_seed_file.empty() || g_split_abundance) && num_depth_samples >= 1) {
+    g_large_means.assign((size_t)nobs * num_depth_samples, 0.0f);
     for (size_t r = 0; r < nobs; ++r)
-      for (size_t i = 0; i < (size_t)nABD; ++i)
-        g_large_means[r * nABD + i] = (float)ABD(r, i);
+      for (size_t i = 0; i < (size_t)num_depth_samples; ++i)
+        g_large_means[r * num_depth_samples + i] = (float)depth_matrix(r, i);
   }
 
   {
@@ -2137,7 +2084,7 @@ int main(int ac, char *av[]) {
     for (size_t r = 0; r < nobs; ++r) {
       // ── Sketch (Fusion B): update → buildSig → sig_flat copy → freeReg
       if (oph_needed) {
-        g_sketches[r] = new fkmv_embed::FastKMV(sketch_size, sketch_kmer_size, sketch_bits);
+        g_sketches[r] = new rabbit_sketch::KmerSketch(sketch_size, sketch_kmer_size, sketch_bits);
         g_sketches[r]->update(seqs[r].c_str(), seqs[r].size());  // fills reg_[]
 
         if (build_index) {
@@ -2156,8 +2103,8 @@ int main(int ac, char *av[]) {
         if (!build_index) g_sketches[r]->freeRegisters();             // free reg_[]
       }
 
-      // ── Weighted ProbMinHash4 winners (FKMV_PMH=1): frequency-weighted,
-      //     small-k composition spectrum (TNF analogue) ──────────────────
+      // ── Weighted ProbMinHash4 winners (RABBIT_PMH=1): frequency-weighted,
+      //     small-k composition spectrum ───────────────────────────────────
       // Skip when g_pmh_built_streaming: winners were already written to
       // g_win_flat during the kseq streaming pass (streaming producer-consumer).
       if (g_pmh_mode && !g_pmh_built_streaming) {
@@ -2174,10 +2121,10 @@ int main(int ac, char *av[]) {
           pmh_idx_builder->insert(tid, key, (uint32_t)r);
       }
 
-      // ── Spearman ranking (Fusion E): rank ABD[r] in-place per thread
-      if (nABD > 1) {
+      // ── Spearman ranking (Fusion E): rank depth_matrix[r] in-place per thread
+      if (num_depth_samples > 1) {
         auto &rowMat = threadRowMat[omp_get_thread_num()];
-        MatrixRowType rRow(ABD, r);
+        MatrixRowType rRow(depth_matrix, r);
         std::copy(rRow.begin(), rRow.end(), rowMat.begin());
         rank(rowMat, rowMat);
         std::copy(rowMat.begin(), rowMat.end(), rRow.begin());
@@ -2194,7 +2141,7 @@ int main(int ac, char *av[]) {
   // Finalise the index (merge thread maps, remove singletons, CSR flatten).
   if (build_index) {
     verbose_message("Merging inverted index thread maps...\n");
-    g_inv_idx = std::make_unique<fkmv_invidx::InvertedIndex>(
+    g_inv_idx = std::make_unique<rabbit_invidx::InvertedIndex>(
         idx_builder->build((int)numThreads));
     idx_builder.reset();
     verbose_message("Inverted index ready: %zu postings / %zu keys "
@@ -2214,12 +2161,12 @@ int main(int ac, char *av[]) {
 
   verbose_message("Composition sketches ready%s. [%.1fGb / %.1fGb]"
                   "                          \n",
-                  (nABD > 1 ? " + Spearman" : ""),
+                  (num_depth_samples > 1 ? " + Spearman" : ""),
                   getUsedPhysMem(), getTotalPhysMem() / 1024 / 1024);
-  if (nABD > 1) verbose_message("Calculated spearman for large contigs\n");
+  if (num_depth_samples > 1) verbose_message("Calculated spearman for large contigs\n");
 
   // Precompute per-contig abundance non-zero flags so is_nz() in the O(N²)
-  // graph loop reduces to two byte loads instead of an nABD matrix scan.
+  // graph loop reduces to two byte loads instead of an num_depth_samples matrix scan.
   build_anynz_cache();
 
   // Estimate the winner-match baseline b0 before calibration so that both the
@@ -2245,15 +2192,15 @@ int main(int ac, char *av[]) {
       // neighbor heaps, then calibrates, then emits edges.
       // Replaces 771M (calib) + 475M (graph) = 1,246M pair-sims with 475M.
       if (simCutoff < 1. && g_pmh_mode && nobs > 25000) {
-        simCutoff = gen_fused_calib_graph(g, maxP);
+        simCutoff = gen_fused_calib_graph(g, calib_connected_pct);
       } else {
         // ── Original sequential path (non-PMH, manual simCutoff, or small N) ──
         if (simCutoff < 1.) {
           if (nobs <= 25000) {
-            simCutoff = calibrate_sim_cutoff(maxP, true);
+            simCutoff = calibrate_sim_cutoff(calib_connected_pct, true);
           } else {
             verbose_message("Running fused 10-round calibration (Fusion C)...\n");
-            simCutoff = calibrate_sim_cutoff_fused(maxP);
+            simCutoff = calibrate_sim_cutoff_fused(calib_connected_pct);
           }
         } else {
           simCutoff *= 10;
@@ -2265,9 +2212,9 @@ int main(int ac, char *av[]) {
         build_similarity_graph(g, simCutoff / 1000.);
       }
 
-      // ── 3. Compute ABD graph weights and composite scores ──────────────
-      if (hasABD) {
-        verbose_message("Calculating ABD graph [%.1fGb / %.1fGb]               "
+      // ── 3. Compute depth_matrix graph weights and composite scores ──────────────
+      if (has_depth) {
+        verbose_message("Calculating depth_matrix graph [%.1fGb / %.1fGb]               "
                         "                           \n",
                         getUsedPhysMem(), getTotalPhysMem() / 1024 / 1024);
         size_t ne = g.getEdgeCount();
@@ -2276,23 +2223,23 @@ int main(int ac, char *av[]) {
 #pragma omp parallel for schedule(dynamic, 1)
         for (size_t e = 0; e < ne; ++e) {
           size_t i = g.from[e], j = g.to[e];
-          if (nABD <= 1) {
+          if (num_depth_samples <= 1) {
             double w = (double)g.sComp[e];
             if (g_edge_power != 1.0) w = std::pow(w, g_edge_power);
             g.edgeScore[e] = (StoredDistance)w;
           } else {
-            double corr = cal_abd_corr(i, j);
+            double corr = cal_depth_corr(i, j);
             if (!std::isfinite(corr)) { g.edgeScore[e] = 0.0f; continue; }
-            // Negative ABD filter: if raw corr is sufficiently negative,
+            // Negative depth_matrix filter: if raw corr is sufficiently negative,
             // the two contigs almost certainly come from different genomes.
-            if (g_neg_abd_thr > -0.99 && corr < g_neg_abd_thr) {
+            if (g_neg_depth_thr > -0.99 && corr < g_neg_depth_thr) {
               g.edgeScore[e] = 0.0f; continue;
             }
             if (corr < 0) corr = 0;
             double sComp_v = g.sComp[e];
-            double minS_v = minS;
+            double min_edge_weight_v = min_edge_weight;
             double w = g_w_comp * sComp_v + (1.0 - g_w_comp) * corr;
-            if (!std::isfinite(w) || w < minS_v) w = 0.0;
+            if (!std::isfinite(w) || w < min_edge_weight_v) w = 0.0;
             // Edge power: raise to p>1 to de-emphasise borderline edges.
             if (g_edge_power != 1.0 && w > 0.0) w = std::pow(w, g_edge_power);
             g.edgeScore[e] = (StoredDistance)w;
@@ -2300,7 +2247,7 @@ int main(int ac, char *av[]) {
         }
       } else {
         g.edgeScore = g.sComp;
-        for (auto &s : g.edgeScore) if (s < minS) s = 0.0f;
+        for (auto &s : g.edgeScore) if (s < min_edge_weight) s = 0.0f;
       }
 
       // ── 4. Build incidence list ────────────────────────────────────────
@@ -2332,7 +2279,7 @@ int main(int ac, char *av[]) {
       std::iota(node_order.begin(), node_order.end(), 0);
       std::shuffle(node_order.begin(), node_order.end(), std::default_random_engine(seed));
 
-      propagate_labels(g, membership, node_order);
+      cluster_by_propagation(g, membership, node_order);
 
       // ── 6. Collect bins ────────────────────────────────────────────────
       for (size_t i = 0; i < nobs; ++i) {
@@ -2342,7 +2289,7 @@ int main(int ac, char *av[]) {
       mems = membership;
     } // graph g destroyed here
 
-    if (noAdd) break;
+    if (no_recruit) break;
 
     // ── 7. Recruit lost and small contigs ─────────────────────────────────
     std::vector<size_t> leftovers;
@@ -2357,12 +2304,12 @@ int main(int ac, char *av[]) {
                     "contigs [%.1fGb / %.1fGb]\n",
                     getUsedPhysMem(), getTotalPhysMem() / 1024 / 1024);
 
-    Matrix spearman(nobs, nABD);
-    if (nABD > 1) {
+    Matrix spearman(nobs, num_depth_samples);
+    if (num_depth_samples > 1) {
 #pragma omp parallel for schedule(dynamic, 1)
       for (size_t r = 0; r < nobs; ++r) {
         auto &rowMat = threadRowMat[omp_get_thread_num()];
-        const MatrixRowType rRow(ABD, r);
+        const MatrixRowType rRow(depth_matrix, r);
         std::copy(rRow.begin(), rRow.end(), rowMat.begin());
         rank(rowMat, rowMat);
         MatrixRowType sRow(spearman, r);
@@ -2375,7 +2322,7 @@ int main(int ac, char *av[]) {
     // ── Build cluster → index mapping ─────────────────────────────────────
     std::unordered_map<size_t, size_t> cls_id_to_idx;
     std::vector<size_t> clsIds;
-    if (recruitSimFactor > 0.0 || recruitToAbdCentroid) {
+    if (recruitSimFactor > 0.0 || recruit_to_depth_centroid) {
       auto sz = cls.size();
       cls_id_to_idx.reserve(sz);
       clsIds.reserve(sz);
@@ -2387,23 +2334,23 @@ int main(int ac, char *av[]) {
     }
 
     // ── Build abundance centroids ─────────────────────────────────────────
-    if (recruitToAbdCentroid) {
-      ABD_centroids.resize(cls.size(), nABD, false);
+    if (recruit_to_depth_centroid) {
+      depth_centroids.resize(cls.size(), num_depth_samples, false);
       verbose_message("Calculating centroid abundances of existing %d bins "
                       "[%.1fGb / %.1fGb]\n",
                       cls.size(), getUsedPhysMem(),
                       getTotalPhysMem() / 1024 / 1024);
       for (auto &[clsId, contigIds] : cls) {
-        std::vector<double> tmp_centroid(nABD, 0.0);
+        std::vector<double> tmp_centroid(num_depth_samples, 0.0);
         for (auto contigId : contigIds)
-          for (auto i = 0; i < (int)nABD; i++)
+          for (auto i = 0; i < (int)num_depth_samples; i++)
             tmp_centroid[i] += spearman(contigId, i);
-        for (auto i = 0; i < (int)nABD; i++)
-          ABD_centroids(cls_id_to_idx[clsId], i) = tmp_centroid[i];
+        for (auto i = 0; i < (int)num_depth_samples; i++)
+          depth_centroids(cls_id_to_idx[clsId], i) = tmp_centroid[i];
       }
     }
 
-    // ── Build FastKMV centroid sketches (replaces TNF_centroids) ─────────
+    // ── Build centroid sketches for composition-based recruitment ──────────
     if (recruitSimFactor > 0.0) {
       auto sz = cls.size();
       g_centroids.assign(sz, nullptr);
@@ -2418,10 +2365,10 @@ int main(int ac, char *av[]) {
         auto &contigIds = cls[clsId];
         if (contigIds.empty()) continue;
         // Union merge of all contig sketches in the cluster
-        fkmv_embed::FastKMV merged(*g_sketches[contigIds[0]]);
+        rabbit_sketch::KmerSketch merged(*g_sketches[contigIds[0]]);
         for (size_t ci = 1; ci < contigIds.size(); ++ci)
           merged = merged.merge(*g_sketches[contigIds[ci]]);
-        g_centroids[idx] = new fkmv_embed::FastKMV(std::move(merged));
+        g_centroids[idx] = new rabbit_sketch::KmerSketch(std::move(merged));
       }
       // Pre-build centroid signatures (single producer per object) before any
       // concurrent jaccard() in the parallel recruitment loops below.
@@ -2466,7 +2413,7 @@ int main(int ac, char *av[]) {
           const auto &c = it->second;
           for (size_t i = 0; i < cs; ++i)
             for (size_t j = i + 1; j < cs; ++j)
-              corr += cal_abd_corr(c[i], c[j]);
+              corr += cal_depth_corr(c[i], c[j]);
           StoredDistance x = corr / (cs * (cs - 1) / 2);
 #pragma omp critical(CALC_MEAN_CORR)
           cls_corr[kk] = x;
@@ -2495,7 +2442,7 @@ int main(int ac, char *av[]) {
 #pragma omp parallel for schedule(dynamic, 1) reduction(+:corr)
         for (size_t i = 0; i < cs; ++i) {
           for (size_t j = i + 1; j < cs; ++j)
-            corr += cal_abd_corr(c[i], c[j]);
+            corr += cal_depth_corr(c[i], c[j]);
           prog_lg.track(cs - i);
           if (omp_get_thread_num() == 0 && prog_lg.isStepMarker())
             verbose_message(".... %s\r", prog_lg.getProgress());
@@ -2529,23 +2476,23 @@ int main(int ac, char *av[]) {
           double corr = 0;
           if (recruitSimFactor > 0.0) {
             auto cls_idx = cls_id_to_idx[kk];
-            // FastKMV Jaccard between centroid and leftover contig
+            // KmerSketch Jaccard between centroid and leftover contig
             auto sComp = g_centroids[cls_idx]
                           ? (StoredDistance)g_centroids[cls_idx]->jaccard(*g_sketches[leftovers[l]])
                           : (StoredDistance)0.0;
             if (sComp < (StoredDistance)sim_recruit_cutoff)
               continue;
           }
-          if (recruitToAbdCentroid) {
+          if (recruit_to_depth_centroid) {
             auto cls_idx = cls_id_to_idx[kk];
-            corr = cal_abd_corr(cls_idx, leftovers[l], false, true);
+            corr = cal_depth_corr(cls_idx, leftovers[l], false, true);
           } else {
             size_t i = 0;
             for (; i < minCS; ++i)
-              corr += cal_abd_corr(c[i], leftovers[l]);
+              corr += cal_depth_corr(c[i], leftovers[l]);
             if (corr / minCS < cls_corr[kk]) continue;
             for (; i < cs; ++i)
-              corr += cal_abd_corr(c[i], leftovers[l]);
+              corr += cal_depth_corr(c[i], leftovers[l]);
             corr /= cs;
           }
           if (corr >= cls_corr[kk]) {
@@ -2577,24 +2524,24 @@ int main(int ac, char *av[]) {
                       "         \n", nobs1);
 
       // Snapshot raw small-contig means for marker_guided_split before the
-      // in-place rank transform below corrupts small_ABD for that purpose.
-      if ((!seedMarkerFile.empty() || g_abd_split) && nABD >= 1) {
-        g_small_means.assign(nobs1 * (size_t)nABD, 0.0f);
+      // in-place rank transform below corrupts small_depth_matrix for that purpose.
+      if ((!marker_seed_file.empty() || g_split_abundance) && num_depth_samples >= 1) {
+        g_small_means.assign(nobs1 * (size_t)num_depth_samples, 0.0f);
         for (size_t r = 0; r < nobs1; ++r)
-          for (size_t i = 0; i < (size_t)nABD; ++i)
-            g_small_means[r * nABD + i] = (float)small_ABD(r, i);
+          for (size_t i = 0; i < (size_t)num_depth_samples; ++i)
+            g_small_means[r * num_depth_samples + i] = (float)small_depth_matrix(r, i);
       }
 
-      if (nABD > 1) {
+      if (num_depth_samples > 1) {
 #pragma omp parallel for schedule(dynamic, 1)
-        for (size_t r = 0; r < small_ABD.size1(); ++r) {
+        for (size_t r = 0; r < small_depth_matrix.size1(); ++r) {
           auto &rowMat = threadRowMat[omp_get_thread_num()];
-          MatrixRowType rRow(small_ABD, r);
+          MatrixRowType rRow(small_depth_matrix, r);
           std::copy(rRow.begin(), rRow.end(), rowMat.begin());
           rank(rowMat, rowMat);
           std::copy(rowMat.begin(), rowMat.end(), rRow.begin());
         }
-        verbose_message("Finished %d spearman corr calcs\n", small_ABD.size1());
+        verbose_message("Finished %d spearman corr calcs\n", small_depth_matrix.size1());
       }
       threadRowMat.clear();
 
@@ -2612,16 +2559,16 @@ int main(int ac, char *av[]) {
           size_t cs = c.size();
           if (cs >= minCS) {
             double corr = 0;
-            if (recruitToAbdCentroid) {
+            if (recruit_to_depth_centroid) {
               auto cls_idx = cls_id_to_idx[kk];
-              corr = cal_abd_corr(cls_idx, s, true, true);
+              corr = cal_depth_corr(cls_idx, s, true, true);
             } else {
               size_t i = 0;
               for (; i < minCS; ++i)
-                corr += cal_abd_corr(c[i], s, true);
+                corr += cal_depth_corr(c[i], s, true);
               if (corr / minCS < cls_corr[kk]) continue;
               for (; i < cs; ++i)
-                corr += cal_abd_corr(c[i], s, true);
+                corr += cal_depth_corr(c[i], s, true);
               corr /= cs;
             }
             if (corr >= cls_corr[kk]) {
@@ -2629,7 +2576,7 @@ int main(int ac, char *av[]) {
               if (sim_recruit_cutoff > 0.0) {
                 auto cls_idx = cls_id_to_idx[kk];
                 // Build a temporary sketch for this small contig
-                fkmv_embed::FastKMV small_sk(sketch_size, sketch_kmer_size, sketch_bits);
+                rabbit_sketch::KmerSketch small_sk(sketch_size, sketch_kmer_size, sketch_bits);
                 small_sk.update(small_seqs[s].c_str(), small_seqs[s].size());
                 auto sComp = g_centroids[cls_idx]
                               ? (StoredDistance)g_centroids[cls_idx]->jaccard(small_sk)
@@ -2688,15 +2635,15 @@ int main(int ac, char *av[]) {
   g_sketches.clear();
 
   verbose_message("Rescuing singleton large contigs\n");
-  rescue_singletons(cls);
+  promote_singleton_bins(cls);
 
   // ── Phase 2: split contaminated/multi-modal bins ─────────────────────────
-  // An explicit --seedMarkers takes priority (marker-guided); otherwise the
+  // An explicit --marker-seed takes priority (marker-guided); otherwise the
   // default marker-free abundance split runs (disable with --noAbdSplit).
-  if (!seedMarkerFile.empty()) {
+  if (!marker_seed_file.empty()) {
     verbose_message("Marker-guided bin splitting...\n");
     marker_guided_split(cls);
-  } else if (g_abd_split) {
+  } else if (g_split_abundance) {
     verbose_message("Abundance-guided bin splitting (marker-free)...\n");
     abundance_guided_split(cls);
   }

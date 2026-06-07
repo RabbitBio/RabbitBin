@@ -24,7 +24,22 @@ cd build && cmake .. && make rabbitbin -j
 | `prefix_bin_001.fa` | Bin FASTA files |
 | `prefix.unbinned.fa` | Unbinned contigs (with `--unbinned`) |
 
-Use `--metaBAT-compat` for legacy MetaBAT-style names (`.BinMembers.txt`, `prefix.1.fa`, …).
+## Migration from older names
+
+If you have existing scripts from an earlier checkout:
+
+| Old | New |
+|-----|-----|
+| `jgi_summarize_bam_contig_depths` | `rabbit_depth` |
+| `contigOverlaps` | `rabbit_overlap` |
+| `RABBIT_NEG_ABD` | `RABBIT_NEG_DEPTH` |
+| `FKMV_*` env vars | `RABBIT_*` only |
+
+After pulling these changes, rebuild from a clean tree:
+
+```bash
+rm -rf build && mkdir build && cd build && cmake .. && make -j
+```
 
 ## Pipeline wrapper
 
@@ -48,12 +63,11 @@ run_rabbitbin.sh assembly.fa sample1.bam sample2.bam
 
 ## Environment variables
 
-Prefer `RABBIT_*` (legacy `FKMV_*` still works):
-
 - `RABBIT_PMH` — weighted ProbMinHash graph (default on)
 - `RABBIT_MUTUAL_KNN` — mutual k-NN graph (default on)
 - `RABBIT_GC_NORM` — GC normalization mode
 - `RABBIT_W_COMP` — composition vs abundance edge weight
+- `RABBIT_NEG_DEPTH` — negative depth-correlation filter (default -0.3)
 - `RABBIT_SPLIT_SIL` — silhouette split threshold
 
 ## Source layout
@@ -61,9 +75,12 @@ Prefer `RABBIT_*` (legacy `FKMV_*` still works):
 ```text
 src/
   rabbitbin.cpp          # CLI + main pipeline
+  rabbit_depth.cpp       # BAM → depth TSV utility
+  rabbit_overlap.cpp     # cross-assembly overlap utility
   rabbitbin.h            # shared types and state
   probmh.cpp/h           # ProbMinHash composition metric
-  fkmv_embed.h           # sketch embedding
+  rabbit_sketch.h        # k-mer sketch embedding
+  rabbit_invidx.h        # inverted index for sketch keys
   impl/
     rb_cluster.cpp       # label propagation
     rb_split.cpp         # abundance / marker bin splitting
@@ -74,4 +91,5 @@ src/
 
 ## License
 
-RabbitBin incorporates code originally from [MetaBAT](https://bitbucket.org/berkeleylab/metabat) (LBNL BSD license). See `license.txt`.
+RabbitBin is released under the LBNL BSD license. Portions of the graph-clustering
+pipeline derive from earlier open-source metagenome binning work; see `license.txt`.

@@ -32,7 +32,7 @@ message("Boost libraries:" ${Boost_LIBRARIES})
 message("Boost lib ver:" ${Boost_LIB_VERSION})
 message("Boost lib dir:" ${Boost_LIBRARY_DIRS})
 
-# RabbitBin: FastKMV k-mer Jaccard metagenome binning
+# RabbitBin: sketch-based metagenome binning
 add_executable(rabbitbin rabbitbin.cpp probmh.cpp)
 if(NOT "${EXTRA_DEPENDENCIES}" STREQUAL "")
   add_dependencies(rabbitbin ${EXTRA_DEPENDENCIES})
@@ -54,7 +54,7 @@ else()
 endif()
 install(TARGETS rabbitbin DESTINATION bin/)
 
-set(targets jgi_summarize_bam_contig_depths contigOverlaps)
+set(targets rabbit_depth rabbit_overlap)
 foreach(target ${targets})
    add_executable(${target} ${target}.cpp)
    if (NOT "${EXTRA_DEPENDENCIES}" STREQUAL "")

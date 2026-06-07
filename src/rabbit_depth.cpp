@@ -1,16 +1,10 @@
-// module load samtools boost
-// g++ -g -O3 -Wall -I$BOOST_DIR/include -I$SAMTOOLS_DIR/include/bam
-// -L$SAMTOOLS_DIR/lib -o jgi_summarize_bam_contig_depths
-// jgi_summarize_bam_contig_depths.cpp -lpthread -lz -lbam -fopenmp
-// g++ -g -O3 -Wall -I$BOOST_DIR/include -I$SAMTOOLS_DIR/include/bam
-// -L$SAMTOOLS_DIR/lib -o jgi_summarize_bam_contig_depths
-// jgi_summarize_bam_contig_depths.cpp -lpthread -lz -lbam -fopenmp
+// rabbit_depth.cpp — summarize per-contig coverage depth from sorted BAM files.
 
 #include <cassert>
 #include <condition_variable>
 #include <mutex>
 
-#include "jgi_summarize_bam_contig_depths.h"
+#include "rabbit_depth.h"
 #include "version.h"
 
 #include "IOThreadBuffer.h"
@@ -45,8 +39,8 @@ static struct option long_options[] = {{"help", 0, 0, 0},
 void usage() {
   fprintf(
       stderr,
-      "jgi_summarize_bam_contig_depths %s %s\n"
-      "Usage: jgi_summarize_bam_contig_depths <options> sortedBam1 [ "
+      "rabbit_depth %s %s\n"
+      "Usage: rabbit_depth <options> sortedBam1 [ "
       "sortedBam2 ...]\n"
       "where options include:\n"
       "\t--outputDepth       arg  The file to put the contig by bam depth "
@@ -155,7 +149,7 @@ public:
       std::stringstream ss;
       ss << "WARNING: calculated a negative mean=" << mean
          << ". correctedLen=" << correctedLen << " contigDepth=" << contigDepth
-         << "\nPlease report this bam file to MetaBAT under Issue #166\n";
+         << "\nPlease report this BAM file to the RabbitBin maintainers\n";
       std::cerr << ss.str() << std::flush;
       contigDepth = 0;
       mean = 0;
@@ -164,7 +158,7 @@ public:
       std::stringstream ss;
       ss << "WARNING: calculated a huge mean=" << mean
          << ". correctedLen=" << correctedLen << " contigDepth=" << contigDepth
-         << "\nPlease report this bam file to MetaBAT under Issue #166\n";
+         << "\nPlease report this BAM file to the RabbitBin maintainers\n";
       std::cerr << ss.str() << std::flush;
       contigDepth = 0;
       mean = 0;
@@ -182,7 +176,7 @@ public:
       ss << "WARNING: received a negative mean=" << variance.mean
          << " or variance=" << variance.variance
          << ". correctedLen=" << correctedLen
-         << "\nPlease report this bam file to MetaBAT under Issue #166\n";
+         << "\nPlease report this BAM file to the RabbitBin maintainers\n";
       std::cerr << ss.str() << std::flush;
       variance.mean = 0;
       variance.variance = 0;
@@ -192,7 +186,7 @@ public:
       ss << "WARNING: received a huge mean=" << variance.mean
          << " or variance=" << variance.variance
          << ". correctedLen=" << correctedLen
-         << "\nPlease report this bam file to MetaBAT under Issue #166\n";
+         << "\nPlease report this BAM file to the RabbitBin maintainers\n";
       std::cerr << ss.str() << std::flush;
       variance.mean = 0;
       variance.variance = 0;
@@ -519,7 +513,7 @@ int main(int argc, char *argv[]) {
   }
   CheckRead::_edgeBases() = maxEdgeBases;
 
-  cerr << "jgi_summarize_bam_contig_depths " << RabbitBin_VERSION << " "
+  cerr << "rabbit_depth " << RabbitBin_VERSION << " "
        << RabbitBin_BUILD_DATE << endl;
   cerr << "Running with " << omp_get_max_threads()
        << " threads to save memory you can reduce the number of threads with "
