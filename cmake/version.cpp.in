@@ -1,0 +1,6 @@
+#include "version.h"
+
+const char *RabbitBin_VERSION = "@RB_VERSION_STRING@";
+const char *RabbitBin_BUILD_DATE = "@RB_BUILD_DATE@";
+const char *RabbitBin_VERSION_DATE = "@RB_VERSION_STRING@-@RB_BUILD_DATE@";
+const char *RabbitBin_BRANCH = "main";
