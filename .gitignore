@@ -1,0 +1,20 @@
+build/
+build*/
+jgi_summarize_bam_contig_depths
+contigOverlaps
+rabbitbin
+*.o
+.sconsign.dblite
+test/*.bins.txt.fa
+test/*.depth*
+test/*.pruned.*
+samtools*
+/include/
+/lib/
+bin
+/.autotools
+/.cproject
+.settings
+/.project
+/.pydevproject
+/Build (GNU)/
