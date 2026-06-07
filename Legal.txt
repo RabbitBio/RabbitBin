@@ -1,12 +1,17 @@
 *********
 
+RabbitBin Copyright (c) 2024-2026 RabbitBin contributors.
+All rights reserved.
+
+*********
+
 MetaBAT v1.0 to v2.0 Copyright (c) 2014, The Regents of the University of
 California, through Lawrence Berkeley National Laboratory (subject to receipt of
 any required approvals from the U.S. Dept. of Energy).  All rights reserved.
 
-If you have questions about your rights to use or distribute this software,
-please contact Berkeley Lab's technology transfer department at IPO@lbl.gov
-referring to "MetaBAT (2014-075)."
+Portions of the graph-clustering pipeline in RabbitBin derive from earlier
+open-source metagenome binning software released under the LBNL BSD license.
+See license.txt for the full terms.
 
 NOTICE.  This software was developed under funding from the U.S. Department of 
 Energy.  As such, the U.S. Government has been granted for itself and others 

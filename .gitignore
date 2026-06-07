@@ -1,7 +1,7 @@
 build/
 build*/
-jgi_summarize_bam_contig_depths
-contigOverlaps
+rabbit_depth
+rabbit_overlap
 rabbitbin
 *.o
 .sconsign.dblite

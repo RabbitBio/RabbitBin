@@ -62,7 +62,7 @@ namespace po = boost::program_options;
 
 // always use double when summing many values together to avoid precision issues
 
-// for TNF and ABD calcs use float to when SURPRISINGLY_NOT_FASTER is defined
+// for composition and depth_matrix calcs use float when SURPRISINGLY_NOT_FASTER is defined
 //#define SURPRISINGLY_NOT_FASTER
 #ifdef SURPRISINGLY_NOT_FASTER
 typedef float CALC_TYPE;
@@ -101,36 +101,35 @@ typedef boost::math::normal_distribution<StoredDistance> Normal;
 
 static const std::string version = RabbitBin_VERSION;
 static const std::string DATE = RabbitBin_BUILD_DATE;
-static bool g_metabat_compat = false;
 static bool verbose = false;
 static bool quiet = false;
 static bool debug = false;
 static bool noBinOut = false;
 static bool noSampleDepths = false;
 static Distance mergeSamplesCosign = 1.0;
-static size_t minClsSize = 200000;
+static size_t min_bin_bp = 200000;
 static size_t minContig = 2500; // minimum contig size for binning
 static std::string inFile;
-static std::string abdFile;
+static std::string depth_file;
 static bool cvExt;
 static bool fullHeader = false;
 static std::string outFile;
 static bool onlyLabel = false;
-static bool noAdd = false;
-static size_t minSmallContig =
+static bool no_recruit = false;
+static size_t min_small_contig =
     1000;          // minimum contig size for small contig binning
 size_t minCS = 10; // minimum cluster size for additional recruiting
-static bool recruitToAbdCentroid = false;
+static bool recruit_to_depth_centroid = false;
 static Distance recruitSimFactor = 0.0;
 static size_t numThreads = 0;
-static Similarity maxP = 95;
-static Similarity minS = 60;
+static Similarity calib_connected_pct = 95;
+static Similarity min_edge_weight = 60;
 static Similarity simCutoff = 0;
 static Distance minCV = 1.0; /// TODO adjust to 0.1?
 static Distance minCVSum = 1;
 static bool saveCls = false;
 static bool outUnbinned = false;
-static size_t minSample = 3;
+static size_t min_sample = 3;
 static unsigned long long totalSize = 0, totalSize1 = 0;
 
 static size_t maxEdges = 200;
@@ -159,19 +158,19 @@ static size_t nobs1 = 0; //# of small
 typedef boost::numeric::ublas::matrix<StoredDistance> Matrix;
 typedef boost::numeric::ublas::matrix_row<Matrix> MatrixRowType;
 
-static Matrix ABD;
-static Matrix ABD_VAR;
-static Matrix ABD_centroids;
-static Matrix small_ABD;
+static Matrix depth_matrix;
+static Matrix depth_var_matrix;
+static Matrix depth_centroids;
+static Matrix small_depth_matrix;
 
-static size_t nABD = 0;
+static size_t num_depth_samples = 0;
 static unsigned long long seed = 0;
 
 static size_t countLines(const char *f);
 static size_t ncols(std::ifstream &is, int skip);
 static size_t ncols(const char *f, int skip);
 
-static double cal_abd_dist(size_t r1, size_t r2, size_t i, bool &nz);
+static double cal_depth_dist(size_t r1, size_t r2, size_t i, bool &nz);
 
 static std::istream &safeGetline(std::istream &is, std::string &t);
 
@@ -210,7 +209,7 @@ public:
       incs; // incidence list which has edge id instead of node id (compared to
             // adjacent list)
   std::vector<StoredDistance> sComp;
-  std::vector<StoredDistance> edgeScore; // composite score (weight) of sComp and sABD
+  std::vector<StoredDistance> edgeScore; // composite score (weight) of sComp and depth
   ContigSet connected_nodes;
   bool hasEdges;
 
@@ -339,7 +338,7 @@ double getUsedPhysMem() {
   return (getTotalPhysMem() - getFreeMem()) / 1024. / 1024.;
 }
 
-int propagate_labels(Graph &g, std::vector<size_t> &membership,
+int cluster_by_propagation(Graph &g, std::vector<size_t> &membership,
                       std::vector<size_t> &node_order);
 
 struct CompareEdge {
@@ -348,10 +347,10 @@ struct CompareEdge {
   }
 };
 
-void rescue_singletons(BinMap &cls);
+void promote_singleton_bins(BinMap &cls);
 void output_bins(BinMap &cls);
 size_t calibrate_sim_cutoff(Distance coverage = 1., bool full = false);
-double cal_abd_corr(size_t r1, size_t r2, bool second_is_small = false,
+double cal_depth_corr(size_t r1, size_t r2, bool second_is_small = false,
                     bool first_is_centroid = false);
 // bool is_small = false, bool is_centroid = false);
 

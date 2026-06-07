@@ -1,10 +1,10 @@
 // RabbitBin module: rb_graph.cpp
 
 // ═══════════════════════════════════════════════════════════════════════════
-// build_similarity_graph  –  build edge list using FastKMV Jaccard
+// build_similarity_graph  –  build edge list using KmerSketch Jaccard
 // ═══════════════════════════════════════════════════════════════════════════
 // All-pairs reference implementation (O(N^2) Jaccard), kept for A/B validation.
-// Selected by setting the environment variable FKMV_GRAPH_ALLPAIRS=1.
+// Reference all-pairs graph build (O(N^2) Jaccard); used when inverted index is off.
 static void build_graph_allpairs(Graph &g, Similarity cutoff) {
   ProgressTracker progress(nobs);
   std::vector<size_t> &from = g.from;
@@ -85,7 +85,7 @@ static void gen_pmh_graph_index(Graph &g, Similarity cutoff) {
     verbose_message("WARN: PMH index not ready, falling back to all-pairs\n");
     build_graph_allpairs(g, cutoff); return;
   }
-  const fkmv_invidx::InvertedIndex &idx = *g_pmh_idx;
+  const rabbit_invidx::InvertedIndex &idx = *g_pmh_idx;
   const uint32_t *csrPtr = idx.csrPosts.data();
   const double    Md     = (double)g_pmh_m;
 
@@ -213,10 +213,10 @@ void build_similarity_graph(Graph &g, Similarity cutoff) {
   // compact (m/8 bytes, cache-resident) that the all-pairs SIMD popcount kernel
   // is faster than inverted-index candidate generation at these contig counts,
   // where skewed posting lists (popular (bucket,min) keys) cause a sum-of-L^2
-  // traversal blow-up. Set FKMV_GRAPH_INDEX=1 to use the inverted-index build
+  // traversal blow-up. Set RABBIT_GRAPH_INDEX=1 to use the inverted-index build
   // (wins when N is much larger and/or the per-pair metric is expensive).
   bool use_index = false;
-  if (const char *e = rabbit_env("RABBIT_GRAPH_INDEX", "FKMV_GRAPH_INDEX"))
+  if (const char *e = rb_getenv("RABBIT_GRAPH_INDEX"))
     use_index = (e[0] == '1');
   if (!use_index) { build_graph_allpairs(g, cutoff); return; }
 
@@ -238,7 +238,7 @@ void build_similarity_graph(Graph &g, Similarity cutoff) {
   // the OPH Jaccard, but in PMH mode the index is only a sparse k-mer prefilter
   // (candidate = shares >= minCommon exact OPH buckets) and the edge weight is
   // the k=6 PMH winner-match.  Allow forcing minCommon to probe that regime.
-  if (const char *e = rabbit_env("RABBIT_MINCOMMON", "FKMV_MINCOMMON")) {
+  if (const char *e = rb_getenv("RABBIT_MINCOMMON")) {
     long v = std::atol(e);
     if (v >= 1) minCommon = (size_t)v;
   }
@@ -248,7 +248,7 @@ void build_similarity_graph(Graph &g, Similarity cutoff) {
     verbose_message("WARN: inverted index not ready, falling back to all-pairs\n");
     build_graph_allpairs(g, cutoff); return;
   }
-  const fkmv_invidx::InvertedIndex& idx = *g_inv_idx;
+  const rabbit_invidx::InvertedIndex& idx = *g_inv_idx;
 
   verbose_message("Starting Building Similarity Graph (inverted index). "
                   "nobs=%d maxEdges=%d buckets=%d cutoff=%.4f minCommon=%d "
@@ -421,7 +421,7 @@ static size_t calib_converge(const std::vector<Similarity>& maxsim,
 // O(sample × avg_posting_size) instead of O(sample × N).
 static void pmh_calib_maxsim(const std::vector<size_t>& sample,
                               std::vector<Similarity>& maxsim) {
-  const fkmv_invidx::InvertedIndex &idx = *g_pmh_idx;
+  const rabbit_invidx::InvertedIndex &idx = *g_pmh_idx;
   const uint32_t *csrPtr = idx.csrPosts.data();
   const double    Md     = (double)g_pmh_m;
   const double    b0     = (g_pmh_base_on && g_pmh_baseline > 0.0 && g_pmh_baseline < 1.0)
@@ -683,7 +683,7 @@ static Distance gen_fused_calib_graph(Graph &g, Distance coverage) {
       }
     }
   } else {
-    // Mutual k-NN (FKMV_MUTUAL_KNN=1): keep edge (i,j) only if both
+    // Mutual k-NN (RABBIT_MUTUAL_KNN=1): keep edge (i,j) only if both
     // j ∈ top-k(i) AND i ∈ top-k(j).
     //
     // Parallel + compact: instead of one ~16M-entry hash map (serial build +
@@ -840,6 +840,6 @@ static Distance calibrate_sim_cutoff_fused(Distance coverage) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Unchanged helper functions from metabat2.cpp
+// Similarity calibration helpers
 // ═══════════════════════════════════════════════════════════════════════════
 

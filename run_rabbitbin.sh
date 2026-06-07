@@ -4,7 +4,7 @@
 SCRIPTPATH="$( cd "$(dirname "$0")" ; pwd -P )"
 PATH=$SCRIPTPATH:$PATH
 RB=rabbitbin
-SUM=jgi_summarize_bam_contig_depths
+SUM=rabbit_depth
 BADMAP=${BADMAP:=0}
 PCTID=${PCTID:=97}
 MINDEPTH=${MINDEPTH:=1.0}

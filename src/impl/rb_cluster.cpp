@@ -1,13 +1,13 @@
 // RabbitBin module: rb_cluster.cpp
 
-int propagate_labels(Graph &g, std::vector<size_t> &membership,
+int cluster_by_propagation(Graph &g, std::vector<size_t> &membership,
                       std::vector<size_t> &node_order) {
   size_t no_of_nodes = g.getNodeCount();
   size_t no_of_edges = g.getEdgeCount();
 
   if (no_of_nodes == 0 || no_of_edges == 0) {
     cerr << "There were " << no_of_nodes << " nodes and " << no_of_edges
-         << " edges -- skipping propagate_labels" << endl;
+         << " edges -- skipping cluster_by_propagation" << endl;
     return 0;
   }
 

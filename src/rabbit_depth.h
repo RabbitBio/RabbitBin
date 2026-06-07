@@ -1,9 +1,9 @@
 /*
- * jgi_summarize_bam_contig_depths.h
+ * rabbit_depth.h  –  summarize per-contig coverage depth from BAM alignments
  */
 
-#ifndef _JGI_SUMMARIZE_BAM_CONTIG_DEPTHS_H_
-#define _JGI_SUMMARIZE_BAM_CONTIG_DEPTHS_H_
+#ifndef RABBIT_DEPTH_H_
+#define RABBIT_DEPTH_H_
 
 #include "version.h"
 
@@ -1062,4 +1062,4 @@ int shredFasta(ostream &shredsOf, const string name, const string sequence,
   return numShreds;
 }
 
-#endif // _JGI_SUMMARIZE_BAM_CONTIG_DEPTHS_H_
+#endif // RABBIT_DEPTH_H_

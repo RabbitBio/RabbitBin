@@ -81,6 +81,6 @@ if (NOT NO_TESTING)
 endif()
 
 install(PROGRAMS run_rabbitbin.sh filter_sam_by_min_len.py aggregateBinDepths.pl aggregateContigOverlapsByBin.pl
-                 merge_abundances.py merge_depths-DEPRECATED.pl
+                 merge_abundances.py
         DESTINATION bin/
        )

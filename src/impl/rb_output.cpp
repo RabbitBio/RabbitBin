@@ -38,12 +38,12 @@ void output_bins(BinMap &cls) {
             numContigs++;
             totalLength += len;
             double total = 0.0;
-            for (auto i = 0; i < (int)nABD; i++)
-              total += (*it2 < nobs) ? ABD(idx, i) : small_ABD(idx, i);
+            for (auto i = 0; i < (int)num_depth_samples; i++)
+              total += (*it2 < nobs) ? depth_matrix(idx, i) : small_depth_matrix(idx, i);
             lengthWeightedAvgCoverage += len * total;
             ss << bin_id << "\t" << sequence_name << "\t" << total << "\n";
           }
-          if (s + s1 < minClsSize) continue;
+          if (s + s1 < min_bin_bp) continue;
           os_members << ss.str();
           for (size_t i = 0; i < cluster.size(); ++i) {
             assert(cluster[i] < (int)clsMap.size());
@@ -78,17 +78,17 @@ void output_bins(BinMap &cls) {
             const string &n = (*it2 < nobs) ? contig_names[idx] : small_contig_names[idx];
             std::stringstream labelss;
             labelss << n;
-            if (abdFile.length()) {
+            if (depth_file.length()) {
               labelss << " total_depth=";
               double total = 0.0;
-              for (auto i = 0; i < (int)nABD; i++)
-                total += (*it2 < nobs) ? ABD(idx, i) : small_ABD(idx, i);
+              for (auto i = 0; i < (int)num_depth_samples; i++)
+                total += (*it2 < nobs) ? depth_matrix(idx, i) : small_depth_matrix(idx, i);
               labelss << std::fixed << std::setprecision(2) << total;
               if (!noSampleDepths) {
                 labelss << " sample_depths" << std::fixed << std::setprecision(1);
-                for (auto i = 0; i < (int)nABD; i++) {
+                for (auto i = 0; i < (int)num_depth_samples; i++) {
                   labelss << (i == 0 ? "=" : ",");
-                  auto d = (*it2 < nobs) ? ABD(idx, i) : small_ABD(idx, i);
+                  auto d = (*it2 < nobs) ? depth_matrix(idx, i) : small_depth_matrix(idx, i);
                   if (d >= 0.1) labelss << d;
                   else          labelss << "0";
                 }

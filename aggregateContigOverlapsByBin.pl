@@ -3,7 +3,7 @@
 use strict;
 use warnings;
 
-our $USAGE = "$0 contigOverlaps.txt firstBinsContigNames.fofn secondBinsContigNames.fofn [...]\n";
+our $USAGE = "$0 rabbit_overlap.txt firstBinsContigNames.fofn secondBinsContigNames.fofn [...]\n";
 
 die $USAGE unless scalar(@ARGV >= 3);
 
