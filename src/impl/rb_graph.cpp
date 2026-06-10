@@ -485,6 +485,27 @@ static void pmh_calib_maxsim(const std::vector<size_t>& sample,
 // Memory: N × maxEdges heaps ≈ 30841 × 200 × 12B ≈ 74 MB (negligible).
 //
 // Returns the calibrated simCutoff×10 and fills Graph g with edges.
+// ── Winner-banding LSH candidate generation (RABBIT_LSH=1) ─────────────────
+// The O(N²/2) all-pairs scan is compute-bound and scales out to the core count,
+// so the only way to go faster is to evaluate fewer pairs.  Kept graph edges
+// have a raw winner-match fraction ≳0.90 while random pairs sit at the PMH
+// baseline (~0.76); banding the m winners into B bands of R rows turns that gap
+// into a strong candidate filter: two contigs are candidates iff some band's R
+// winners match exactly (prob s^R per band).  With R=20 a same-genome pair
+// (s≈0.9) is a candidate w.h.p. while a random pair (s≈0.76) is pruned ~10×.
+// Default OFF — the all-pairs path stays the reference.
+static bool     rb_lsh_on() { const char *e = getenv("RABBIT_LSH"); return e && e[0]=='1'; }
+static uint32_t rb_lsh_R()  { const char *e = getenv("RABBIT_LSH_R");
+                              uint32_t v = e ? (uint32_t)atoi(e) : 20; return v ? v : 20; }
+static size_t   rb_lsh_maxbucket() { const char *e = getenv("RABBIT_LSH_MAXBUCKET");
+                              return e ? (size_t)atoll(e) : 6000; }
+
+static inline uint64_t lsh_band_hash(const uint32_t *w, uint32_t r) {
+  uint64_t h = 1469598103934665603ULL;
+  for (uint32_t k = 0; k < r; ++k) { h ^= w[k]; h *= 1099511628211ULL; }
+  return h;
+}
+
 static Distance gen_fused_calib_graph(Graph &g, Distance coverage) {
   static constexpr size_t NROUNDS = 10;
   static constexpr size_t SAMP    = 2500;
@@ -569,10 +590,101 @@ static Distance gen_fused_calib_graph(Graph &g, Distance coverage) {
                   "SAMP=%zu×%zu TILE=%zu tilepairs=%zu\n",
                   nobs, NROUNDS, SAMP, TILE, tilepairs.size());
 
+  const bool rb_timing = (getenv("RB_TIMING") != nullptr);
+  std::chrono::steady_clock::time_point _t_pass0;
+  if (rb_timing) _t_pass0 = std::chrono::steady_clock::now();
+
+  // ── Abundance-first exact upper-bound prune (RABBIT_ABDFIRST=1) ───────────
+  // The final edge weight is w = g_w_comp·sComp + (1−g_w_comp)·corr, kept only
+  // if w ≥ min_edge_weight.  sComp ≤ 1, so the best-case score for a pair is
+  // g_w_comp·1 + (1−g_w_comp)·corr.  If even that is below the cutoff the pair
+  // can NEVER become an edge — so we can skip the (≈100× more expensive) PMH
+  // composition kernel after only an O(num_samples) abundance correlation.
+  // This is exact w.r.t. the fused-edge filter: no pruned pair could survive.
+  // corr threshold: corr < (min_edge_weight − g_w_comp)/(1 − g_w_comp).
+  // Abundance-first prune is ON by default for multi-sample data (it is exact
+  // w.r.t. the fused-edge filter and substantially improves multi-sample
+  // binning by stopping high-composition / low-abundance pairs from starving
+  // the composition top-k).  RABBIT_NO_ABDFIRST=1 restores the old all-pairs
+  // composition pass for comparison.
+  const bool abdfirst = (getenv("RABBIT_NO_ABDFIRST") == nullptr) &&
+                        num_depth_samples > 1 && g_w_comp < 1.0 &&
+                        g_w_comp < min_edge_weight;
+  const double abd_corr_min = abdfirst
+      ? (min_edge_weight - g_w_comp) / (1.0 - g_w_comp) : -2.0;
+  // Precompute per-contig unit rank vectors u_i so the abundance correlation
+  // corr(i,j) = Σ_k u_i[k]·u_j[k] is a single length-S dot product — bit-equal
+  // to the Pearson-on-ranks that cal_depth_corr() computes (depth_matrix is
+  // already rank-transformed), but ~100× cheaper than its per-pair Welford+sqrt.
+  // A small safety margin keeps the prune conservative against float rounding:
+  // we only skip when the fast estimate is clearly below the exact bound, so no
+  // pair that could pass the fused filter is ever dropped.
+  const uint32_t ABD_S = (uint32_t)num_depth_samples;
+  const float abd_corr_min_eps = (float)(abd_corr_min - 1e-4);
+  std::vector<float> abd_unit;
+  if (abdfirst) {
+    abd_unit.assign((size_t)nobs * ABD_S, 0.0f);
+#pragma omp parallel for num_threads(numThreads) schedule(static)
+    for (size_t r = 0; r < nobs; ++r) {
+      double mean = 0.0;
+      for (uint32_t k = 0; k < ABD_S; ++k) mean += depth_matrix(r, k);
+      mean /= ABD_S;
+      double ss = 0.0;
+      for (uint32_t k = 0; k < ABD_S; ++k) {
+        double d = (double)depth_matrix(r, k) - mean; ss += d * d;
+      }
+      if (ss > 0.0) {
+        const double inv = 1.0 / std::sqrt(ss);
+        float *u = abd_unit.data() + r * ABD_S;
+        for (uint32_t k = 0; k < ABD_S; ++k)
+          u[k] = (float)(((double)depth_matrix(r, k) - mean) * inv);
+      }
+    }
+    verbose_message("Abundance-first prune: skip pairs with depth corr < %.4f "
+                    "(g_w_comp=%.2f, min_edge=%.2f)\n",
+                    abd_corr_min, g_w_comp, (double)min_edge_weight);
+  }
+  const float *abd_u = abd_unit.empty() ? nullptr : abd_unit.data();
+
+  // ── Optional LSH candidate generation ───────────────────────────────────
+  // Build B band buckets: for each band, contig ids sorted by the band's
+  // R-winner hash so equal-hash contigs (candidates) form contiguous ranges.
+  const bool     use_lsh = rb_lsh_on() && g_pmh_mode && !g_win_flat.empty();
+  const uint32_t LSH_R   = rb_lsh_R();
+  const uint32_t LSH_B   = use_lsh ? (g_pmh_m / LSH_R) : 0;
+  const size_t   LSH_MAXB= rb_lsh_maxbucket();
+  std::vector<std::vector<uint64_t>> band_sorted_key;  // [B][nobs] ascending
+  std::vector<std::vector<uint32_t>> band_order;       // [B][nobs] contig ids by key
+  std::vector<std::vector<uint64_t>> band_key_of;      // [B][nobs] key per contig
+  if (use_lsh) {
+    band_sorted_key.assign(LSH_B, std::vector<uint64_t>(nobs));
+    band_order.assign(LSH_B, std::vector<uint32_t>(nobs));
+    band_key_of.assign(LSH_B, std::vector<uint64_t>(nobs));
+    const uint32_t *winbase = g_win_flat.data();
+#pragma omp parallel for num_threads(numThreads) schedule(dynamic, 1)
+    for (uint32_t b = 0; b < LSH_B; ++b) {
+      auto &ord = band_order[b]; auto &skey = band_sorted_key[b];
+      auto &kof = band_key_of[b];
+      const uint32_t off = b * LSH_R;
+      for (size_t c = 0; c < nobs; ++c) {
+        kof[c] = lsh_band_hash(winbase + c * g_pmh_m + off, LSH_R);
+        ord[c] = (uint32_t)c;
+      }
+      std::sort(ord.begin(), ord.end(),
+                [&](uint32_t a, uint32_t c) { return kof[a] < kof[c]; });
+      for (size_t p = 0; p < nobs; ++p) skey[p] = kof[ord[p]];
+    }
+    verbose_message("LSH candidate gen: B=%u bands × R=%u rows, maxbucket=%zu\n",
+                    LSH_B, LSH_R, LSH_MAXB);
+  }
+
 #pragma omp parallel num_threads(numThreads)
   {
     const int tid = omp_get_thread_num();
     auto &my_jmax = thread_jmax[tid];
+    std::vector<uint32_t> visited;       // LSH per-i dedup stamp
+    uint32_t visit_gen = 0;
+    if (use_lsh) visited.assign(nobs, 0u);
 
     // Thread-safe update of row r's neighbor heap with candidate (other, sv).
     auto update_row = [&](size_t r, size_t other, StoredDistance sv) {
@@ -599,6 +711,7 @@ static Distance gen_fused_calib_graph(Graph &g, Distance coverage) {
       row_spin[r].store(0, std::memory_order_release);  // release spinlock
     };
 
+    if (!use_lsh) {
 #pragma omp for schedule(dynamic, 1)
     for (size_t p = 0; p < tilepairs.size(); ++p) {
       const size_t ii = tilepairs[p].first;
@@ -612,6 +725,15 @@ static Distance gen_fused_calib_graph(Graph &g, Distance coverage) {
         // Diagonal tile: only j>i; off-diagonal: full j range.
         for (size_t j = (diag ? i + 1 : jj); j < j_stop; ++j) {
           if (!is_nz(i, j)) continue;
+          // Abundance-first exact upper-bound prune: skip the PMH kernel for
+          // pairs whose best-case fused score is already below the cutoff.
+          if (abdfirst) {
+            const float *ui = abd_u + i * ABD_S;
+            const float *uj = abd_u + j * ABD_S;
+            float c = 0.0f;
+            for (uint32_t k = 0; k < ABD_S; ++k) c += ui[k] * uj[k];
+            if (c < abd_corr_min_eps) continue;
+          }
           StoredDistance sv = (StoredDistance)graph_sim(i, j);
           update_row(i, j, sv);
           update_row(j, i, sv);
@@ -629,6 +751,51 @@ static Distance gen_fused_calib_graph(Graph &g, Distance coverage) {
       if (verbose && tid == 0 && (p & 0x3FFu) == 0)
         verbose_message("Fusion D %zu/%zu\r", p, tilepairs.size());
     }
+    } else {
+      // ── LSH path: evaluate only co-banded candidate pairs ────────────────
+#pragma omp for schedule(dynamic, 16)
+      for (size_t i = 0; i < nobs; ++i) {
+        ++visit_gen;
+        visited[i] = visit_gen;                 // exclude self
+        const int    i_round = sample_round[i];
+        const size_t i_local = sample_local[i];
+        for (uint32_t b = 0; b < LSH_B; ++b) {
+          const uint64_t key   = band_key_of[b][i];
+          const auto    &skey  = band_sorted_key[b];
+          const auto    &ord   = band_order[b];
+          const size_t lo = (size_t)(std::lower_bound(skey.begin(), skey.end(), key) - skey.begin());
+          const size_t hi = (size_t)(std::upper_bound(skey.begin(), skey.end(), key) - skey.begin());
+          if (hi - lo > LSH_MAXB) continue;     // skip non-discriminative (repeat) buckets
+          for (size_t p = lo; p < hi; ++p) {
+            const uint32_t j = ord[p];
+            if (visited[j] == visit_gen) continue;  // dedup across bands
+            visited[j] = visit_gen;
+            if ((size_t)j <= i) continue;           // each unordered pair once (i<j)
+            if (!is_nz(i, j)) continue;
+            StoredDistance sv = (StoredDistance)graph_sim(i, j);
+            update_row(i, j, sv);
+            update_row(j, i, sv);
+            if (i_round >= 0) {
+              float &m = my_jmax[i_round][i_local];
+              if ((float)sv > m) m = (float)sv;
+            }
+            const int j_round = sample_round[j];
+            if (j_round >= 0) {
+              float &m = my_jmax[j_round][sample_local[j]];
+              if ((float)sv > m) m = (float)sv;
+            }
+          }
+        }
+        if (verbose && tid == 0 && (i & 0xFFFu) == 0)
+          verbose_message("LSH cand %zu/%zu\r", i, nobs);
+      }
+    }
+  }
+
+  if (rb_timing) {
+    double ms = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - _t_pass0).count();
+    fprintf(stderr, "[RB_TIMING] fusedD pair-pass: %.1f ms\n", ms);
   }
 
   { std::vector<std::atomic<float>>().swap(row_thresh); }

@@ -11,6 +11,8 @@
 #include <random>
 #include <sstream>
 #include <string>
+#include <string_view>
+#include <deque>
 #include <sys/time.h>
 #include <unordered_map>
 #include <unordered_set>
@@ -140,8 +142,25 @@ static const std::size_t buf_size = 1024 * 1024;
 
 static std::vector<std::string> contig_names;
 static std::vector<std::string> small_contig_names;
-static std::vector<std::string> seqs;
-static std::vector<std::string> small_seqs;
+// Contig sequences are stored as VIEWS (std::string_view).  In the parallel
+// mmap parse path a single-line sequence is referenced zero-copy directly in
+// the (retained, never-unmapped) FASTA mmap — avoiding ~N per-contig heap
+// allocations + a multi-GB memcpy that previously dominated the parse phase.
+// Sequences that must be materialised (multi-line records, gzip / kseq
+// fallbacks, the libdeflate streaming path) are copied once into g_seq_store
+// (a deque, so element addresses are stable) and the view points there.
+static std::deque<std::string>   g_seq_store;     // owned backing for gz/kseq paths
+// Per-parse-thread contiguous arenas holding compacted MULTI-LINE sequences
+// from the mmap path.  One big growing buffer per thread replaces N per-contig
+// std::string allocations (which dominated the parse phase).  Kept alive for
+// the whole run; seq views point into these.
+static std::vector<std::string>  g_seq_arenas;
+static std::vector<std::string_view> seqs;
+static std::vector<std::string_view> small_seqs;
+// Retained FASTA mmap (kept mapped for the whole run so zero-copy seq views
+// stay valid).  Released by the OS at process exit.
+static const char *g_fasta_mmap = nullptr;
+static size_t      g_fasta_mmap_len = 0;
 // Parallel length arrays – populated alongside seqs[]/small_seqs[] in every
 // FASTA parse path so that size() queries don't need the full sequence in RAM.
 static std::vector<size_t> seq_lens;
@@ -240,14 +259,14 @@ static void trim_fasta_label(std::string &label) {
     label = label.substr(0, pos);
 }
 
-std::ostream &printFasta(std::ostream &os, string label, string seq) {
+std::ostream &printFasta(std::ostream &os, string label, std::string_view seq) {
   int64_t len = seq.size();
   if (len == 0) {
     cerr << "Warning attempt to print an empty fasta!" << endl;
     return os;
   }
   os << fasta_delim << label << line_delim;
-  const char *_seq = seq.c_str();
+  const char *_seq = seq.data();
   const int maxWidth = 60;
   for (size_t s = 0; s < len; s += maxWidth) {
     int bytes = s + maxWidth < len ? maxWidth : len - s;

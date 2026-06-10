@@ -321,36 +321,86 @@ static inline double jaccard_raw(const uint64_t* __restrict__ a,
 // Returns the raw number of matching non-zero winner registers (numerator of
 // the winner-match fraction).  Callers multiply by a precomputed 1/m to avoid
 // a per-pair division in the hot loop.
+// Env-gated coarse phase timer: prints wall ms since first call to stderr.
+static inline void rb_phase(const char *label) {
+  static const bool on = (getenv("RB_TIMING") != nullptr);
+  if (!on) return;
+  static std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+  double ms = std::chrono::duration<double, std::milli>(
+                  std::chrono::steady_clock::now() - t0).count();
+  fprintf(stderr, "[RB_TIMING] %-28s %8.1f ms\n", label, ms);
+}
+
+// Env-gated sequence-integrity self-check: order-independent 64-bit hash over
+// every (contig name + stored sequence bytes).  Used to PROVE that a change to
+// the sequence-storage path keeps the loaded bytes identical (the partition is
+// a deterministic function of these bytes).  Prints to stderr when RB_SEQHASH.
+static inline void rb_seq_integrity_check(const char *label) {
+  if (getenv("RB_SEQHASH") == nullptr) return;
+  auto fnv = [](const char *p, size_t n, uint64_t h) {
+    for (size_t i = 0; i < n; ++i) { h ^= (uint8_t)p[i]; h *= 1099511628211ULL; }
+    return h;
+  };
+  uint64_t acc = 0;
+  uint64_t totbp = 0;
+  for (size_t i = 0; i < contig_names.size() && i < seqs.size(); ++i) {
+    uint64_t h = 1469598103934665603ULL;
+    h = fnv(contig_names[i].data(), contig_names[i].size(), h);
+    h = fnv(seqs[i].data(), seqs[i].size(), h);
+    acc ^= h; totbp += seqs[i].size();
+  }
+  for (size_t i = 0; i < small_contig_names.size() && i < small_seqs.size(); ++i) {
+    uint64_t h = 1469598103934665603ULL;
+    h = fnv(small_contig_names[i].data(), small_contig_names[i].size(), h);
+    h = fnv(small_seqs[i].data(), small_seqs[i].size(), h);
+    acc ^= h; totbp += small_seqs[i].size();
+  }
+  fprintf(stderr, "[RB_SEQHASH] %-12s seqhash=%016llx large=%zu small=%zu totbp=%llu\n",
+          label, (unsigned long long)acc, seqs.size(), small_seqs.size(),
+          (unsigned long long)totbp);
+}
+
 static inline uint32_t pmh_match_count(const uint32_t *__restrict__ a,
                                        const uint32_t *__restrict__ b, uint32_t m) {
   uint32_t cnt = 0;
   uint32_t k = 0;
 #if defined(__AVX512F__)
-  // 32 × uint32 per step (two independent 16-lane chains) to break the
-  // compare→mask→popcount dependency and keep both vector ports busy.
   // Count lanes where a==b AND a!=0 (a==0 is the unset-winner sentinel).
+  // Four independent vector accumulators: each iteration produces a compare
+  // mask and folds it into the accumulator with a single masked vpaddd, so the
+  // per-step kmask→GPR(KMOVW)→POPCNT→add dependency chain of the scalar-popcount
+  // variant is removed.  Counts stay in vector lanes until one horizontal
+  // reduction at the end.  Result is the identical integer match count.
   const __m512i vzero = _mm512_setzero_si512();
-  uint32_t cnt0 = 0, cnt1 = 0;
-  for (; k + 32 <= m; k += 32) {
+  const __m512i vone  = _mm512_set1_epi32(1);
+  __m512i acc0 = vzero, acc1 = vzero, acc2 = vzero, acc3 = vzero;
+  for (; k + 64 <= m; k += 64) {
     __m512i va0 = _mm512_loadu_si512((const __m512i *)(a + k));
     __m512i vb0 = _mm512_loadu_si512((const __m512i *)(b + k));
     __m512i va1 = _mm512_loadu_si512((const __m512i *)(a + k + 16));
     __m512i vb1 = _mm512_loadu_si512((const __m512i *)(b + k + 16));
-    __mmask16 hit0 = _mm512_cmpeq_epi32_mask(va0, vb0) &
-                     _mm512_cmpneq_epi32_mask(va0, vzero);
-    __mmask16 hit1 = _mm512_cmpeq_epi32_mask(va1, vb1) &
-                     _mm512_cmpneq_epi32_mask(va1, vzero);
-    cnt0 += (uint32_t)__builtin_popcount((unsigned)hit0);
-    cnt1 += (uint32_t)__builtin_popcount((unsigned)hit1);
+    __m512i va2 = _mm512_loadu_si512((const __m512i *)(a + k + 32));
+    __m512i vb2 = _mm512_loadu_si512((const __m512i *)(b + k + 32));
+    __m512i va3 = _mm512_loadu_si512((const __m512i *)(a + k + 48));
+    __m512i vb3 = _mm512_loadu_si512((const __m512i *)(b + k + 48));
+    __mmask16 h0 = _mm512_cmpeq_epi32_mask(va0, vb0) & _mm512_cmpneq_epi32_mask(va0, vzero);
+    __mmask16 h1 = _mm512_cmpeq_epi32_mask(va1, vb1) & _mm512_cmpneq_epi32_mask(va1, vzero);
+    __mmask16 h2 = _mm512_cmpeq_epi32_mask(va2, vb2) & _mm512_cmpneq_epi32_mask(va2, vzero);
+    __mmask16 h3 = _mm512_cmpeq_epi32_mask(va3, vb3) & _mm512_cmpneq_epi32_mask(va3, vzero);
+    acc0 = _mm512_mask_add_epi32(acc0, h0, acc0, vone);
+    acc1 = _mm512_mask_add_epi32(acc1, h1, acc1, vone);
+    acc2 = _mm512_mask_add_epi32(acc2, h2, acc2, vone);
+    acc3 = _mm512_mask_add_epi32(acc3, h3, acc3, vone);
   }
   for (; k + 16 <= m; k += 16) {
     __m512i va = _mm512_loadu_si512((const __m512i *)(a + k));
     __m512i vb = _mm512_loadu_si512((const __m512i *)(b + k));
-    __mmask16 hit = _mm512_cmpeq_epi32_mask(va, vb) &
-                    _mm512_cmpneq_epi32_mask(va, vzero);
-    cnt0 += (uint32_t)__builtin_popcount((unsigned)hit);
+    __mmask16 h = _mm512_cmpeq_epi32_mask(va, vb) & _mm512_cmpneq_epi32_mask(va, vzero);
+    acc0 = _mm512_mask_add_epi32(acc0, h, acc0, vone);
   }
-  cnt = cnt0 + cnt1;
+  acc0 = _mm512_add_epi32(_mm512_add_epi32(acc0, acc1),
+                          _mm512_add_epi32(acc2, acc3));
+  cnt = (uint32_t)_mm512_reduce_add_epi32(acc0);
 #endif
   for (; k < m; ++k)
     cnt += (a[k] != 0 && a[k] == b[k]) ? 1u : 0u;
@@ -737,7 +787,12 @@ static void parse_fasta_buf(const char* buf, size_t len, CB&& cb) {
 
 struct ContigRec {
   std::string  name;
-  std::string  seq;          // empty when no_store_seqs
+  // Sequence location.  Exactly one of:
+  //   seq_view_ptr != nullptr        → single-line: zero-copy slice of the mmap
+  //   arena_tid    >= 0              → multi-line:  [arena_off,+len) in g_seq_arenas[tid]
+  const char  *seq_view_ptr = nullptr;
+  int          arena_tid = -1;
+  size_t       arena_off = 0;
   size_t       len = 0;
   bool         is_small = false;
   std::vector<uint32_t> winners; // PMH winners (size pmh_m), empty if !stream_pmh
@@ -778,8 +833,16 @@ static bool parse_fasta_mmap_parallel(
 
   // Advise the kernel we'll scan sequentially.
   madvise(mptr, fsz, MADV_SEQUENTIAL);
+  rb_phase("  mmap done");
 
   const char *buf = static_cast<const char *>(mptr);
+  // Retain the mapping for the whole run: single-line sequences are stored as
+  // zero-copy string_views into this buffer (see ContigRec::seq_view_ptr), so
+  // it must NOT be unmapped after parsing.  The OS reclaims it at exit; since
+  // the pages are read-only and file-backed they stay shared with the page
+  // cache and cost little resident memory.
+  g_fasta_mmap     = buf;
+  g_fasta_mmap_len = fsz;
 
   // ── 2. Find N chunk boundaries ──────────────────────────────────────────
   // Each boundary is the offset of the '>' that starts a record.
@@ -820,6 +883,10 @@ static bool parse_fasta_mmap_parallel(
   std::vector<std::vector<std::pair<std::string,std::string>>> tl_tiny(nthreads);
   std::vector<size_t> tl_numseqs(nthreads, 0);
   std::vector<std::vector<uint64_t>> tl_scratch(nthreads); // PMH scratch
+  // Per-thread compacted-sequence arenas (multi-line records).  Each thread
+  // appends only to its own arena, so there is no cross-thread contention; the
+  // arenas are retained globally so seq views stay valid for the whole run.
+  g_seq_arenas.assign(nthreads, std::string());
 
 #pragma omp parallel for num_threads(nthreads) schedule(static, 1)
   for (int t = 0; t < nthreads; ++t) {
@@ -831,6 +898,12 @@ static bool parse_fasta_mmap_parallel(
     auto &my_tiny   = tl_tiny[t];
     auto &my_scratch= tl_scratch[t];
     size_t &my_nseq = tl_numseqs[t];
+
+    // Reserve the arena once to the chunk's byte span: sequence content is the
+    // vast majority of a FASTA chunk, so this avoids std::string's doubling
+    // growth (which would over-allocate up to ~2× and inflate peak RSS) while
+    // never reallocating during the parse.
+    g_seq_arenas[t].reserve((size_t)(splits[t + 1] - splits[t]));
 
     // Fast FASTA parser — same logic as parse_fasta_buf
     while (p < end) {
@@ -854,28 +927,54 @@ static bool parse_fasta_mmap_parallel(
       const char *seq_end = next_gt ? next_gt : end;
 
       // Compact sequence (may be multi-line).
-      // We always build a std::string here; the cost is dominated by PMH anyway.
-      // For single-line sequences we use assign() from the mmap buffer directly.
-      std::string seq_str;
+      // Single-line records (the overwhelmingly common case in assembly FASTA)
+      // are referenced ZERO-COPY: the sequence is a contiguous slice of the
+      // mmap, so we keep only a (ptr,len) view and never allocate/memcpy it.
+      // Multi-line records still need newline removal → an owned compacted copy.
+      std::string &my_arena = g_seq_arenas[t];
+      const char *view_ptr = nullptr;  // non-null ⇒ zero-copy view into mmap
+      int         arena_tid = -1;      // >=0 ⇒ compacted copy in my_arena
+      size_t      arena_off = 0;
+      size_t      seq_len;
+      // A record is effectively single-line when the only newlines are the
+      // trailing one(s) before the next '>'.  In that case the sequence is a
+      // contiguous mmap slice and we reference it zero-copy.  (Note: the first
+      // '\n' is the END of the sequence line, not evidence of multi-line — the
+      // old `!memchr('\n')` test almost never fired since every record but the
+      // last ends in a newline.)  Multi-line records are compacted once into
+      // the thread arena (no per-contig allocation).
       const char *inner_nl = (const char *)memchr(p, '\n', (size_t)(seq_end - p));
+      bool single_line;
       if (!inner_nl) {
-        size_t raw_len = (size_t)(seq_end - p);
-        if (raw_len > 0 && p[raw_len - 1] == '\r') --raw_len;
-        seq_str.assign(p, raw_len);
+        single_line = true;
+        seq_len = (size_t)(seq_end - p);
       } else {
-        seq_str.reserve((size_t)(seq_end - p));
+        single_line = true;
+        for (const char *q = inner_nl + 1; q < seq_end; ++q)
+          if (*q != '\n' && *q != '\r') { single_line = false; break; }
+        seq_len = (size_t)(inner_nl - p);
+      }
+      if (single_line) {
+        if (seq_len > 0 && p[seq_len - 1] == '\r') --seq_len;
+        view_ptr = p;
+      } else {
+        arena_off = my_arena.size();
         const char *seg = p;
         while (seg < seq_end) {
           const char *seg_nl = (const char *)memchr(seg, '\n', (size_t)(seq_end - seg));
           const char *seg_e  = seg_nl ? seg_nl : seq_end;
           size_t slen = (size_t)(seg_e - seg);
           if (slen > 0 && seg[slen - 1] == '\r') --slen;
-          if (slen > 0) seq_str.append(seg, slen);
+          if (slen > 0) my_arena.append(seg, slen);
           if (!seg_nl) break;
           seg = seg_nl + 1;
         }
+        seq_len   = my_arena.size() - arena_off;
+        arena_tid = t;
       }
-      const size_t seq_len = seq_str.size();
+      // Pointer to raw sequence bytes (mmap view or arena slice) for k-mer scan.
+      // Valid here because the arena is not appended again before this use.
+      const char *seq_bytes = view_ptr ? view_ptr : (my_arena.data() + arena_off);
 
       p = seq_end;
       ++my_nseq;
@@ -885,7 +984,6 @@ static bool parse_fasta_mmap_parallel(
         rec.name = std::move(name);
         rec.len  = seq_len;
         rec.is_small = false;
-        // Build PMH winners before (potentially) moving seq_str away.
         if (stream_pmh_arg) {
           rec.winners.resize(pmh_m_arg, 0u);
           float *k4out = nullptr;
@@ -893,28 +991,35 @@ static bool parse_fasta_mmap_parallel(
             rec.k4freq.resize(256, 0.0f);
             k4out = rec.k4freq.data();
           }
-          build_pmh_winners(seq_str.c_str(), seq_len,
+          build_pmh_winners(seq_bytes, seq_len,
                             pmh_k_arg, pmh_m_arg, /*seed=*/42u,
                             rec.winners.data(), my_scratch,
                             /*out64=*/nullptr, /*out_keys=*/nullptr, k4out);
         }
-        if (!no_store_seqs_arg)
-          rec.seq = std::move(seq_str);
+        if (!no_store_seqs_arg) {
+          rec.seq_view_ptr = view_ptr;   // zero-copy (single-line) or nullptr
+          rec.arena_tid    = arena_tid;  // arena slice (multi-line) or -1
+          rec.arena_off    = arena_off;
+        }
         my_large.push_back(std::move(rec));
       } else if (seq_len >= min_small_contig_arg) {
         ContigRec rec;
         rec.name = std::move(name);
         rec.len  = seq_len;
         rec.is_small = true;
-        rec.seq  = std::move(seq_str);
+        rec.seq_view_ptr = view_ptr;
+        rec.arena_tid    = arena_tid;
+        rec.arena_off    = arena_off;
         my_small.push_back(std::move(rec));
       } else {
-        my_tiny.emplace_back(std::move(name), std::move(seq_str));
+        // Tiny contigs are emitted immediately as text; always materialise.
+        my_tiny.emplace_back(std::move(name), std::string(seq_bytes, seq_len));
       }
     }
   }
 
-  munmap(mptr, fsz);
+  rb_phase("  parallel parse loop done");
+  // NOTE: do NOT munmap(mptr, fsz) — zero-copy seq views point into it.
 
   // ── 4. Serial merge in file order ───────────────────────────────────────
   num_seqs_out = 0;
@@ -924,6 +1029,7 @@ static bool parse_fasta_mmap_parallel(
     for (auto &r : tl_small[t]) small_out.push_back(std::move(r));
     for (auto &r : tl_tiny[t])  tiny_out.push_back(std::move(r));
   }
+  rb_phase("  parse serial merge done");
   return true;
 }
 
@@ -1459,6 +1565,7 @@ int main(int ac, char *av[]) {
                               depth_file, cvExt, num_depth_samples, fullHeader, (int)numThreads);
     }
 
+    rb_phase("parse start");
     verbose_message("Parsing assembly file [%.1fGb / %.1fGb]\n",
                     getUsedPhysMem(), getTotalPhysMem() / 1024 / 1024);
     size_t num_seqs = 0;
@@ -1515,7 +1622,8 @@ int main(int ac, char *av[]) {
               }
               contigs[name] = nobs + nskip;
               contig_names.push_back(name);
-              seqs.emplace_back(seq_ptr, seq_len);
+              g_seq_store.emplace_back(seq_ptr, seq_len);   // owned (buffer is transient)
+              seqs.push_back(std::string_view(g_seq_store.back()));
               seq_lens.push_back(seq_len);
               nobs++;
             } else if (seq_len >= (size_t)min_small_contig) {
@@ -1525,7 +1633,8 @@ int main(int ac, char *av[]) {
               }
               small_contigs[name] = nobs1 + nskip1;
               small_contig_names.push_back(name);
-              small_seqs.emplace_back(seq_ptr, seq_len);
+              g_seq_store.emplace_back(seq_ptr, seq_len);   // owned (buffer is transient)
+              small_seqs.push_back(std::string_view(g_seq_store.back()));
               small_seq_lens.push_back(seq_len);
               nobs1++;
             } else {
@@ -1605,7 +1714,16 @@ int main(int ac, char *av[]) {
           g_k4freq_flat.assign(mmap_large.size() * 256, 0.0f);
         }
 
-        // Merge results into global arrays (serial, but O(nobs) and fast)
+        // Merge results into global arrays (serial, but O(nobs) and fast).
+        // Sequences become string_views into the retained mmap (single-line) or
+        // the per-thread arenas (multi-line); no copy here either.
+        bool took_mmap_view = false;
+        auto rec_view = [&](const ContigRec &rec) -> std::string_view {
+          if (rec.seq_view_ptr) { took_mmap_view = true;
+            return std::string_view(rec.seq_view_ptr, rec.len); }
+          return std::string_view(g_seq_arenas[rec.arena_tid].data() + rec.arena_off,
+                                  rec.len);
+        };
         size_t nskip = 0, nskip1 = 0;
         for (auto &rec : mmap_large) {
           if (has_depth && contigs.find(rec.name) != contigs.end()) { nskip++; continue; }
@@ -1613,7 +1731,7 @@ int main(int ac, char *av[]) {
           contigs[rec.name] = r + nskip;
           contig_names.push_back(rec.name);
           seq_lens.push_back(rec.len);
-          if (!no_store_seqs_mmap) seqs.push_back(std::move(rec.seq));
+          if (!no_store_seqs_mmap) seqs.push_back(rec_view(rec));
           if (stream_pmh_mmap && !rec.winners.empty()) {
             uint32_t *dst = g_win_flat.data() + r * pmh_m_mmap;
             std::memcpy(dst, rec.winners.data(), pmh_m_mmap * sizeof(uint32_t));
@@ -1627,9 +1745,16 @@ int main(int ac, char *av[]) {
           if (has_depth && small_contigs.find(rec.name) != small_contigs.end()) { nskip1++; continue; }
           small_contigs[rec.name] = nobs1 + nskip1;
           small_contig_names.push_back(rec.name);
-          small_seqs.push_back(std::move(rec.seq));
+          small_seqs.push_back(rec_view(rec));
           small_seq_lens.push_back(rec.len);
           nobs1++;
+        }
+        // If no single-line view referenced the mmap (e.g. a fully multi-line
+        // assembly, where every sequence lives in an arena), release the
+        // mapping now to avoid retaining ~filesize of resident pages.
+        if (!took_mmap_view && g_fasta_mmap) {
+          munmap((void *)g_fasta_mmap, g_fasta_mmap_len);
+          g_fasta_mmap = nullptr; g_fasta_mmap_len = 0;
         }
         if (os) {
           for (auto &p : mmap_tiny) {
@@ -1809,8 +1934,10 @@ int main(int ac, char *av[]) {
               contigs[name] = r + nskip;
               contig_names.push_back(name);
               seq_lens.push_back(seq->seq.l);
-              if (!no_store_seqs)
-                seqs.push_back(std::string(seq->seq.s, seq->seq.l));
+              if (!no_store_seqs) {
+                g_seq_store.emplace_back(seq->seq.s, seq->seq.l);  // kseq buffer is reused
+                seqs.push_back(std::string_view(g_seq_store.back()));
+              }
 
               if (stream_pmh) {
                 // Grow g_win_flat by one row in the single thread (safe: no
@@ -1849,7 +1976,8 @@ int main(int ac, char *av[]) {
               }
               small_contigs[name] = nobs1 + nskip1;
               small_contig_names.push_back(name);
-              small_seqs.push_back(std::string(seq->seq.s, seq->seq.l));
+              g_seq_store.emplace_back(seq->seq.s, seq->seq.l);  // kseq buffer is reused
+              small_seqs.push_back(std::string_view(g_seq_store.back()));
               small_seq_lens.push_back(seq->seq.l);
               nobs1++;
             } else {
@@ -1887,6 +2015,7 @@ int main(int ac, char *av[]) {
     // depth_future was launched before FASTA decompression and should be
     // complete (or nearly so) by the time we reach here.
     if (has_depth) {
+      rb_phase("fasta parse+sketch done");
       verbose_message("Merging abundance data [%.1fGb / %.1fGb]\n",
                       getUsedPhysMem(), getTotalPhysMem() / 1024 / 1024);
 
@@ -1948,10 +2077,10 @@ int main(int ac, char *av[]) {
       // Remove any empty-string sentinel entries (legacy compatibility).
       // seq_lens is filtered in sync with seqs/contig_names.
       if (!seqs.empty()) {
-        seqs.erase(std::remove(seqs.begin(), seqs.end(), ""), seqs.end());
+        seqs.erase(std::remove(seqs.begin(), seqs.end(), std::string_view{}), seqs.end());
       }
       if (!small_seqs.empty()) {
-        small_seqs.erase(std::remove(small_seqs.begin(), small_seqs.end(), ""), small_seqs.end());
+        small_seqs.erase(std::remove(small_seqs.begin(), small_seqs.end(), std::string_view{}), small_seqs.end());
       }
       contig_names.erase(std::remove(contig_names.begin(), contig_names.end(), ""), contig_names.end());
       small_contig_names.erase(std::remove(small_contig_names.begin(), small_contig_names.end(), ""), small_contig_names.end());
@@ -2085,7 +2214,7 @@ int main(int ac, char *av[]) {
       // ── Sketch (Fusion B): update → buildSig → sig_flat copy → freeReg
       if (oph_needed) {
         g_sketches[r] = new rabbit_sketch::KmerSketch(sketch_size, sketch_kmer_size, sketch_bits);
-        g_sketches[r]->update(seqs[r].c_str(), seqs[r].size());  // fills reg_[]
+        g_sketches[r]->update(seqs[r].data(), seqs[r].size());  // fills reg_[]
 
         if (build_index) {
           const int tid = omp_get_thread_num();
@@ -2111,7 +2240,7 @@ int main(int ac, char *av[]) {
         const int tid = omp_get_thread_num();
         uint32_t *wrow32 = g_win_flat.data()   + (size_t)r * g_pmh_m;
         uint64_t *wrow64 = g_win64_flat.data() + (size_t)r * g_pmh_m;
-        build_pmh_winners(seqs[r].c_str(), seqs[r].size(), g_pmh_k, g_pmh_m,
+        build_pmh_winners(seqs[r].data(), seqs[r].size(), g_pmh_k, g_pmh_m,
                           g_pmh_seed, wrow32,
                           threadPmhScratch[tid],
                           wrow64,
@@ -2164,6 +2293,9 @@ int main(int ac, char *av[]) {
                   (num_depth_samples > 1 ? " + Spearman" : ""),
                   getUsedPhysMem(), getTotalPhysMem() / 1024 / 1024);
   if (num_depth_samples > 1) verbose_message("Calculated spearman for large contigs\n");
+
+  rb_phase("parse+sketch done");
+  rb_seq_integrity_check("post-parse");
 
   // Precompute per-contig abundance non-zero flags so is_nz() in the O(N²)
   // graph loop reduces to two byte loads instead of an num_depth_samples matrix scan.
@@ -2250,6 +2382,8 @@ int main(int ac, char *av[]) {
         for (auto &s : g.edgeScore) if (s < min_edge_weight) s = 0.0f;
       }
 
+      rb_phase("graph+edgescore done");
+
       // ── 4. Build incidence list ────────────────────────────────────────
       // Clamp edgeScore to (0, 1-eps): Boost 1.66 cdf(chi_squared, x) throws when
       // x = -2*LOG(1-edgeScore) is non-finite (LOG(0) = -inf when edgeScore >= 1.0).
@@ -2280,6 +2414,7 @@ int main(int ac, char *av[]) {
       std::shuffle(node_order.begin(), node_order.end(), std::default_random_engine(seed));
 
       cluster_by_propagation(g, membership, node_order);
+      rb_phase("label propagation done");
 
       // ── 6. Collect bins ────────────────────────────────────────────────
       for (size_t i = 0; i < nobs; ++i) {
@@ -2577,7 +2712,7 @@ int main(int ac, char *av[]) {
                 auto cls_idx = cls_id_to_idx[kk];
                 // Build a temporary sketch for this small contig
                 rabbit_sketch::KmerSketch small_sk(sketch_size, sketch_kmer_size, sketch_bits);
-                small_sk.update(small_seqs[s].c_str(), small_seqs[s].size());
+                small_sk.update(small_seqs[s].data(), small_seqs[s].size());
                 auto sComp = g_centroids[cls_idx]
                               ? (StoredDistance)g_centroids[cls_idx]->jaccard(small_sk)
                               : (StoredDistance)0.0;
@@ -2625,6 +2760,7 @@ int main(int ac, char *av[]) {
     }
 
   } while (false);
+  rb_phase("recruit done");
 
   // Release centroid sketches
   for (auto *p : g_centroids) delete p;
@@ -2648,8 +2784,10 @@ int main(int ac, char *av[]) {
     abundance_guided_split(cls);
   }
 
+  rb_phase("split done");
   verbose_message("Outputting bins\n");
   output_bins(cls);
+  rb_phase("output done");
 
   verbose_message("Finished\n");
   return 0;
