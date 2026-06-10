@@ -98,7 +98,7 @@ void output_bins(BinMap &cls) {
             if (onlyLabel) {
               os << label << line_delim;
             } else {
-              const std::string &seq = (*it2 < nobs) ? seqs[idx] : small_seqs[idx];
+              std::string_view seq = (*it2 < nobs) ? seqs[idx] : small_seqs[idx];
               printFasta(os, label, seq);
               bases += (*it2 < nobs) ? seq_lens[idx] : small_seq_lens[idx];
             }
@@ -167,7 +167,7 @@ void output_bins(BinMap &cls) {
               if (onlyLabel) {
                 os << label << line_delim;
               } else {
-                std::string &seq = (i < nobs) ? seqs[idx] : small_seqs[idx];
+                std::string_view seq = (i < nobs) ? seqs[idx] : small_seqs[idx];
                 printFasta(os, label, seq);
               }
             }
