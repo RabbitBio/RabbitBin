@@ -970,6 +970,29 @@ static bool parse_fasta_mmap_parallel(
       size_t      arena_off = 0;
       size_t      seq_len;
       const char *seq_region = p;      // sequence bytes start (single-line view base)
+
+      // Fast tiny-prune: seq_end - seq_region is an UPPER BOUND on seq_len
+      // (it includes newlines which only reduce the count after removal).
+      // If even the raw byte span is below min_small_contig, the record is
+      // definitely tiny — skip the inner_nl scan, multi-line copy, and name
+      // materialisation entirely.  On assemblies like CAMI2 plant (3.13M tiny
+      // contigs out of 3.44M total), this saves the dominant memchr + arena
+      // append + resize-undo for 91% of records.
+      if (!collect_tiny_arg &&
+          (size_t)(seq_end - seq_region) < (size_t)min_small_contig_arg) {
+        p = seq_end;
+        ++my_nseq;
+        // MADV_DONTNEED: pages up to current p are consumed for this thread.
+        if (can_release) {
+          uintptr_t a = ((uintptr_t)rel_base + (uintptr_t)_pg - 1) & ~((uintptr_t)_pg - 1);
+          uintptr_t b = (uintptr_t)p & ~((uintptr_t)_pg - 1);
+          if (b > a && (b - a) >= REL_GRAN) {
+            madvise((void *)a, (size_t)(b - a), MADV_DONTNEED);
+            rel_base = (const char *)b;
+          }
+        }
+        continue;
+      }
       // A record is effectively single-line when the only newlines are the
       // trailing one(s) before the next '>'.  In that case the sequence is a
       // contiguous mmap slice and we reference it zero-copy.  (Note: the first
