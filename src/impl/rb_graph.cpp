@@ -543,20 +543,29 @@ static Distance gen_fused_calib_graph(Graph &g, Distance coverage) {
   using Heap = std::priority_queue<Edge, std::vector<Edge>, CompareEdge>;
   std::vector<Heap> heaps(nobs);
 
-  std::vector<std::atomic<float>> row_thresh(nobs);
-  for (size_t r = 0; r < nobs; ++r)
-    row_thresh[r].store(std::numeric_limits<float>::lowest(),
-                        std::memory_order_relaxed);
-  // Per-row spinlock (1 byte) instead of omp_lock_t. The critical section is a
-  // single heap push/pop, so a futex-backed omp_lock is overkill: its acquire
-  // path is a syscall under contention and its cache line bounces expensively
-  // across sockets. A relaxed test-and-test-and-set spinlock keeps the hot path
-  // entirely in user space and only touches one cache line per row. Most
-  // candidates never reach here (rejected by the row_thresh atomic fast-path),
-  // so contention is brief.
-  std::vector<std::atomic<uint8_t>> row_spin(nobs);
-  for (size_t r = 0; r < nobs; ++r)
-    row_spin[r].store(0, std::memory_order_relaxed);
+  // Per-row sync state (threshold + spinlock) co-located on its OWN cache line.
+  // The triangle tiling makes every row r's heap a target for every thread that
+  // processes a tile-pair containing r, so the spinlock's acquire RMW and the
+  // threshold store are hammered concurrently.  Packing them as separate 1-byte
+  // / 4-byte entries in two flat arrays put 64 locks (or 16 thresholds) per
+  // cache line, so an update to row r falsely invalidated the line for up to 63
+  // neighbouring rows.  alignas(64) gives each row a private line: a row update
+  // touches exactly one line and never false-shares with other rows.  True
+  // same-row contention (correct and unavoidable) is unchanged.
+  // The critical section is a single heap push/pop, so a futex-backed omp_lock
+  // is overkill: a relaxed test-and-test-and-set spinlock keeps the hot path in
+  // user space.  Most candidates never reach here (rejected by the threshold
+  // fast-path), so contention is brief.
+  struct alignas(64) RowSync {
+    std::atomic<float>   thresh;
+    std::atomic<uint8_t> spin;
+  };
+  std::vector<RowSync> rowsync(nobs);
+  for (size_t r = 0; r < nobs; ++r) {
+    rowsync[r].thresh.store(std::numeric_limits<float>::lowest(),
+                            std::memory_order_relaxed);
+    rowsync[r].spin.store(0, std::memory_order_relaxed);
+  }
 
   // Per-thread maxsim accumulators — both endpoints of every pair feed these;
   // merged into the global maxsim[][] after the pass (max is order-independent,
@@ -688,10 +697,11 @@ static Distance gen_fused_calib_graph(Graph &g, Distance coverage) {
 
     // Thread-safe update of row r's neighbor heap with candidate (other, sv).
     auto update_row = [&](size_t r, size_t other, StoredDistance sv) {
-      if (sv <= row_thresh[r].load(std::memory_order_relaxed)) return;
+      RowSync &rs = rowsync[r];
+      if (sv <= rs.thresh.load(std::memory_order_relaxed)) return;
       // ── acquire spinlock (test-and-test-and-set) ──
-      while (row_spin[r].exchange(1, std::memory_order_acquire)) {
-        while (row_spin[r].load(std::memory_order_relaxed))
+      while (rs.spin.exchange(1, std::memory_order_acquire)) {
+        while (rs.spin.load(std::memory_order_relaxed))
 #if defined(__x86_64__) || defined(__i386__)
           __builtin_ia32_pause();
 #else
@@ -702,13 +712,13 @@ static Distance gen_fused_calib_graph(Graph &g, Distance coverage) {
       if (h.size() < (size_t)maxEdges) {
         h.push({other, sv});
         if (h.size() == (size_t)maxEdges)
-          row_thresh[r].store(h.top().second, std::memory_order_relaxed);
+          rs.thresh.store(h.top().second, std::memory_order_relaxed);
       } else if (sv > h.top().second) {
         h.pop();
         h.push({other, sv});
-        row_thresh[r].store(h.top().second, std::memory_order_relaxed);
+        rs.thresh.store(h.top().second, std::memory_order_relaxed);
       }
-      row_spin[r].store(0, std::memory_order_release);  // release spinlock
+      rs.spin.store(0, std::memory_order_release);  // release spinlock
     };
 
     if (!use_lsh) {
@@ -798,8 +808,7 @@ static Distance gen_fused_calib_graph(Graph &g, Distance coverage) {
     fprintf(stderr, "[RB_TIMING] fusedD pair-pass: %.1f ms\n", ms);
   }
 
-  { std::vector<std::atomic<float>>().swap(row_thresh); }
-  { std::vector<std::atomic<uint8_t>>().swap(row_spin); }
+  { std::vector<RowSync>().swap(rowsync); }
 
   // Merge per-thread maxsim into the global array.
   for (size_t r = 0; r < NROUNDS; ++r)

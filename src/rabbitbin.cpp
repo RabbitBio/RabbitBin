@@ -28,6 +28,7 @@
 // ── libdeflate (fast gzip decompression) ─────────────────────────────────
 #include <libdeflate.h>
 #include <future>
+#include <thread>
 #include <omp.h>
 // ── mmap parallel FASTA reader ───────────────────────────────────────────
 #include <sys/mman.h>
@@ -328,7 +329,18 @@ static inline void rb_phase(const char *label) {
   static std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
   double ms = std::chrono::duration<double, std::milli>(
                   std::chrono::steady_clock::now() - t0).count();
-  fprintf(stderr, "[RB_TIMING] %-28s %8.1f ms\n", label, ms);
+  long rss_mb = 0, hwm_mb = 0;
+  if (FILE *f = fopen("/proc/self/status", "r")) {
+    char ln[256];
+    while (fgets(ln, sizeof(ln), f)) {
+      long kb;
+      if (sscanf(ln, "VmRSS: %ld kB", &kb) == 1) rss_mb = kb / 1024;
+      else if (sscanf(ln, "VmHWM: %ld kB", &kb) == 1) hwm_mb = kb / 1024;
+    }
+    fclose(f);
+  }
+  fprintf(stderr, "[RB_TIMING] %-28s %8.1f ms   RSS=%ldMB peak=%ldMB\n",
+          label, ms, rss_mb, hwm_mb);
 }
 
 // Env-gated sequence-integrity self-check: order-independent 64-bit hash over
@@ -807,6 +819,7 @@ static bool parse_fasta_mmap_parallel(
     bool                 fullHeader_arg,
     bool                 stream_pmh_arg,
     bool                 no_store_seqs_arg,
+    bool                 collect_tiny_arg,
     uint32_t             pmh_m_arg,
     int                  pmh_k_arg,
     // outputs  ──────────────────────────────────────────────────────────
@@ -826,7 +839,13 @@ static bool parse_fasta_mmap_parallel(
 
   // Use MAP_POPULATE only for files < 4 GB to avoid long fault storms on huge files.
   int mflags = MAP_PRIVATE;
-  if (fsz < 4ULL * 1024 * 1024 * 1024) mflags |= MAP_POPULATE;
+  // NOTE: MAP_POPULATE is intentionally NOT used.  The parse reads each page
+  // exactly once, sequentially, and (for multi-line records) MADV_DONTNEEDs it
+  // immediately afterwards, so prefaulting the whole file would only inflate
+  // peak RSS by the full file size before the incremental release can run.
+  // MADV_SEQUENTIAL (below) already drives aggressive read-ahead.
+  if (const char *ev = getenv("RABBIT_MMAP_POPULATE"))
+    if (ev[0] == '1' && fsz < 4ULL * 1024 * 1024 * 1024) mflags |= MAP_POPULATE;
   void *mptr = mmap(nullptr, fsz, PROT_READ, mflags, fd, 0);
   ::close(fd);
   if (mptr == MAP_FAILED) return false;
@@ -905,19 +924,33 @@ static bool parse_fasta_mmap_parallel(
     // never reallocating during the parse.
     g_seq_arenas[t].reserve((size_t)(splits[t + 1] - splits[t]));
 
+    // Incremental mmap page release: this thread reads its file region exactly
+    // once, sequentially.  For multi-line records the bytes are compacted into
+    // the arena and the mmap pages are never touched again, so we MADV_DONTNEED
+    // the consumed range as we advance.  This collapses the parse-phase peak RSS
+    // from "full mmap + arenas" to roughly "arenas only" on multi-line FASTAs
+    // (the CAMI gold-standard assemblies).  Release is disabled the moment a
+    // single-line record retains a zero-copy mmap view (its pages must survive);
+    // page-aligned bounds keep the boundary pages shared with neighbour threads
+    // intact.  No-op for single-line assemblies (which keep using mmap views and
+    // never double-store, so their peak is already just the mmap).
+    const long  _pg       = sysconf(_SC_PAGESIZE);
+    const size_t REL_GRAN = 8u << 20;        // release in ≥8 MB aligned spans
+    const char  *rel_base = p;               // start of not-yet-released region
+    bool         can_release = true;         // false once an mmap view is kept
+
     // Fast FASTA parser — same logic as parse_fasta_buf
     while (p < end) {
       const char *gt = (const char *)memchr(p, '>', (size_t)(end - p));
       if (!gt) break;
       p = gt + 1;
 
+      // Name EXTENT only (no allocation yet): the std::string is materialised
+      // after we know the record is kept, so discarded tiny contigs (millions of
+      // them on fragmented assemblies) never pay for a name allocation.
       const char *name_start = p;
       while (p < end && (uint8_t)*p > ' ') ++p;
-      std::string name(name_start, p);
-      if (!fullHeader_arg) {
-        size_t sp = name.find_first_of(" \t");
-        if (sp != std::string::npos) name.resize(sp);
-      }
+      const char *name_end = p;
       const char *nl = (const char *)memchr(p, '\n', (size_t)(end - p));
       if (!nl) break;
       p = nl + 1;
@@ -936,6 +969,7 @@ static bool parse_fasta_mmap_parallel(
       int         arena_tid = -1;      // >=0 ⇒ compacted copy in my_arena
       size_t      arena_off = 0;
       size_t      seq_len;
+      const char *seq_region = p;      // sequence bytes start (single-line view base)
       // A record is effectively single-line when the only newlines are the
       // trailing one(s) before the next '>'.  In that case the sequence is a
       // contiguous mmap slice and we reference it zero-copy.  (Note: the first
@@ -956,7 +990,7 @@ static bool parse_fasta_mmap_parallel(
       }
       if (single_line) {
         if (seq_len > 0 && p[seq_len - 1] == '\r') --seq_len;
-        view_ptr = p;
+        // view_ptr set below, only once the record is known to be kept.
       } else {
         arena_off = my_arena.size();
         const char *seg = p;
@@ -972,14 +1006,33 @@ static bool parse_fasta_mmap_parallel(
         seq_len   = my_arena.size() - arena_off;
         arena_tid = t;
       }
-      // Pointer to raw sequence bytes (mmap view or arena slice) for k-mer scan.
-      // Valid here because the arena is not appended again before this use.
-      const char *seq_bytes = view_ptr ? view_ptr : (my_arena.data() + arena_off);
 
       p = seq_end;
       ++my_nseq;
 
-      if (seq_len >= minContig_arg) {
+      // Early-skip discarded tiny contigs.  When unbinned output is off the tiny
+      // (name,seq) pair is never consumed downstream, so skip the name allocation
+      // and the full-sequence copy entirely — the dominant per-record cost on
+      // assemblies with millions of sub-min_small_contig fragments.
+      const bool is_large = seq_len >= minContig_arg;
+      const bool is_small = !is_large && seq_len >= min_small_contig_arg;
+      if (!is_large && !is_small && !collect_tiny_arg) {
+        if (arena_tid >= 0) my_arena.resize(arena_off);  // undo multi-line tiny copy
+        continue;
+      }
+
+      // Record is kept: materialise the name and (single-line) the zero-copy view.
+      std::string name(name_start, name_end);
+      if (!fullHeader_arg) {
+        size_t sp = name.find_first_of(" \t");
+        if (sp != std::string::npos) name.resize(sp);
+      }
+      if (single_line) { view_ptr = seq_region; can_release = false; }
+      // Pointer to raw sequence bytes (mmap view or arena slice) for k-mer scan.
+      // Valid here because the arena is not appended again before this use.
+      const char *seq_bytes = view_ptr ? view_ptr : (my_arena.data() + arena_off);
+
+      if (is_large) {
         ContigRec rec;
         rec.name = std::move(name);
         rec.len  = seq_len;
@@ -1002,7 +1055,7 @@ static bool parse_fasta_mmap_parallel(
           rec.arena_off    = arena_off;
         }
         my_large.push_back(std::move(rec));
-      } else if (seq_len >= min_small_contig_arg) {
+      } else if (is_small) {
         ContigRec rec;
         rec.name = std::move(name);
         rec.len  = seq_len;
@@ -1012,22 +1065,58 @@ static bool parse_fasta_mmap_parallel(
         rec.arena_off    = arena_off;
         my_small.push_back(std::move(rec));
       } else {
-        // Tiny contigs are emitted immediately as text; always materialise.
+        // Tiny contig, kept only because collect_tiny is set (unbinned output):
+        // materialise (name, seq) text for emission.
         my_tiny.emplace_back(std::move(name), std::string(seq_bytes, seq_len));
       }
+
+      // Drop the mmap pages consumed so far (page-aligned, conservative bounds
+      // so the boundary pages shared with neighbour threads are untouched).
+      if (can_release) {
+        uintptr_t a = ((uintptr_t)rel_base + (uintptr_t)_pg - 1) & ~((uintptr_t)_pg - 1);
+        uintptr_t b = (uintptr_t)p & ~((uintptr_t)_pg - 1);
+        if (b > a && (b - a) >= REL_GRAN) {
+          madvise((void *)a, (size_t)(b - a), MADV_DONTNEED);
+          rel_base = (const char *)b;
+        }
+      }
+    }
+
+    // Tail release: free this thread's remaining (fully consumed) region.
+    if (can_release) {
+      uintptr_t a = ((uintptr_t)rel_base + (uintptr_t)_pg - 1) & ~((uintptr_t)_pg - 1);
+      uintptr_t b = (uintptr_t)end & ~((uintptr_t)_pg - 1);
+      if (b > a) madvise((void *)a, (size_t)(b - a), MADV_DONTNEED);
     }
   }
 
   rb_phase("  parallel parse loop done");
   // NOTE: do NOT munmap(mptr, fsz) — zero-copy seq views point into it.
 
-  // ── 4. Serial merge in file order ───────────────────────────────────────
+  // ── 4. Parallel merge in file order ─────────────────────────────────────
+  // Prefix-sum the per-thread record counts to compute each thread's output
+  // slice, resize the output vectors once, then move each thread's records into
+  // its disjoint slice in parallel.  This yields byte-for-byte the same ordering
+  // as a serial concatenation (thread blocks in ascending order, records within
+  // a block in file order) while removing the O(total) serial copy.
   num_seqs_out = 0;
+  std::vector<size_t> off_large(nthreads + 1, 0);
+  std::vector<size_t> off_small(nthreads + 1, 0);
+  std::vector<size_t> off_tiny(nthreads + 1, 0);
   for (int t = 0; t < nthreads; ++t) {
     num_seqs_out += tl_numseqs[t];
-    for (auto &r : tl_large[t]) large_out.push_back(std::move(r));
-    for (auto &r : tl_small[t]) small_out.push_back(std::move(r));
-    for (auto &r : tl_tiny[t])  tiny_out.push_back(std::move(r));
+    off_large[t + 1] = off_large[t] + tl_large[t].size();
+    off_small[t + 1] = off_small[t] + tl_small[t].size();
+    off_tiny[t + 1]  = off_tiny[t]  + tl_tiny[t].size();
+  }
+  large_out.resize(off_large[nthreads]);
+  small_out.resize(off_small[nthreads]);
+  tiny_out.resize(off_tiny[nthreads]);
+#pragma omp parallel for num_threads(nthreads) schedule(static, 1)
+  for (int t = 0; t < nthreads; ++t) {
+    std::move(tl_large[t].begin(), tl_large[t].end(), large_out.begin() + off_large[t]);
+    std::move(tl_small[t].begin(), tl_small[t].end(), small_out.begin() + off_small[t]);
+    std::move(tl_tiny[t].begin(),  tl_tiny[t].end(),  tiny_out.begin()  + off_tiny[t]);
   }
   rb_phase("  parse serial merge done");
   return true;
@@ -1533,8 +1622,15 @@ int main(int ac, char *av[]) {
 
   nobs = 0; nobs1 = 0;
 
-  std::unordered_map<std::string, size_t> contigs;
-  std::unordered_map<std::string, size_t> small_contigs;
+  // Dedup + name→row index maps.  phmap::flat_hash_map (vs std::unordered_map)
+  // stores entries in a flat array, so build/lookup/teardown are markedly
+  // cheaper for the hundreds-of-thousands of contig keys.  had_dup_names stays
+  // false unless the FASTA actually contained a repeated header (the common
+  // case); when it is false the depth-merge loop can use the contig's position
+  // directly instead of re-looking-up the map (idx == ci by construction).
+  phmap::flat_hash_map<std::string, size_t> contigs;
+  phmap::flat_hash_map<std::string, size_t> small_contigs;
+  bool had_dup_names = false;
 
   const int nNonFeat = cvExt ? 1 : 3;
   bool has_depth = depth_file.length() > 0;
@@ -1617,7 +1713,7 @@ int main(int ac, char *av[]) {
             if (seq_len >= (size_t)minContig) {
               if (has_depth && contigs.find(name) != contigs.end()) {
                 if (debug) verbose_message("Skipping duplicate contig: %s\n", name.c_str());
-                nskip++;
+                nskip++; had_dup_names = true;
                 return;
               }
               contigs[name] = nobs + nskip;
@@ -1628,7 +1724,7 @@ int main(int ac, char *av[]) {
               nobs++;
             } else if (seq_len >= (size_t)min_small_contig) {
               if (has_depth && small_contigs.find(name) != small_contigs.end()) {
-                nskip1++;
+                nskip1++; had_dup_names = true;
                 return;
               }
               small_contigs[name] = nobs1 + nskip1;
@@ -1693,6 +1789,7 @@ int main(int ac, char *av[]) {
               minContig, min_small_contig,
               fullHeader,
               stream_pmh_mmap, no_store_seqs_mmap,
+              /*collect_tiny=*/outUnbinned,
               pmh_m_mmap, pmh_k_mmap,
               mmap_large, mmap_small, mmap_tiny,
               num_seqs)) {
@@ -1724,12 +1821,26 @@ int main(int ac, char *av[]) {
           return std::string_view(g_seq_arenas[rec.arena_tid].data() + rec.arena_off,
                                   rec.len);
         };
+        // Reserve once (exact element counts are known) so the per-record
+        // push_back never reallocates these large vectors mid-merge.
+        contig_names.reserve(contig_names.size() + mmap_large.size());
+        seq_lens.reserve(seq_lens.size() + mmap_large.size());
+        if (!no_store_seqs_mmap) seqs.reserve(seqs.size() + mmap_large.size());
+        small_contig_names.reserve(small_contig_names.size() + mmap_small.size());
+        small_seq_lens.reserve(small_seq_lens.size() + mmap_small.size());
+        small_seqs.reserve(small_seqs.size() + mmap_small.size());
+        if (has_depth) {
+          contigs.reserve(contigs.size() + mmap_large.size());
+          small_contigs.reserve(small_contigs.size() + mmap_small.size());
+        }
         size_t nskip = 0, nskip1 = 0;
         for (auto &rec : mmap_large) {
-          if (has_depth && contigs.find(rec.name) != contigs.end()) { nskip++; continue; }
+          if (has_depth && contigs.find(rec.name) != contigs.end()) { nskip++; had_dup_names = true; continue; }
           const size_t r = nobs++;
           contigs[rec.name] = r + nskip;
-          contig_names.push_back(rec.name);
+          // rec.name is not used past this point → move it into the permanent
+          // store instead of copying (the map keeps its own key copy).
+          contig_names.push_back(std::move(rec.name));
           seq_lens.push_back(rec.len);
           if (!no_store_seqs_mmap) seqs.push_back(rec_view(rec));
           if (stream_pmh_mmap && !rec.winners.empty()) {
@@ -1742,9 +1853,9 @@ int main(int ac, char *av[]) {
           }
         }
         for (auto &rec : mmap_small) {
-          if (has_depth && small_contigs.find(rec.name) != small_contigs.end()) { nskip1++; continue; }
+          if (has_depth && small_contigs.find(rec.name) != small_contigs.end()) { nskip1++; had_dup_names = true; continue; }
           small_contigs[rec.name] = nobs1 + nskip1;
-          small_contig_names.push_back(rec.name);
+          small_contig_names.push_back(std::move(rec.name));
           small_seqs.push_back(rec_view(rec));
           small_seq_lens.push_back(rec.len);
           nobs1++;
@@ -1927,7 +2038,7 @@ int main(int ac, char *av[]) {
             if (seq->seq.l >= minContig) {
               if (has_depth && contigs.find(name) != contigs.end()) {
                 if (debug) verbose_message("Skipping duplicate contig: %s\n", name.c_str());
-                nskip++;
+                nskip++; had_dup_names = true;
                 continue;
               }
               const size_t r = nobs++;
@@ -1971,7 +2082,7 @@ int main(int ac, char *av[]) {
               }
             } else if (seq->seq.l >= min_small_contig) {
               if (has_depth && small_contigs.find(name) != small_contigs.end()) {
-                nskip1++;
+                nskip1++; had_dup_names = true;
                 continue;
               }
               small_contigs[name] = nobs1 + nskip1;
@@ -2030,34 +2141,48 @@ int main(int ac, char *av[]) {
       depth_var_matrix.resize(nobs, num_depth_samples, false);
       small_depth_matrix.resize(nobs1, num_depth_samples, false);
 
-      // Iterate large contigs in order (preserves original row semantics)
+      // Iterate large contigs in order (preserves original row semantics).
+      // Fast path: when the FASTA had no duplicate headers, contigs[name] == ci
+      // by construction (kept order == insertion order, nskip stayed 0), so the
+      // per-contig contigs.find() is redundant and is skipped entirely.
       for (size_t ci = 0; ci < contig_names.size(); ++ci) {
         const std::string& name = contig_names[ci];
-        auto it = contigs.find(name);
-        if (it == contigs.end()) { nskip++; continue; }
-        size_t idx = it->second;
-        size_t row = idx - nskip;
-        if (row >= nobs) continue;
+        size_t idx, row;
+        if (had_dup_names) {
+          auto it = contigs.find(name);
+          if (it == contigs.end()) { nskip++; continue; }
+          idx = it->second;
+          row = idx - nskip;
+          if (row >= nobs) continue;
+        } else {
+          idx = ci; row = ci;
+        }
 
         auto jt = depth_map.find(name);
         if (jt == depth_map.end()) { ignored_too_small++; continue; }
         const RawDepthEntry& entry = jt->second;
 
-        for (int i = 0; i < num_depth_samples; ++i) {
+        for (int i = 0; i < num_depth_samples; ++i)
           depth_matrix(row, i) = entry.means[i];
-          if (!cvExt) depth_var_matrix(row, i) = entry.vars[i];
-        }
+        // NOTE: depth_var_matrix is intentionally NOT filled — its only reader,
+        // cal_depth_dist(), has no live call sites, so the per-element variance
+        // store here was dead work.  Re-add this if cal_depth_dist is revived.
         r++;  num++;  totalSize += seq_lens[idx];
       }
 
-      // Iterate small contigs
+      // Iterate small contigs (same fast path as the large-contig loop above)
       for (size_t ci = 0; ci < small_contig_names.size(); ++ci) {
         const std::string& name = small_contig_names[ci];
-        auto it = small_contigs.find(name);
-        if (it == small_contigs.end()) { nskip1++; continue; }
-        size_t idx = it->second;
-        size_t row = idx - nskip1;
-        if (row >= nobs1) continue;
+        size_t idx, row;
+        if (had_dup_names) {
+          auto it = small_contigs.find(name);
+          if (it == small_contigs.end()) { nskip1++; continue; }
+          idx = it->second;
+          row = idx - nskip1;
+          if (row >= nobs1) continue;
+        } else {
+          idx = ci; row = ci;
+        }
 
         auto jt = depth_map.find(name);
         if (jt == depth_map.end()) { ignored_too_small++; continue; }
@@ -2069,10 +2194,19 @@ int main(int ac, char *av[]) {
         r1++;  num1++;  totalSize1 += small_seq_lens[idx];
       }
 
+      // depth_map (one entry per depth-file row — often millions, incl. all the
+      // tiny contigs that never get binned) is no longer needed after the merge.
+      // Its single-threaded teardown (freeing ~N hash slots + per-row mean/var
+      // vectors) costs hundreds of ms; hand it to a detached thread so that the
+      // free overlaps the sketch + graph-build work instead of stalling here.
+      // The contigs / small_contigs dedup maps are also done being read here;
+      // fold their (string-key) teardown into the same detached thread.
+      std::thread([dm = std::move(depth_map),
+                   cm = std::move(contigs),
+                   scm = std::move(small_contigs)]() mutable { }).detach();
+
       nobs  = r;
       nobs1 = r1;
-      contigs.clear();
-      small_contigs.clear();
 
       // Remove any empty-string sentinel entries (legacy compatibility).
       // seq_lens is filtered in sync with seqs/contig_names.
@@ -2142,6 +2276,12 @@ int main(int ac, char *av[]) {
   g_gc_norm     = rb_env_gc_norm();
   g_gc_norm_cap = [] { const char *e = rb_getenv("RABBIT_GC_NORM_CAP"); double v = e ? std::atof(e) : 20.0;
                        return (v < 1.0) ? 20.0 : v; }();
+  // PMH winner-identity inverted index: a diagnostic-only structure (the graph
+  // build uses the all-pairs SIMD kernel, not the index — see the reset at the
+  // end of the sketch section).  Building it costs the full 64-bit winner array
+  // + ~m hash-map insertions per contig, all immediately discarded, so it is
+  // OFF unless RABBIT_PMH_INDEX is set.
+  const bool pmh_index_on = g_pmh_mode && (getenv("RABBIT_PMH_INDEX") != nullptr);
   if (g_pmh_mode) {
     g_pmh_m    = sketch_size;
     g_inv_pmh_m = (g_pmh_m > 0) ? (1.0 / (double)g_pmh_m) : 0.0;
@@ -2154,7 +2294,12 @@ int main(int ac, char *av[]) {
                       g_win_flat.size() / g_pmh_m);
     } else {
       g_win_flat.assign((size_t)nobs * g_pmh_m, 0u);
-      g_win64_flat.assign((size_t)nobs * g_pmh_m, 0ULL);
+      // Full 64-bit winners are ONLY needed to feed the (diagnostic, off-by-
+      // default) PMH inverted index.  The similarity kernel uses the 32-bit
+      // folded winners in g_win_flat, so skip the 64-bit array (≈8 B/register ×
+      // nobs × m — e.g. ~300 MB on plant) unless the index is explicitly asked
+      // for.  See pmh_index_on below.
+      if (pmh_index_on) g_win64_flat.assign((size_t)nobs * g_pmh_m, 0ULL);
     }
     verbose_message("RABBIT_PMH=1: weighted ProbMinHash4 graph metric "
                     "(k=%d, m=%u, count-weighted Jaccard, baseline_corr=%d)\n",
@@ -2167,20 +2312,28 @@ int main(int ac, char *av[]) {
     idx_builder = std::make_unique<rabbit_invidx::InvertedIndexBuilder>(
         (int)numThreads);
 
-  // PMH-winner inverted index builder (active whenever RABBIT_PMH=1).
+  // PMH-winner inverted index builder (RABBIT_PMH_INDEX only; see pmh_index_on).
   // Built in the same parallel loop — no extra pass over seqs[].
   std::unique_ptr<rabbit_invidx::InvertedIndexBuilder> pmh_idx_builder;
-  if (g_pmh_mode)
+  if (pmh_index_on)
     pmh_idx_builder = std::make_unique<rabbit_invidx::InvertedIndexBuilder>(
         (int)numThreads);
 
   // ── Fusion B+E: sketch update + buildSig + sig_flat copy + freeReg
   //               + abundance ranking, ALL in ONE parallel loop ─────────────
+  // In weighted-ProbMinHash mode the OPH (k=21) b-bit sketch is never read
+  // (graph_sim uses the PMH winners), so skip building it entirely unless an
+  // OPH-consuming option is active (inverted index or composition-min recruitment).
+  // This removes a full per-contig MinHash pass + 30k heap allocations.
+  const bool oph_needed = !g_pmh_mode || build_index || (recruitSimFactor > 0.0);
+
   g_sig_nw = (sketch_size + 63) / 64;
   g_sig_np = sketch_bits;
   g_sig_m  = sketch_size;
   const size_t sig_stride = (size_t)g_sig_nw * g_sig_np;
-  g_sig_flat.resize(nobs * sig_stride);
+  // g_sig_flat holds the OPH b-bit signatures; only written/read when oph_needed
+  // (graph_sim uses g_win_flat in PMH mode).  Skip the alloc+zero otherwise.
+  if (oph_needed) g_sig_flat.resize(nobs * sig_stride);
 
   // Spearman scratch buffer (one per thread, reused across iterations)
   std::vector<StoredDistance> rowMat_proto(num_depth_samples);
@@ -2192,11 +2345,6 @@ int main(int ac, char *av[]) {
   std::vector<std::vector<uint64_t>> threadPmhKeys(numThreads);
 
   g_sketches.resize(nobs, nullptr);
-  // In weighted-ProbMinHash mode the OPH (k=21) b-bit sketch is never read
-  // (graph_sim uses the PMH winners), so skip building it entirely unless an
-  // OPH-consuming option is active (inverted index or composition-min recruitment).
-  // This removes a full per-contig MinHash pass + 30k heap allocations.
-  const bool oph_needed = !g_pmh_mode || build_index || (recruitSimFactor > 0.0);
 
   // Snapshot raw per-sample mean depths BEFORE the loop below rank-transforms
   // depth_matrix in place (Fusion E / Spearman). marker_guided_split needs raw means.
@@ -2238,16 +2386,20 @@ int main(int ac, char *av[]) {
       // g_win_flat during the kseq streaming pass (streaming producer-consumer).
       if (g_pmh_mode && !g_pmh_built_streaming) {
         const int tid = omp_get_thread_num();
-        uint32_t *wrow32 = g_win_flat.data()   + (size_t)r * g_pmh_m;
-        uint64_t *wrow64 = g_win64_flat.data() + (size_t)r * g_pmh_m;
-        build_pmh_winners(seqs[r].data(), seqs[r].size(), g_pmh_k, g_pmh_m,
-                          g_pmh_seed, wrow32,
-                          threadPmhScratch[tid],
-                          wrow64,
-                          &threadPmhKeys[tid]);
-        // Insert full 64-bit winner-index keys into the per-thread map.
-        for (uint64_t key : threadPmhKeys[tid])
-          pmh_idx_builder->insert(tid, key, (uint32_t)r);
+        uint32_t *wrow32 = g_win_flat.data() + (size_t)r * g_pmh_m;
+        if (pmh_index_on) {
+          uint64_t *wrow64 = g_win64_flat.data() + (size_t)r * g_pmh_m;
+          build_pmh_winners(seqs[r].data(), seqs[r].size(), g_pmh_k, g_pmh_m,
+                            g_pmh_seed, wrow32, threadPmhScratch[tid],
+                            wrow64, &threadPmhKeys[tid]);
+          for (uint64_t key : threadPmhKeys[tid])
+            pmh_idx_builder->insert(tid, key, (uint32_t)r);
+        } else {
+          // Default: only the 32-bit folded winners (consumed by the kernel).
+          build_pmh_winners(seqs[r].data(), seqs[r].size(), g_pmh_k, g_pmh_m,
+                            g_pmh_seed, wrow32, threadPmhScratch[tid],
+                            /*out64=*/nullptr, /*out_keys=*/nullptr);
+        }
       }
 
       // ── Spearman ranking (Fusion E): rank depth_matrix[r] in-place per thread
@@ -2279,11 +2431,11 @@ int main(int ac, char *av[]) {
                     getUsedPhysMem(), getTotalPhysMem() / 1024 / 1024);
   }
 
-  // The PMH-winner inverted index is kept here for diagnostic purposes only.
-  // In the current configuration it is NOT used for calibration or graph build
-  // because k=6 has only 4096 distinct k-mers → avg posting ≈ 1748 → all-pairs
-  // SIMD is faster. We build and immediately free it to release the builder RAM.
-  if (g_pmh_mode && pmh_idx_builder) {
+  // The PMH-winner inverted index (RABBIT_PMH_INDEX) is diagnostic only: the
+  // graph build uses the all-pairs SIMD kernel, not the index (small-k → dense
+  // postings → all-pairs is faster), so free the builder + 64-bit winners now.
+  // When the index is off (default) neither was ever allocated.
+  if (pmh_idx_builder) {
     pmh_idx_builder.reset();  // free builder thread-maps; index not needed
     g_win64_flat.clear(); g_win64_flat.shrink_to_fit(); // not queried at run time
   }
@@ -2439,20 +2591,76 @@ int main(int ac, char *av[]) {
                     "contigs [%.1fGb / %.1fGb]\n",
                     getUsedPhysMem(), getTotalPhysMem() / 1024 / 1024);
 
-    Matrix spearman(nobs, num_depth_samples);
-    if (num_depth_samples > 1) {
+    // This rank-transformed copy is consumed ONLY by the abundance-centroid
+    // recruit path (recruit_to_depth_centroid, default off).  depth_matrix was
+    // already rank-transformed in place during the sketch loop, so building it
+    // unconditionally was both a redundant second ranking and a wasted nobs×S
+    // matrix in the default path.  Build it only when actually used.
+    Matrix spearman;
+    if (recruit_to_depth_centroid) {
+      // Allocated (matching the original (nobs,S) shape) whenever the centroid
+      // reader below runs, so its row access stays in-bounds even for a single
+      // depth sample.  The rank fill only applies for multi-sample depth.
+      spearman.resize(nobs, num_depth_samples);
+      if (num_depth_samples > 1) {
 #pragma omp parallel for schedule(dynamic, 1)
-      for (size_t r = 0; r < nobs; ++r) {
-        auto &rowMat = threadRowMat[omp_get_thread_num()];
-        const MatrixRowType rRow(depth_matrix, r);
-        std::copy(rRow.begin(), rRow.end(), rowMat.begin());
-        rank(rowMat, rowMat);
-        MatrixRowType sRow(spearman, r);
-        std::copy(rowMat.begin(), rowMat.end(), sRow.begin());
+        for (size_t r = 0; r < nobs; ++r) {
+          auto &rowMat = threadRowMat[omp_get_thread_num()];
+          const MatrixRowType rRow(depth_matrix, r);
+          std::copy(rRow.begin(), rRow.end(), rowMat.begin());
+          rank(rowMat, rowMat);
+          MatrixRowType sRow(spearman, r);
+          std::copy(rowMat.begin(), rowMat.end(), sRow.begin());
+        }
       }
     }
     verbose_message("Calculated %d spearman corr for small and leftover "
                     "contigs\n", nobs);
+
+    // ── Precompute centered + L2-normalised unit depth vectors ─────────────
+    // Pearson/Spearman correlation between two contigs equals the dot product
+    // of their centered+normalised depth vectors (same identity used by the
+    // abdfirst prune in build_similarity_graph).  Replacing the per-pair scalar
+    // Welford cal_depth_corr in the recruit loops below with a dot product
+    // removes the per-element divisions and the two per-pair sqrt calls.  Built
+    // only for multi-sample depth (cal_depth_corr requires num_depth_samples>1);
+    // the lambdas fall back to cal_depth_corr when the vectors are absent.
+    const uint32_t ABD_S = (uint32_t)num_depth_samples;
+    std::vector<float> unit_large, unit_small;
+    auto build_unit = [&](std::vector<float>& out, const Matrix& m, size_t rows) {
+      out.assign(rows * ABD_S, 0.0f);
+#pragma omp parallel for schedule(static)
+      for (size_t r = 0; r < rows; ++r) {
+        double mean = 0.0;
+        for (uint32_t k = 0; k < ABD_S; ++k) mean += m(r, k);
+        mean /= ABD_S;
+        double ss = 0.0;
+        for (uint32_t k = 0; k < ABD_S; ++k) { double d = (double)m(r, k) - mean; ss += d * d; }
+        if (ss > 0.0) {
+          const double inv = 1.0 / std::sqrt(ss);
+          float* u = out.data() + r * ABD_S;
+          for (uint32_t k = 0; k < ABD_S; ++k)
+            u[k] = (float)(((double)m(r, k) - mean) * inv);
+        }
+      }
+    };
+    if (num_depth_samples > 1) build_unit(unit_large, depth_matrix, nobs);
+    auto dcorr_ll = [&](size_t a, size_t b) -> double {
+      if (unit_large.empty()) return cal_depth_corr(a, b);
+      const float* ua = unit_large.data() + a * (size_t)ABD_S;
+      const float* ub = unit_large.data() + b * (size_t)ABD_S;
+      float c = 0.0f;
+      for (uint32_t k = 0; k < ABD_S; ++k) c += ua[k] * ub[k];
+      return (double)c;
+    };
+    auto dcorr_ls = [&](size_t a, size_t s) -> double {
+      if (unit_large.empty() || unit_small.empty()) return cal_depth_corr(a, s, true);
+      const float* ua = unit_large.data() + a * (size_t)ABD_S;
+      const float* us = unit_small.data() + s * (size_t)ABD_S;
+      float c = 0.0f;
+      for (uint32_t k = 0; k < ABD_S; ++k) c += ua[k] * us[k];
+      return (double)c;
+    };
 
     // ── Build cluster → index mapping ─────────────────────────────────────
     std::unordered_map<size_t, size_t> cls_id_to_idx;
@@ -2548,7 +2756,7 @@ int main(int ac, char *av[]) {
           const auto &c = it->second;
           for (size_t i = 0; i < cs; ++i)
             for (size_t j = i + 1; j < cs; ++j)
-              corr += cal_depth_corr(c[i], c[j]);
+              corr += dcorr_ll(c[i], c[j]);
           StoredDistance x = corr / (cs * (cs - 1) / 2);
 #pragma omp critical(CALC_MEAN_CORR)
           cls_corr[kk] = x;
@@ -2577,7 +2785,7 @@ int main(int ac, char *av[]) {
 #pragma omp parallel for schedule(dynamic, 1) reduction(+:corr)
         for (size_t i = 0; i < cs; ++i) {
           for (size_t j = i + 1; j < cs; ++j)
-            corr += cal_depth_corr(c[i], c[j]);
+            corr += dcorr_ll(c[i], c[j]);
           prog_lg.track(cs - i);
           if (omp_get_thread_num() == 0 && prog_lg.isStepMarker())
             verbose_message(".... %s\r", prog_lg.getProgress());
@@ -2624,10 +2832,10 @@ int main(int ac, char *av[]) {
           } else {
             size_t i = 0;
             for (; i < minCS; ++i)
-              corr += cal_depth_corr(c[i], leftovers[l]);
+              corr += dcorr_ll(c[i], leftovers[l]);
             if (corr / minCS < cls_corr[kk]) continue;
             for (; i < cs; ++i)
-              corr += cal_depth_corr(c[i], leftovers[l]);
+              corr += dcorr_ll(c[i], leftovers[l]);
             corr /= cs;
           }
           if (corr >= cls_corr[kk]) {
@@ -2680,6 +2888,8 @@ int main(int ac, char *av[]) {
       }
       threadRowMat.clear();
 
+      if (num_depth_samples > 1) build_unit(unit_small, small_depth_matrix, nobs1);
+
       ProgressTracker small_progress(nobs1);
 #pragma omp parallel for schedule(dynamic)
       for (size_t s = 0; s < nobs1; ++s) {
@@ -2700,10 +2910,10 @@ int main(int ac, char *av[]) {
             } else {
               size_t i = 0;
               for (; i < minCS; ++i)
-                corr += cal_depth_corr(c[i], s, true);
+                corr += dcorr_ls(c[i], s);
               if (corr / minCS < cls_corr[kk]) continue;
               for (; i < cs; ++i)
-                corr += cal_depth_corr(c[i], s, true);
+                corr += dcorr_ls(c[i], s);
               corr /= cs;
             }
             if (corr >= cls_corr[kk]) {
