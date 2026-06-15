@@ -185,6 +185,10 @@ static bool rb_env_depth_prefilter_on() {
   const char *e = rb_getenv("RABBIT_DEPTH_PREFILTER");
   return !e || e[0] != '0';
 }
+static bool rb_env_depth_parse_var() {
+  const char *e = rb_getenv("RABBIT_DEPTH_PARSE_VAR");
+  return e && e[0] == '1';
+}
 
 // IDF (inverse document frequency) normalization for PMH k-mer weights.
 // Controlled by RABBIT_IDF_NORM=1 (requires g_gc_norm>0 and k==4).
@@ -1364,6 +1368,10 @@ parse_depth_async(const std::string& depth_file, bool cvExt, int num_depth_sampl
   std::vector<std::vector<std::pair<std::string, RawDepthEntry>>> tl(nthreads);
   const bool depth_prefilter = rb_env_depth_prefilter_on();
   const size_t min_depth_len = min_small_contig;
+  // MetaBAT depth files interleave mean/var pairs; vars are unused in the main
+  // pipeline (depth_var_matrix is never filled). Skip strtof on var columns unless
+  // RABBIT_DEPTH_PARSE_VAR=1 (for cal_depth_dist revival / debugging).
+  const bool parse_var = cvExt ? false : rb_env_depth_parse_var();
 
 #pragma omp parallel for num_threads(nthreads) schedule(static, 1)
   for (int t = 0; t < nthreads; ++t) {
@@ -1405,7 +1413,7 @@ parse_depth_async(const std::string& depth_file, bool cvExt, int num_depth_sampl
 
       RawDepthEntry entry;
       entry.means.resize(num_depth_samples, 0.f);
-      if (!cvExt) entry.vars.resize(num_depth_samples, 0.f);
+      if (parse_var) entry.vars.resize(num_depth_samples, 0.f);
 
       auto next_field = [&](const char* cur) -> const char* {
         const char* tp = (const char*)memchr(cur, tab_delim, (size_t)(line_end - cur));
@@ -1418,7 +1426,8 @@ parse_depth_async(const std::string& depth_file, bool cvExt, int num_depth_sampl
         c = next_field(c);
         if (!cvExt) {
           if (c >= line_end) break;
-          entry.vars[i] = strtof(c, &ep);
+          if (parse_var)
+            entry.vars[i] = strtof(c, &ep);
           c = next_field(c);
         }
       }
