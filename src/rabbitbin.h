@@ -361,8 +361,15 @@ int cluster_by_propagation(Graph &g, std::vector<size_t> &membership,
                       std::vector<size_t> &node_order);
 
 struct CompareEdge {
+  // Total order so a top-maxEdges heap has a UNIQUE kept set / drain order
+  // regardless of insertion order (required for run-to-run determinism under
+  // multithreaded edge construction). Primary key: similarity (min-heap, so the
+  // weakest kept edge is on top and is evicted first). Tie-break: neighbour id
+  // — the heap top (evicted first) is the LARGER id, so on equal similarity the
+  // smaller-id neighbour is retained deterministically.
   constexpr bool operator()(Edge const &a, Edge const &b) const noexcept {
-    return a.second > b.second;
+    if (a.second != b.second) return a.second > b.second;
+    return a.first < b.first;
   }
 };
 

@@ -556,14 +556,30 @@ static Distance gen_fused_calib_graph(Graph &g, Distance coverage) {
   // is overkill: a relaxed test-and-test-and-set spinlock keeps the hot path in
   // user space.  Most candidates never reach here (rejected by the threshold
   // fast-path), so contention is brief.
+  // thresh holds the packed (similarity, neighbour id) key of the weakest kept
+  // edge (heap top). Packing both into one atomic lets the lock-free fast path
+  // reject a candidate iff it cannot beat the current top under the SAME total
+  // order as CompareEdge — including the equal-similarity id tie-break — so the
+  // deterministic tie-break adds zero extra spinlock traffic vs the sv-only
+  // threshold. (The two-field sv/id alternative would need either an extra atomic
+  // read that can race, or letting every equal-sv candidate take the lock.)
+  // thresh_sv: similarity of the weakest kept edge (heap top) — a pure float for
+  // the cheap common-case reject (sv strictly below threshold), identical cost to
+  // the original sv-only test. thresh_key: the FULL packed (similarity, id) key of
+  // that same top, consulted only for the rare near-threshold candidates so the
+  // deterministic equal-similarity id tie-break is resolved lock-free too. Both
+  // are written together under the lock; both are monotonic so the relaxed reads
+  // never reject a true winner.
   struct alignas(64) RowSync {
-    std::atomic<float>   thresh;
-    std::atomic<uint8_t> spin;
+    std::atomic<float>    thresh_sv;
+    std::atomic<uint64_t> thresh_key;
+    std::atomic<uint8_t>  spin;
   };
   std::vector<RowSync> rowsync(nobs);
   for (size_t r = 0; r < nobs; ++r) {
-    rowsync[r].thresh.store(std::numeric_limits<float>::lowest(),
-                            std::memory_order_relaxed);
+    rowsync[r].thresh_sv.store(std::numeric_limits<float>::lowest(),
+                               std::memory_order_relaxed);
+    rowsync[r].thresh_key.store(0, std::memory_order_relaxed);
     rowsync[r].spin.store(0, std::memory_order_relaxed);
   }
 
@@ -695,10 +711,39 @@ static Distance gen_fused_calib_graph(Graph &g, Distance coverage) {
     uint32_t visit_gen = 0;
     if (use_lsh) visited.assign(nobs, 0u);
 
-    // Thread-safe update of row r's neighbor heap with candidate (other, sv).
+    // Pack (similarity, neighbour id) into one 64-bit key with the SAME total
+    // order as CompareEdge so the lock-free threshold test is exact: a candidate
+    // is rejected iff it cannot beat the current weakest kept edge, including the
+    // equal-similarity smaller-id-wins tie-break. Higher key == kept-preferred.
+    // Similarities are >= 0 (graph_sim clamps), so the IEEE-754 float bit pattern
+    // is monotonic with value; smaller id maps to a larger (~id) low word so it
+    // ranks above a larger id at equal similarity. The heap top (weakest kept)
+    // therefore has the MINIMUM key, and that key only ever increases, making the
+    // relaxed fast-path load safe (never rejects a true winner).
+    static_assert(sizeof(StoredDistance) == 4,
+                  "packed edge key assumes a 32-bit StoredDistance");
+    auto edge_key = [](StoredDistance sv, size_t id) -> uint64_t {
+      uint32_t sb;
+      std::memcpy(&sb, &sv, sizeof(sb));
+      return ((uint64_t)sb << 32) | (uint32_t)(~(uint32_t)id);
+    };
+    static const CompareEdge cmp_edge{};
+    auto store_thresh = [&](RowSync &rs, const Edge &top) {
+      rs.thresh_sv.store(top.second, std::memory_order_relaxed);
+      rs.thresh_key.store(edge_key(top.second, top.first),
+                          std::memory_order_relaxed);
+    };
     auto update_row = [&](size_t r, size_t other, StoredDistance sv) {
       RowSync &rs = rowsync[r];
-      if (sv <= rs.thresh.load(std::memory_order_relaxed)) return;
+      // Common case: similarity strictly below the kept threshold — rejected with
+      // one float compare, identical cost to the original sv-only fast path.
+      if (sv < rs.thresh_sv.load(std::memory_order_relaxed)) return;
+      // Near/at threshold (rare): resolve the deterministic equal-similarity
+      // smaller-id-wins tie-break lock-free via the packed key.
+      uint32_t svb;
+      std::memcpy(&svb, &sv, sizeof(svb));
+      const uint64_t ck = ((uint64_t)svb << 32) | (uint32_t)(~(uint32_t)other);
+      if (ck <= rs.thresh_key.load(std::memory_order_relaxed)) return;
       // ── acquire spinlock (test-and-test-and-set) ──
       while (rs.spin.exchange(1, std::memory_order_acquire)) {
         while (rs.spin.load(std::memory_order_relaxed))
@@ -709,14 +754,14 @@ static Distance gen_fused_calib_graph(Graph &g, Distance coverage) {
 #endif
       }
       Heap &h = heaps[r];
+      const Edge cand{other, sv};
       if (h.size() < (size_t)maxEdges) {
-        h.push({other, sv});
-        if (h.size() == (size_t)maxEdges)
-          rs.thresh.store(h.top().second, std::memory_order_relaxed);
-      } else if (sv > h.top().second) {
+        h.push(cand);
+        if (h.size() == (size_t)maxEdges) store_thresh(rs, h.top());
+      } else if (cmp_edge(cand, h.top())) {  // cand kept-preferred over weakest
         h.pop();
-        h.push({other, sv});
-        rs.thresh.store(h.top().second, std::memory_order_relaxed);
+        h.push(cand);
+        store_thresh(rs, h.top());
       }
       rs.spin.store(0, std::memory_order_release);  // release spinlock
     };

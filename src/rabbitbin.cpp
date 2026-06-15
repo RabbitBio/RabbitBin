@@ -2571,6 +2571,19 @@ int main(int ac, char *av[]) {
           g.incs[g.to[e]].push_back(e);
         }
       }
+      // Determinism: the parallel edge build concatenates per-thread lists in a
+      // non-reproducible order, so each node's incidence list (and hence the
+      // floating-point accumulation order + first-max tie-break inside the
+      // serial Gauss-Seidel label propagation) would vary run-to-run. Sorting
+      // each incidence list by the neighbouring node id pins a canonical order,
+      // making the converged labelling reproducible at a fixed seed/threads.
+#pragma omp parallel for schedule(dynamic, 256)
+      for (size_t v = 0; v < nobs; ++v) {
+        auto &inc = g.incs[v];
+        std::sort(inc.begin(), inc.end(), [&](size_t e1, size_t e2) {
+          return g.getOtherNode(e1, v) < g.getOtherNode(e2, v);
+        });
+      }
       // A node is "connected" iff it has ≥1 positive-weight incident edge, i.e.
       // its incidence list is non-empty — so we read that directly instead of
       // maintaining a separate unordered_set (which cost ~2·|E| hash inserts).
