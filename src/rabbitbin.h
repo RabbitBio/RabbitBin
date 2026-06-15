@@ -118,6 +118,12 @@ static bool fullHeader = false;
 static std::string outFile;
 static bool onlyLabel = false;
 static bool no_recruit = false;
+// --no_gold: label-free multi-resolution mode. Builds the similarity graph once,
+// runs label propagation under several α / edge_power settings, and selects the
+// partition with the highest (gold-standard-free) modularity on the fixed
+// composition graph. Lets RabbitBin auto-tune binning resolution without any
+// ground truth. Default OFF — the single-resolution production path is unchanged.
+static bool no_gold = false;
 static size_t min_small_contig =
     1000;          // minimum contig size for small contig binning
 size_t minCS = 10; // minimum cluster size for additional recruiting

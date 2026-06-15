@@ -181,6 +181,10 @@ static double rb_env_split_sil() {
   const char *e = rb_getenv("RABBIT_SPLIT_SIL");
   return e ? std::atof(e) : 0.70;
 }
+static bool rb_env_depth_prefilter_on() {
+  const char *e = rb_getenv("RABBIT_DEPTH_PREFILTER");
+  return !e || e[0] != '0';
+}
 
 // IDF (inverse document frequency) normalization for PMH k-mer weights.
 // Controlled by RABBIT_IDF_NORM=1 (requires g_gc_norm>0 and k==4).
@@ -1358,6 +1362,8 @@ parse_depth_async(const std::string& depth_file, bool cvExt, int num_depth_sampl
   }
 
   std::vector<std::vector<std::pair<std::string, RawDepthEntry>>> tl(nthreads);
+  const bool depth_prefilter = rb_env_depth_prefilter_on();
+  const size_t min_depth_len = min_small_contig;
 
 #pragma omp parallel for num_threads(nthreads) schedule(static, 1)
   for (int t = 0; t < nthreads; ++t) {
@@ -1381,10 +1387,14 @@ parse_depth_async(const std::string& depth_file, bool cvExt, int num_depth_sampl
       if (!fullHeader) trim_fasta_label(name);
       const char* c = tabp + 1;
 
-      // contigLen: must be present (skip)
+      // contigLen: parse before depth columns so short rows can be skipped early.
       tabp = (const char*)memchr(c, tab_delim, (size_t)(line_end - c));
       if (!tabp) continue;
+      char* ep = nullptr;
+      unsigned long contig_len = strtoul(c, &ep, 10);
+      if (ep != tabp) continue;
       c = tabp + 1;
+      if (depth_prefilter && contig_len < min_depth_len) continue;
 
       // totalAvgDepth: skip when not in cvExt mode
       if (!cvExt) {
@@ -1524,6 +1534,7 @@ int main(int ac, char *av[]) {
       ("sketch-m", po::value<uint32_t>(&sketch_size)->default_value(500), "Sketch size (PMH registers)")
       ("sketch-b", po::value<uint32_t>(&sketch_bits)->default_value(2), "MinHash bucket bits")
       ("no-recruit", po::value<bool>(&no_recruit)->zero_tokens(), "Disable small-contig recruiting")
+      ("no_gold", po::value<bool>(&no_gold)->zero_tokens(), "Label-free multi-resolution: sweep alpha/edge_power on the reused graph, auto-select max-modularity partition (no ground truth needed)")
       ("min-recruit-cluster", po::value<size_t>(&minCS)->default_value(10), "Min cluster size for recruiting")
       ("recruit-abd-centroid", po::value<bool>(&recruit_to_depth_centroid)->default_value(false)->zero_tokens(), "Recruit using abundance centroid")
       ("recruit-cutoff", po::value<Distance>(&recruitSimFactor)->default_value(0.0), "Recruit sim factor x sim-cutoff (0=off)")
@@ -2519,7 +2530,255 @@ int main(int ac, char *av[]) {
         build_similarity_graph(g, simCutoff / 1000.);
       }
 
+      // ── --no_gold: label-free multi-resolution auto-selection ─────────────
+      // Build the (expensive) similarity graph ONCE, then run many CHEAP
+      // (edgeScore + incidence + label-propagation) passes under different
+      // α (g_w_comp) / edge_power settings, and select the partition with the
+      // highest weighted modularity on the fixed composition graph — a quality
+      // signal that needs NO ground truth. The selected membership then flows
+      // into the normal recruit/split/output pipeline (no early exit), so the
+      // final bins are a complete, auto-resolution result.
+      // Trigger: --no_gold (default grid) or RABBIT_REUSE_SWEEP="a:p;a:p;..."
+      // for a custom grid. RABBIT_NO_GOLD_DUMP=1 additionally writes per-config
+      // and selected AMBER .binning files (for offline evaluation). When neither
+      // is set, the single-resolution production path below is byte-identical.
+      std::vector<size_t> membership;     // shared by the two branches below
+      bool used_no_gold = false;
+      const char *sweep_env = getenv("RABBIT_REUSE_SWEEP");
+      if (no_gold || sweep_env) {
+        const bool dump = (getenv("RABBIT_NO_GOLD_DUMP") != nullptr) ||
+                          (sweep_env && !no_gold);
+        using clk = std::chrono::steady_clock;
+        auto ms_since = [](clk::time_point t0) {
+          return std::chrono::duration<double, std::milli>(clk::now() - t0).count();
+        };
+
+        // Parse "a:p;a:p" configs; null/"1"/empty → default grid.
+        std::vector<std::pair<double, double>> cfgs;
+        {
+          std::string spec(sweep_env ? sweep_env : "");
+          if (spec.empty() || spec == "1") {
+            cfgs = {{0.3, 1.0}, {0.4, 1.0}, {0.5, 1.0},
+                    {0.5, 1.5}, {0.6, 1.0}};
+          } else {
+            size_t p = 0;
+            while (p < spec.size()) {
+              size_t semi = spec.find(';', p);
+              std::string tok = spec.substr(p, semi == std::string::npos ? std::string::npos : semi - p);
+              size_t colon = tok.find(':');
+              if (colon != std::string::npos) {
+                double a = std::atof(tok.substr(0, colon).c_str());
+                double pw = std::atof(tok.substr(colon + 1).c_str());
+                if (a >= 0.0 && a <= 1.0 && pw >= 0.1) cfgs.emplace_back(a, pw);
+              }
+              if (semi == std::string::npos) break;
+              p = semi + 1;
+            }
+          }
+        }
+        const size_t M = cfgs.size();
+        const size_t E = g.getEdgeCount();
+        static constexpr StoredDistance SSCR_MAX = 1.0f - 1e-6f;
+
+        // Recompute g.edgeScore from the (reused) g.sComp + depth correlation,
+        // mirroring the production block below, under the current g_w_comp /
+        // g_edge_power globals.
+        auto compute_edgescore = [&]() {
+          g.edgeScore.assign(E, 0.0f);
+          if (has_depth) {
+#pragma omp parallel for schedule(dynamic, 1)
+            for (size_t e = 0; e < E; ++e) {
+              size_t i = g.from[e], j = g.to[e];
+              if (num_depth_samples <= 1) {
+                double w = (double)g.sComp[e];
+                if (g_edge_power != 1.0) w = std::pow(w, g_edge_power);
+                g.edgeScore[e] = (StoredDistance)w;
+              } else {
+                double corr = cal_depth_corr(i, j);
+                if (!std::isfinite(corr)) { g.edgeScore[e] = 0.0f; continue; }
+                if (g_neg_depth_thr > -0.99 && corr < g_neg_depth_thr) {
+                  g.edgeScore[e] = 0.0f; continue;
+                }
+                if (corr < 0) corr = 0;
+                double w = g_w_comp * (double)g.sComp[e] + (1.0 - g_w_comp) * corr;
+                if (!std::isfinite(w) || w < (double)min_edge_weight) w = 0.0;
+                if (g_edge_power != 1.0 && w > 0.0) w = std::pow(w, g_edge_power);
+                g.edgeScore[e] = (StoredDistance)w;
+              }
+            }
+          } else {
+            g.edgeScore = g.sComp;
+            for (auto &s : g.edgeScore) if (s < min_edge_weight) s = 0.0f;
+          }
+        };
+
+        // Rebuild incidence lists from the current g.edgeScore (clamp + sort).
+        auto rebuild_incs = [&]() {
+          g.incs.assign(nobs, {});
+          for (size_t e = 0; e < E; ++e) {
+            if (g.edgeScore[e] > 0) {
+              if (g.edgeScore[e] > SSCR_MAX) g.edgeScore[e] = SSCR_MAX;
+              g.incs[g.from[e]].push_back(e);
+              g.incs[g.to[e]].push_back(e);
+            }
+          }
+#pragma omp parallel for schedule(dynamic, 256)
+          for (size_t v = 0; v < nobs; ++v) {
+            auto &inc = g.incs[v];
+            std::sort(inc.begin(), inc.end(), [&](size_t e1, size_t e2) {
+              return g.getOtherNode(e1, v) < g.getOtherNode(e2, v);
+            });
+          }
+        };
+
+        auto run_lp = [&](long long sd) {
+          std::vector<size_t> membership;
+          std::vector<size_t> node_order(nobs);
+          std::iota(node_order.begin(), node_order.end(), 0);
+          std::shuffle(node_order.begin(), node_order.end(),
+                       std::default_random_engine((unsigned)sd));
+          cluster_by_propagation(g, membership, node_order);
+          return membership;
+        };
+
+        auto write_binning = [&](const std::vector<size_t> &mem,
+                                 const std::string &path) {
+          FILE *f = fopen(path.c_str(), "w");
+          if (!f) { fprintf(stderr, "[REUSE] cannot write %s\n", path.c_str()); return; }
+          fputs("@Version:0.9.0\n@SampleID:gsa\n@@SEQUENCEID\tBINID\t_LENGTH\n", f);
+          for (size_t i = 0; i < nobs; ++i) {
+            if (g.incs[i].empty()) continue;  // unbinned (no positive edge)
+            fprintf(f, "%s\t%zu\t%zu\n", contig_names[i].c_str(), mem[i],
+                    (i < seq_lens.size() ? seq_lens[i] : 0));
+          }
+          fclose(f);
+        };
+
+        auto count_bins = [&](const std::vector<size_t> &mem) {
+          std::unordered_set<size_t> b;
+          size_t binned = 0;
+          for (size_t i = 0; i < nobs; ++i)
+            if (!g.incs[i].empty()) { b.insert(mem[i]); ++binned; }
+          return std::make_pair(b.size(), binned);
+        };
+
+        fprintf(stderr,
+                "[REUSE] graph reused: nobs=%zu edges=%zu configs=%zu seed=%lld\n",
+                (size_t)nobs, E, M, (long long)seed);
+
+        std::vector<std::vector<size_t>> mems_all(M);
+        std::string base = std::string(outFile);
+
+        // ── Label-free selection criterion: weighted modularity Q ─────────────
+        // Q is evaluated on the FIXED, parameter-independent composition graph
+        // (weights = g.sComp, identical for every config), so differences in Q
+        // reflect ONLY how well each config's partition cuts the graph — not the
+        // per-config reweighting. This is the no-ground-truth selector: pick the
+        // config with the highest Q. Precompute weighted degree + total weight
+        // once (O(E)); per-config Q is then O(E + N).
+        std::vector<double> wdeg(nobs, 0.0);
+        double Wtot = 0.0;
+        for (size_t e = 0; e < E; ++e) {
+          double w = (double)g.sComp[e];
+          Wtot += w; wdeg[g.from[e]] += w; wdeg[g.to[e]] += w;
+        }
+        const double invWtot  = Wtot > 0 ? 1.0 / Wtot : 0.0;
+        const double inv2Wtot = Wtot > 0 ? 1.0 / (2.0 * Wtot) : 0.0;
+        auto modularity = [&](const std::vector<size_t> &mem) -> double {
+          double Wintra = 0.0;
+          for (size_t e = 0; e < E; ++e)
+            if (mem[g.from[e]] == mem[g.to[e]]) Wintra += (double)g.sComp[e];
+          std::unordered_map<size_t, double> vol;
+          for (size_t i = 0; i < nobs; ++i)
+            if (wdeg[i] > 0.0) vol[mem[i]] += wdeg[i];
+          double sumsq = 0.0;
+          for (auto &kv : vol) { double f = kv.second * inv2Wtot; sumsq += f * f; }
+          return Wintra * invWtot - sumsq;
+        };
+
+        // ── Per-config cheap tail: edgeScore + incs + LP + modularity ─────────
+        double tail_total = 0.0;
+        std::vector<double> qscore(M, 0.0);
+        size_t best_c = 0; double best_q = -1e300;
+        for (size_t c = 0; c < M; ++c) {
+          g_w_comp     = cfgs[c].first;
+          g_edge_power = cfgs[c].second;
+          auto t0 = clk::now();
+          compute_edgescore();
+          double es_ms = ms_since(t0);
+          auto t1 = clk::now();
+          rebuild_incs();
+          double inc_ms = ms_since(t1);
+          auto t2 = clk::now();
+          mems_all[c] = run_lp(seed);
+          double lp_ms = ms_since(t2);
+          double pass_ms = es_ms + inc_ms + lp_ms;
+          tail_total += pass_ms;
+          auto bc = count_bins(mems_all[c]);
+          qscore[c] = modularity(mems_all[c]);
+          if (qscore[c] > best_q) { best_q = qscore[c]; best_c = c; }
+          if (dump) {
+            char path[4096];
+            snprintf(path, sizeof(path), "%s.reuse.cfg%zu_a%.2f_p%.2f.binning",
+                     base.c_str(), c, cfgs[c].first, cfgs[c].second);
+            write_binning(mems_all[c], path);
+          }
+          fprintf(stderr,
+                  "[REUSE] cfg%zu a=%.2f p=%.2f | edgeScore=%.1fms incs=%.1fms "
+                  "LP=%.1fms pass=%.1fms | bins=%zu binned=%zu Q=%.5f\n",
+                  c, cfgs[c].first, cfgs[c].second, es_ms, inc_ms, lp_ms,
+                  pass_ms, bc.first, bc.second, qscore[c]);
+        }
+
+        // ── No-ground-truth selection: argmax modularity ──────────────────────
+        // Re-materialise the selected config's edgeScore + incidence so the
+        // downstream collect-bins / recruit / split / output stages operate on
+        // exactly the chosen partition. membership is the selected LP labelling.
+        g_w_comp     = cfgs[best_c].first;
+        g_edge_power = cfgs[best_c].second;
+        compute_edgescore();
+        rebuild_incs();
+        membership = mems_all[best_c];
+        used_no_gold = true;
+        if (dump) {
+          char path[4096];
+          snprintf(path, sizeof(path), "%s.reuse.selected.binning", base.c_str());
+          write_binning(membership, path);
+        }
+        fprintf(stderr,
+                "[REUSE] SELECTED (max modularity) = cfg%zu a=%.2f p=%.2f "
+                "Q=%.5f\n",
+                best_c, cfgs[best_c].first, cfgs[best_c].second, best_q);
+
+        // ── Pairwise edge-agreement (diversity proxy; lower = more diverse) ────
+        if (dump && M >= 2) {
+          double agree_sum = 0.0; size_t npair = 0;
+          for (size_t a = 0; a < M; ++a)
+            for (size_t b = a + 1; b < M; ++b) {
+              size_t same = 0;
+              const auto &ma = mems_all[a], &mb = mems_all[b];
+              for (size_t e = 0; e < E; ++e) {
+                bool ja = (ma[g.from[e]] == ma[g.to[e]]);
+                bool jb = (mb[g.from[e]] == mb[g.to[e]]);
+                if (ja == jb) ++same;
+              }
+              agree_sum += (double)same / (double)std::max<size_t>(E, 1);
+              ++npair;
+            }
+          fprintf(stderr, "[REUSE] mean pairwise edge-agreement=%.4f "
+                  "(1.0=identical, lower=more diverse) over %zu pairs\n",
+                  agree_sum / std::max<size_t>(npair, 1), npair);
+        }
+
+        fprintf(stderr,
+                "[REUSE] SUMMARY: 1 graph build reused for %zu LP passes; "
+                "per-pass tail avg=%.1fms (total %.1fms). Selected partition "
+                "flows into recruit/split/output below.\n",
+                M, tail_total / std::max<size_t>(M, 1), tail_total);
+      }  // end --no_gold multi-resolution selection
+
       // ── 3. Compute depth_matrix graph weights and composite scores ──────────────
+      if (!used_no_gold) {
       if (has_depth) {
         verbose_message("Calculating depth_matrix graph [%.1fGb / %.1fGb]               "
                         "                           \n",
@@ -2596,13 +2855,13 @@ int main(int ac, char *av[]) {
                       n_connected, nobs,
                       getUsedPhysMem(), getTotalPhysMem() / 1024 / 1024);
 
-      std::vector<size_t> membership;
       std::vector<size_t> node_order(nobs);
       std::iota(node_order.begin(), node_order.end(), 0);
       std::shuffle(node_order.begin(), node_order.end(), std::default_random_engine(seed));
 
       cluster_by_propagation(g, membership, node_order);
       rb_phase("label propagation done");
+      }  // end !used_no_gold (single-resolution production path)
 
       // ── 6. Collect bins ────────────────────────────────────────────────
       for (size_t i = 0; i < nobs; ++i) {
