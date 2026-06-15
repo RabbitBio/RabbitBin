@@ -12,6 +12,15 @@
 #include "RunningStats.h"
 #include "SafeOfstream.hpp"
 
+#ifdef USE_RABBITBAM
+// RabbitBAM parallel BAM reader: decompresses BGZF blocks of a single bam with
+// a pool of worker threads, then hands back bam1_t records in file order via
+// getBam1_t() — a drop-in for sam_read1() that removes the serial-decompress
+// bottleneck of the depth stage. Record order is identical to sam_read1, so the
+// emitted depth table is unchanged.
+#include "BamReader.h"
+#endif
+
 ThreadBlocker tb;
 
 static struct option long_options[] = {{"help", 0, 0, 0},
@@ -683,6 +692,15 @@ int main(int argc, char *argv[]) {
       if (header->target_len[i] > largest_contig)
         largest_contig = header->target_len[i];
   }
+#ifdef USE_RABBITBAM
+  // Budget RabbitBAM decompression threads BEFORE the per-bam cap below throttles
+  // numThreads down to num_bams. The outer loop parallelises across bam files
+  // (≤ num_bams threads); RabbitBAM then fills the remaining idle cores with
+  // per-file BGZF decompression workers. Total ≈ original core count.
+  const int rbam_total_threads = numThreads;
+  int rbam_read_threads =
+      std::max(1, rbam_total_threads / std::max(1, (int)num_bams));
+#endif
   if (numThreads > (int)num_bams) {
     numThreads = num_bams;
     omp_set_num_threads(numThreads);
@@ -857,9 +875,24 @@ int main(int argc, char *argv[]) {
     readIds.setTrackNamer(check); // BamNameMap now manages this memory
 
     // read the bam file
+#ifdef USE_RABBITBAM
+    // Per-file parallel reader. Records arrive in file order (== sam_read1
+    // order), and b->core.tid is decoded against this file's own @SQ table, the
+    // same table sam_read1 would use, so all downstream tid indexing into the
+    // consolidated header is identical.
+    // 3rd arg (single_parser/is_tgs) MUST be true: it tells BamReader to prime
+    // un_comp for the serial getBam1_t() consumer. With false, un_comp is left
+    // uninitialised and getBam1_t() dereferences garbage.
+    BamReader *rbamReader =
+        new BamReader(bamFilePaths[bamIdx], rbam_read_threads, true);
+#endif
     while (true) {
       std::swap(b, lastBam);
-#ifdef LEGACY_SAMTOOLS
+#ifdef USE_RABBITBAM
+      if (!rbamReader->getBam1_t(b))
+        break;
+      bytesRead = 1;  // success sentinel (matches sam_read1 >= 0)
+#elif defined(LEGACY_SAMTOOLS)
       bytesRead = samread(myBam, b);
       if (bytesRead <= 0)
         break;
@@ -1105,6 +1138,10 @@ int main(int argc, char *argv[]) {
         delete tempMates;
 
     } // while read the bam file
+
+#ifdef USE_RABBITBAM
+    delete rbamReader;  // joins decompression worker threads
+#endif
 
     if (unmappedFastq != NULL)
       delete unmappedFastq;

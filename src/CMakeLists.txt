@@ -81,8 +81,37 @@ foreach(target ${targets})
    if (NOT "${EXTRA_DEPENDENCIES}" STREQUAL "")
      add_dependencies(${target} ${EXTRA_DEPENDENCIES})
    endif()
+   # The htslib headers were previously found only via the default /usr/include
+   # search path, which silently pinned an old system htslib. Add the located
+   # include dir explicitly so the build matches HTSlib_LIBRARIES (e.g. a newer
+   # htslib supplied via -DHTSLIB_ROOT).
+   target_include_directories(${target} PRIVATE ${HTSlib_INCLUDE_DIRS})
    target_link_libraries(${target} ${HTSlib_LIBRARIES} ${ZLIB_LIBRARIES} ${Boost_LIBRARIES} RabbitBin_VERSION_LIB) 
 endforeach()
+
+# ── Vendored RabbitBAM parallel BAM reader (built into rabbit_depth) ────────
+# Only the minimal read path of RabbitBAM (BamReader + its block pipeline) is
+# vendored under src/rabbitbam/ — none of the writer / QC / dedup bloat. It
+# parallelises BGZF block decompression within a single BAM, removing the
+# serial-decompress bottleneck of the depth stage (the old code only
+# parallelised ACROSS bam files, leaving cores idle for single/few-bam runs).
+# BamReader::getBam1_t() yields records in the SAME order as sam_read1, so the
+# emitted depth table is byte-identical. Compiled directly in (no external .so,
+# no RABBITBAM_ROOT). Disable with -DRABBITBIN_USE_VENDORED_BAM=OFF.
+option(RABBITBIN_USE_VENDORED_BAM "Use the vendored RabbitBAM parallel reader in rabbit_depth" ON)
+find_library(DEFLATE_LIB NAMES deflate)
+if(RABBITBIN_USE_VENDORED_BAM AND DEFLATE_LIB)
+  file(GLOB RABBITBAM_SRC ${CMAKE_CURRENT_SOURCE_DIR}/rabbitbam/*.cpp)
+  message(STATUS "rabbit_depth: vendored RabbitBAM parallel reader enabled")
+  target_sources(rabbit_depth PRIVATE ${RABBITBAM_SRC})
+  target_compile_definitions(rabbit_depth PRIVATE USE_RABBITBAM)
+  target_include_directories(rabbit_depth PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/rabbitbam)
+  target_link_libraries(rabbit_depth ${DEFLATE_LIB})
+else()
+  if(RABBITBIN_USE_VENDORED_BAM)
+    message(WARNING "libdeflate not found; building rabbit_depth without the vendored RabbitBAM reader")
+  endif()
+endif()
 
 install(TARGETS ${targets}
         DESTINATION bin/
