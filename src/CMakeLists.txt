@@ -52,6 +52,27 @@ else()
     message("rabbitbin: AVX2 not supported, using scalar fallback")
   endif()
 endif()
+# Link-time optimization: rabbitbin is split across rabbitbin.cpp + probmh.cpp,
+# so the hot ProbMinHash methods (addHashFromRng, tracker update, jaccard) live
+# in a different translation unit from their per-contig sketch caller and cannot
+# be inlined without LTO. Enabling IPO lets the compiler inline + specialise the
+# sketch hot path across the TU boundary. No -ffast-math is implied, so floating
+# point results are unchanged. Only applied if the toolchain supports it.
+check_cxx_compiler_flag("-flto" COMPILER_SUPPORTS_LTO)
+if(COMPILER_SUPPORTS_LTO)
+  # Apply LTO explicitly to both compile and link so the objects are emitted as
+  # LTO bytecode and the final codegen sees both TUs. -march=native is re-asserted
+  # on the link line because LTO performs code generation at link time.
+  target_compile_options(rabbitbin PRIVATE -flto)
+  target_link_options(rabbitbin PRIVATE -flto)
+  if(COMPILER_SUPPORTS_MARCH_NATIVE)
+    target_link_options(rabbitbin PRIVATE -march=native)
+  endif()
+  message("rabbitbin: LTO enabled")
+else()
+  message("rabbitbin: LTO not supported by compiler")
+endif()
+
 install(TARGETS rabbitbin DESTINATION bin/)
 
 set(targets rabbit_depth rabbit_overlap)
