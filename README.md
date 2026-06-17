@@ -24,17 +24,6 @@ cd build && cmake .. && make rabbitbin -j
 | `prefix_bin_001.fa` | Bin FASTA files |
 | `prefix.unbinned.fa` | Unbinned contigs (with `--unbinned`) |
 
-## Migration from older names
-
-If you have existing scripts from an earlier checkout:
-
-| Old | New |
-|-----|-----|
-| `jgi_summarize_bam_contig_depths` | `rabbit_depth` |
-| `contigOverlaps` | `rabbit_overlap` |
-| `RABBIT_NEG_ABD` | `RABBIT_NEG_DEPTH` |
-| `FKMV_*` env vars | `RABBIT_*` only |
-
 After pulling these changes, rebuild from a clean tree:
 
 ```bash
