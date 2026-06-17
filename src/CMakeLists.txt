@@ -38,6 +38,30 @@ if(NOT "${EXTRA_DEPENDENCIES}" STREQUAL "")
   add_dependencies(rabbitbin ${EXTRA_DEPENDENCIES})
 endif()
 target_link_libraries(rabbitbin ${ZLIB_LIBRARIES} ${Boost_LIBRARIES} ${EXTRALIBS} RabbitBin_VERSION_LIB deflate)
+
+# ── ISA-L (igzip) fast gzip inflate for the streaming large-.gz reader ──────
+# Optional: when libisal + igzip_lib.h are found, the streaming FASTA reader's
+# producer decompresses .gz with ISA-L's igzip (~2-4x faster than zlib) instead
+# of gzread.  Purely a speedup — results are identical (same DEFLATE bytes), and
+# the uncompressed mmap path / small-.gz libdeflate path are untouched.  When
+# ISA-L is absent the code compiles to the zlib path unchanged.
+# Override search roots with -DISAL_ROOT=/path (expects include/ and lib/).
+# Default to the vendored build at thirdparty/isa-l/_inst when present, so a
+# plain `cmake ..` picks up igzip automatically once ISA-L has been built there.
+if(NOT ISAL_ROOT)
+  set(ISAL_ROOT "${CMAKE_SOURCE_DIR}/thirdparty/isa-l/_inst")
+endif()
+find_library(ISAL_LIB NAMES libisal.a isal HINTS ${ISAL_ROOT}/lib ${ISAL_ROOT}/lib64)
+find_path(ISAL_INCLUDE_DIR igzip_lib.h HINTS ${ISAL_ROOT}/include PATH_SUFFIXES isa-l)
+if(ISAL_LIB AND ISAL_INCLUDE_DIR)
+  target_compile_definitions(rabbitbin PRIVATE USE_IGZIP)
+  target_include_directories(rabbitbin PRIVATE ${ISAL_INCLUDE_DIR})
+  target_link_libraries(rabbitbin ${ISAL_LIB})
+  message(STATUS "rabbitbin: ISA-L igzip enabled (${ISAL_LIB}) — fast .gz inflate")
+else()
+  message(STATUS "rabbitbin: ISA-L not found; .gz uses zlib (set -DISAL_ROOT to enable igzip)")
+endif()
+
 include(CheckCXXCompilerFlag)
 check_cxx_compiler_flag("-march=native" COMPILER_SUPPORTS_MARCH_NATIVE)
 if(COMPILER_SUPPORTS_MARCH_NATIVE)

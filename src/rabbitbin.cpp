@@ -29,6 +29,8 @@
 #include <libdeflate.h>
 #include <future>
 #include <thread>
+#include <mutex>
+#include <condition_variable>
 #include <omp.h>
 // ── mmap parallel FASTA reader ───────────────────────────────────────────
 #include <sys/mman.h>
@@ -1153,6 +1155,411 @@ static bool parse_fasta_mmap_parallel(
   return true;
 }
 
+// ─── Decompression backend for the streaming reader ─────────────────────────
+// A tiny façade over three byte sources, chosen at open() time:
+//   • PLAIN  : fopen + fread            (uncompressed input)
+//   • ZLIB   : gzopen + gzread          (.gz, default)
+//   • IGZIP  : ISA-L streaming inflate  (.gz, when built with USE_IGZIP)
+// ISA-L's igzip decompresses a single gzip stream ~2–4× faster than zlib, which
+// is the bottleneck on hundred-GB .gz assemblies (a single DEFLATE stream's
+// inflate is inherently sequential, so it lives on one producer thread).  When
+// ISA-L is not available the class compiles to the zlib path unchanged, so the
+// streaming reader's behaviour and results are identical with or without ISA-L.
+// read() returns the number of bytes produced (0 = EOF, <0 = error); on a
+// corrupt/truncated stream the ISA-L path returns the bytes decoded so far and
+// then reports EOF, matching zlib's lenient gzread behaviour.
+#if defined(USE_IGZIP)
+#include <igzip_lib.h>
+#endif
+struct RbGzReader {
+  enum Mode { PLAIN, ZLIB
+#if defined(USE_IGZIP)
+            , IGZIP
+#endif
+  };
+  Mode    mode  = PLAIN;
+  FILE   *fp    = nullptr;
+  gzFile  gz    = nullptr;
+  bool    eof_  = false;
+#if defined(USE_IGZIP)
+  static const size_t   IN_SZ   = 1u << 22;   // 4 MB compressed read granularity
+  static const uint32_t HDR_REQ = 1u << 16;   // bytes needed to (re)read a gz header
+  unsigned char        *inbuf   = nullptr;
+  struct inflate_state  st;
+  struct isal_gzip_header hdr;
+#endif
+
+  bool open(const char *path, bool is_gz) {
+    if (!is_gz) { mode = PLAIN; fp = fopen(path, "rb"); return fp != nullptr; }
+#if defined(USE_IGZIP)
+    mode = IGZIP;
+    fp = fopen(path, "rb");
+    if (!fp) return false;
+    inbuf = (unsigned char *)malloc(IN_SZ);
+    if (!inbuf) { fclose(fp); fp = nullptr; return false; }
+    isal_gzip_header_init(&hdr);
+    isal_inflate_init(&st);
+    st.crc_flag = ISAL_GZIP_NO_HDR_VER;
+    st.next_in  = inbuf;
+    st.avail_in = (uint32_t)fread(inbuf, 1, IN_SZ, fp);
+    if (isal_read_gzip_header(&st, &hdr) != ISAL_DECOMP_OK) return false;
+    return true;
+#else
+    mode = ZLIB;
+    gz = gzopen(path, "r");
+    if (!gz) return false;
+    gzbuffer(gz, 4u << 20);
+    return true;
+#endif
+  }
+
+  int64_t read(char *out, size_t size) {
+    if (mode == PLAIN) return (int64_t)fread(out, 1, size, fp);
+#if defined(USE_IGZIP)
+    if (mode == IGZIP) {
+      if (eof_) return 0;
+      unsigned char *o = (unsigned char *)out;
+      uint64_t off = 0;
+      while (off < size) {
+        if (st.avail_in == 0) {
+          if (feof(fp)) { eof_ = true; break; }
+          st.next_in  = inbuf;
+          st.avail_in = (uint32_t)fread(inbuf, 1, IN_SZ, fp);
+          if (st.avail_in == 0) { eof_ = true; break; }
+        }
+        st.next_out  = o + off;
+        st.avail_out = (uint32_t)(size - off);
+        int r = isal_inflate(&st);
+        off = (uint64_t)(st.next_out - o);
+        if (r != ISAL_DECOMP_OK) { eof_ = true; break; }  // tolerate truncation
+        if (st.block_state == ISAL_BLOCK_FINISH) {
+          if (feof(fp) && st.avail_in == 0) { eof_ = true; break; }
+          // A concatenated gzip member may follow (pigz / cat a.gz b.gz …).
+          if (st.avail_in == 0) {
+            isal_inflate_reset(&st);
+            st.next_in  = inbuf;
+            st.avail_in = (uint32_t)fread(inbuf, 1, IN_SZ, fp);
+            if (st.avail_in == 0) { eof_ = true; break; }
+          } else if (st.avail_in >= HDR_REQ) {
+            unsigned char *oni = st.next_in; uint32_t oai = st.avail_in;
+            isal_inflate_reset(&st);
+            st.next_in = oni; st.avail_in = oai;
+          } else {
+            uint32_t oai = st.avail_in;
+            memmove(inbuf, st.next_in, oai);
+            size_t rd = feof(fp) ? 0 : fread(inbuf + oai, 1, IN_SZ - oai, fp);
+            isal_inflate_reset(&st);
+            st.next_in = inbuf; st.avail_in = oai + (uint32_t)rd;
+          }
+          if (isal_read_gzip_header(&st, &hdr) != ISAL_DECOMP_OK) { eof_ = true; break; }
+        }
+      }
+      return (int64_t)off;
+    }
+#endif
+    return (int64_t)gzread(gz, out, (unsigned)size);  // ZLIB
+  }
+
+  void close() {
+    if (gz) { gzclose(gz); gz = nullptr; }
+    if (fp) { fclose(fp);  fp = nullptr; }
+#if defined(USE_IGZIP)
+    if (inbuf) { free(inbuf); inbuf = nullptr; }
+#endif
+  }
+};
+
+// ─── Streaming parallel gzip FASTA reader (large .gz) ────────────────────────
+// For .gz assemblies too large for the one-shot libdeflate path (default
+// > RABBIT_LIBDEFLATE_MAXGB compressed), the historical fallback was a single
+// threaded kseq loop: one thread inflated AND parsed AND compacted AND copied
+// AND sketched every record, so throughput collapsed to a single core on
+// hundred-GB assemblies.
+//
+// A single gzip stream's inflate is inherently sequential, so it stays on ONE
+// dedicated producer thread; everything else (FASTA parsing, newline removal,
+// sequence storage, PMH sketching) moves onto N worker threads.  The producer
+// cuts the decompressed byte stream into record-aligned blocks — every block
+// both starts and ends on a '>' record boundary, so no record ever straddles
+// two blocks — and feeds them through a bounded queue (backpressure caps the
+// in-flight decompressed memory).  Workers drain the queue in parallel, parse
+// each block into thread-local ContigRec lists (sequences compacted into the
+// per-worker arenas, identical storage model to the mmap path) and build the
+// PMH sketches inline.  Per-block results are stored by block id and merged in
+// file order, so the resulting contig indexing is byte-for-byte identical to
+// the serial kseq path — and therefore so is every downstream result.  This
+// touches NEITHER the <threshold libdeflate path (used by CAMI-scale .gz) NOR
+// the uncompressed mmap path, so their behaviour and results are unchanged.
+//
+// Output shape mirrors parse_fasta_mmap_parallel() so the caller can share the
+// same merge / IDF-rebuild / exact-cosine post-processing.  Returns false (→
+// caller uses the kseq fallback) only if the file cannot be opened.
+static bool parse_fasta_stream_parallel(
+    const std::string   &path,
+    int                  nthreads,
+    size_t               minContig_arg,
+    size_t               min_small_contig_arg,
+    bool                 fullHeader_arg,
+    bool                 stream_pmh_arg,
+    bool                 no_store_seqs_arg,
+    bool                 collect_tiny_arg,
+    uint32_t             pmh_m_arg,
+    int                  pmh_k_arg,
+    bool                 input_is_gz,    // .gz → zlib/igzip; else → plain fread
+    // outputs  ──────────────────────────────────────────────────────────
+    std::vector<ContigRec> &large_out,
+    std::vector<ContigRec> &small_out,
+    std::vector<std::pair<std::string,std::string>> &tiny_out,
+    size_t               &num_seqs_out)
+{
+  RbGzReader fgz;
+  if (!fgz.open(path.c_str(), input_is_gz)) { fgz.close(); return false; }
+
+  // One producer thread (inflate) + the rest parse.  At least one parser.
+  const int n_consumers = std::max(1, nthreads - 1);
+
+  // Per-consumer persistent sequence arenas (retained for the whole run; the
+  // merged seq views point into them).  Indexed by consumer slot.
+  g_seq_arenas.assign(n_consumers, std::string());
+
+  struct Block { std::vector<char> data; size_t id; };
+  struct BlockOut {
+    std::vector<ContigRec> large, small;
+    std::vector<std::pair<std::string,std::string>> tiny;
+    size_t nseq = 0;
+  };
+
+  // ── Bounded block queue (producer → consumers) ──────────────────────────
+  std::mutex                 qmtx;
+  std::condition_variable    q_notempty, q_notfull;
+  std::deque<Block>          queue;
+  bool                       producer_done = false;
+  const size_t MAX_INFLIGHT = (size_t)std::max(4, n_consumers * 3);
+
+  // ── Per-block parsed results (results[id]; file order == block id order) ─
+  std::mutex                 rmtx;
+  std::deque<BlockOut>       results;
+
+  // ── Producer: inflate, then split on the last "\n>" so every emitted block
+  //    is a whole number of records (the trailing partial record is carried
+  //    over to the next block). ───────────────────────────────────────────
+  std::thread producer([&]() {
+    const size_t TARGET = 64u << 20;   // ~64 MB decompressed per block
+    const size_t CHUNK  = 4u << 20;    // gzread granularity
+    std::vector<char> carry;           // partial trailing record (starts at '>')
+    size_t block_id = 0;
+    bool   eof = false;
+
+    while (true) {
+      std::vector<char> buf;
+      buf.swap(carry);                 // begins with '>' (or empty on first pass)
+      if (buf.capacity() < TARGET + CHUNK) buf.reserve(TARGET + CHUNK);
+
+      // Accumulate until we have >= TARGET bytes AND a record boundary, or EOF.
+      // A single record larger than TARGET simply grows the block until the
+      // next boundary appears (or EOF), so no record is ever split.
+      for (;;) {
+        bool boundary = buf.size() >= TARGET &&
+            std::string_view(buf.data(), buf.size())
+                .rfind(std::string_view("\n>", 2)) != std::string_view::npos;
+        if (boundary || eof) break;
+        size_t old = buf.size();
+        buf.resize(old + CHUNK);
+        int64_t got = fgz.read(buf.data() + old, CHUNK);
+        if (got <= 0) { buf.resize(old); eof = true; }  // 0 = EOF, <0 = error
+        else          buf.resize(old + (size_t)got);
+      }
+
+      if (buf.empty()) break;          // nothing left to emit
+
+      size_t emit_len;
+      if (eof) {
+        emit_len = buf.size();         // last block: all records are complete
+      } else {
+        size_t cut = std::string_view(buf.data(), buf.size())
+                         .rfind(std::string_view("\n>", 2));
+        // Non-EOF exit implies a boundary was found above.
+        emit_len = cut + 1;            // keep the '\n'; the next '>' starts carry
+        carry.assign(buf.begin() + emit_len, buf.end());
+        buf.resize(emit_len);
+      }
+
+      Block blk;
+      blk.id   = block_id++;
+      blk.data = std::move(buf);
+      {
+        std::unique_lock<std::mutex> lk(qmtx);
+        q_notfull.wait(lk, [&] { return queue.size() < MAX_INFLIGHT; });
+        queue.push_back(std::move(blk));
+      }
+      q_notempty.notify_one();
+
+      if (eof) break;
+    }
+
+    {
+      std::lock_guard<std::mutex> lk(qmtx);
+      producer_done = true;
+    }
+    q_notempty.notify_all();
+  });
+
+  // ── Consumers: parse whole-record blocks into thread-local ContigRecs ────
+  auto consumer = [&](int cidx) {
+    std::string          &arena = g_seq_arenas[cidx];
+    std::vector<uint64_t> scratch;   // build_pmh_winners scratch (reused)
+
+    for (;;) {
+      Block blk;
+      {
+        std::unique_lock<std::mutex> lk(qmtx);
+        q_notempty.wait(lk, [&] { return !queue.empty() || producer_done; });
+        if (queue.empty()) break;    // producer_done && drained
+        blk = std::move(queue.front());
+        queue.pop_front();
+      }
+      q_notfull.notify_one();
+
+      BlockOut out;
+      const char *p   = blk.data.data();
+      const char *end = p + blk.data.size();
+
+      while (p < end) {
+        const char *gt = (const char *)memchr(p, '>', (size_t)(end - p));
+        if (!gt) break;
+        p = gt + 1;
+
+        const char *name_start = p;
+        while (p < end && (uint8_t)*p > ' ') ++p;
+        const char *name_end = p;
+        const char *nl = (const char *)memchr(p, '\n', (size_t)(end - p));
+        if (!nl) break;              // header not terminated (block boundary)
+        p = nl + 1;
+
+        const char *next_gt = (const char *)memchr(p, '>', (size_t)(end - p));
+        const char *seq_end = next_gt ? next_gt : end;
+
+        ++out.nseq;
+
+        // Fast tiny-prune: the raw byte span (incl. newlines) is an upper bound
+        // on seq_len, so a sub-threshold span is definitely tiny — skip the
+        // compaction + name materialisation entirely (unless tiny output is on).
+        if (!collect_tiny_arg &&
+            (size_t)(seq_end - p) < (size_t)min_small_contig_arg) {
+          p = seq_end;
+          continue;
+        }
+
+        // Compact the (possibly multi-line) sequence into this worker's arena,
+        // stripping '\n' and trailing '\r'.  Recorded as an (arena_tid,off,len)
+        // slice; rolled back below if the record turns out to be discarded.
+        const size_t off = arena.size();
+        const char  *seg = p;
+        while (seg < seq_end) {
+          const char *seg_nl = (const char *)memchr(seg, '\n', (size_t)(seq_end - seg));
+          const char *seg_e  = seg_nl ? seg_nl : seq_end;
+          size_t slen = (size_t)(seg_e - seg);
+          if (slen > 0 && seg[slen - 1] == '\r') --slen;
+          if (slen > 0) arena.append(seg, slen);
+          if (!seg_nl) break;
+          seg = seg_nl + 1;
+        }
+        const size_t seq_len = arena.size() - off;
+        p = seq_end;
+
+        const bool is_large = seq_len >= minContig_arg;
+        const bool is_small = !is_large && seq_len >= min_small_contig_arg;
+
+        if (!is_large && !is_small) {
+          if (collect_tiny_arg) {
+            std::string name(name_start, name_end);
+            if (!fullHeader_arg) {
+              size_t sp = name.find_first_of(" \t");
+              if (sp != std::string::npos) name.resize(sp);
+            }
+            out.tiny.emplace_back(std::move(name),
+                                  std::string(arena.data() + off, seq_len));
+          }
+          arena.resize(off);          // discard tiny bytes
+          continue;
+        }
+
+        std::string name(name_start, name_end);
+        if (!fullHeader_arg) {
+          size_t sp = name.find_first_of(" \t");
+          if (sp != std::string::npos) name.resize(sp);
+        }
+        const char *seq_bytes = arena.data() + off;  // stable until next append
+
+        if (is_large) {
+          ContigRec rec;
+          rec.name     = std::move(name);
+          rec.len      = seq_len;
+          rec.is_small = false;
+          if (stream_pmh_arg) {
+            rec.winners.resize(pmh_m_arg, 0u);
+            float *k4out = nullptr;
+            if ((g_idf_norm || g_exact_cos_cmp) && pmh_k_arg == 4 && g_gc_norm >= 1) {
+              rec.k4freq.resize(256, 0.0f);
+              k4out = rec.k4freq.data();
+            }
+            build_pmh_winners(seq_bytes, seq_len,
+                              pmh_k_arg, pmh_m_arg, /*seed=*/42u,
+                              rec.winners.data(), scratch,
+                              /*out64=*/nullptr, /*out_keys=*/nullptr, k4out);
+          }
+          if (!no_store_seqs_arg) {
+            rec.arena_tid = cidx;     // arena slice retained
+            rec.arena_off = off;
+          } else {
+            arena.resize(off);        // sketch built; drop the stored bytes
+            rec.arena_tid = -1;
+          }
+          out.large.push_back(std::move(rec));
+        } else {                       // is_small (always stored, matches mmap)
+          ContigRec rec;
+          rec.name      = std::move(name);
+          rec.len       = seq_len;
+          rec.is_small  = true;
+          rec.arena_tid = cidx;
+          rec.arena_off = off;
+          out.small.push_back(std::move(rec));
+        }
+      }
+
+      {
+        std::lock_guard<std::mutex> lk(rmtx);
+        if (results.size() <= blk.id) results.resize(blk.id + 1);
+        results[blk.id] = std::move(out);
+      }
+    }
+  };
+
+  std::vector<std::thread> workers;
+  workers.reserve(n_consumers);
+  for (int c = 0; c < n_consumers; ++c) workers.emplace_back(consumer, c);
+  producer.join();
+  for (auto &w : workers) w.join();
+  fgz.close();
+  rb_phase("  streaming parallel parse loop done");
+
+  // ── Merge per-block results in file (block id) order ────────────────────
+  num_seqs_out = 0;
+  size_t n_large = 0, n_small = 0, n_tiny = 0;
+  for (auto &b : results) { n_large += b.large.size(); n_small += b.small.size(); n_tiny += b.tiny.size(); }
+  large_out.reserve(n_large);
+  small_out.reserve(n_small);
+  tiny_out.reserve(n_tiny);
+  for (auto &b : results) {
+    num_seqs_out += b.nseq;
+    for (auto &r : b.large) large_out.push_back(std::move(r));
+    for (auto &r : b.small) small_out.push_back(std::move(r));
+    for (auto &r : b.tiny)  tiny_out.push_back(std::move(r));
+  }
+  rb_phase("  streaming parse merge done");
+  return true;
+}
+
 // Decompress a gzip file with libdeflate into out_buf.
 // Returns true on success; out_buf is NUL-terminated.
 // ── Parallel multi-stream gzip decompression ──────────────────────────────
@@ -1797,11 +2204,17 @@ int main(int ac, char *av[]) {
                       gz_file_bytes / 1048576.0, libdeflate_max_bytes / 1048576.0);
     }
 
-    // ── Parallel mmap path: uncompressed FASTA, N threads each parse one chunk ─
-    // Active when: file is NOT .gz AND mmap succeeds.
-    // Borrows RabbitFX producer-consumer spirit but uses shared mmap instead of
-    // fread chunks → zero per-thread open/seek cost; the OS prefetches pages.
-    if (!parsed_ok && !is_gz) {
+    // ── Parallel ContigRec path ──────────────────────────────────────────
+    // Two producers feed the SAME thread-local-ContigRec → file-order-merge
+    // machinery (so the two share all downstream code and behave identically):
+    //   • uncompressed FASTA  → parse_fasta_mmap_parallel   (shared mmap, N
+    //     threads each parse one chunk; OS prefetches pages).
+    //   • large .gz (above the libdeflate one-shot threshold) →
+    //     parse_fasta_stream_parallel (1 inflate producer + N parse workers).
+    //     This replaces the old single-threaded kseq fallback for big gzip
+    //     assemblies while leaving the <threshold libdeflate path (CAMI-scale)
+    //     and the uncompressed mmap path untouched.
+    if (!parsed_ok) {
       const bool stream_pmh_mmap = rb_env_pmh_on();
       const bool no_store_seqs_mmap = [&]() -> bool {
         const char *e = rb_getenv("RABBIT_NOSTORE_SEQS"); return e && e[0] == '1';
@@ -1821,13 +2234,44 @@ int main(int ac, char *av[]) {
 
       if (no_store_seqs_mmap) onlyLabel = true;
 
-      verbose_message("Parallel mmap FASTA parse (%d threads) [%.1fGb / %.1fGb]\n",
+      verbose_message("Parallel %s FASTA parse (%d threads) [%.1fGb / %.1fGb]\n",
+                      is_gz ? "streaming gzip" : "mmap",
                       (int)numThreads, getUsedPhysMem(), getTotalPhysMem() / 1024 / 1024);
 
       std::vector<ContigRec> mmap_large, mmap_small;
       std::vector<std::pair<std::string,std::string>> mmap_tiny;
 
-      if (parse_fasta_mmap_parallel(
+      bool producer_ok;
+      bool used_stream_reader = is_gz;  // gz always uses the streaming reader
+      if (is_gz) {
+        producer_ok = parse_fasta_stream_parallel(
+            inFile, (int)numThreads,
+            minContig, min_small_contig,
+            fullHeader,
+            stream_pmh_mmap, no_store_seqs_mmap,
+            /*collect_tiny=*/outUnbinned,
+            pmh_m_mmap, pmh_k_mmap,
+            /*input_is_gz=*/true,
+            mmap_large, mmap_small, mmap_tiny,
+            num_seqs);
+      } else {
+        // Uncompressed.  Prefer the zero-copy mmap reader (fastest — no copy,
+        // OS read-ahead, N threads each parse one chunk).  Two escape hatches
+        // both route to the PARALLEL streaming reader (never the single-threaded
+        // kseq loop), so large uncompressed assemblies always parse on N threads:
+        //   • RABBIT_FORCE_STREAM=1  — force streaming (for environments where
+        //     mmap behaves poorly, e.g. some network/over-committed file systems).
+        //   • automatic             — mmap could not be established (NFS /
+        //     restricted-fs / mmap-capped env).
+        // gzread reads plain files transparently — the same zlib decode basis the
+        // legacy kseq fallback used — so parsed contigs, order and results match
+        // the mmap path exactly.
+        const bool force_stream = [] {
+          const char *e = rb_getenv("RABBIT_FORCE_STREAM"); return e && e[0] == '1';
+        }();
+        producer_ok = false;
+        if (!force_stream) {
+          producer_ok = parse_fasta_mmap_parallel(
               inFile, (int)numThreads,
               minContig, min_small_contig,
               fullHeader,
@@ -1835,10 +2279,34 @@ int main(int ac, char *av[]) {
               /*collect_tiny=*/outUnbinned,
               pmh_m_mmap, pmh_k_mmap,
               mmap_large, mmap_small, mmap_tiny,
-              num_seqs)) {
+              num_seqs);
+        }
+        if (!producer_ok) {
+          verbose_message("Using parallel streaming reader for uncompressed FASTA "
+                          "(%s) [%.1fGb / %.1fGb]\n",
+                          force_stream ? "RABBIT_FORCE_STREAM=1" : "mmap unavailable",
+                          getUsedPhysMem(), getTotalPhysMem() / 1024 / 1024);
+          mmap_large.clear(); mmap_small.clear(); mmap_tiny.clear();
+          used_stream_reader = true;
+          producer_ok = parse_fasta_stream_parallel(
+              inFile, (int)numThreads,
+              minContig, min_small_contig,
+              fullHeader,
+              stream_pmh_mmap, no_store_seqs_mmap,
+              /*collect_tiny=*/outUnbinned,
+              pmh_m_mmap, pmh_k_mmap,
+              /*input_is_gz=*/false,
+              mmap_large, mmap_small, mmap_tiny,
+              num_seqs);
+        }
+      }
 
-        verbose_message("Parallel mmap parsed %zu seqs (%zu large, %zu small) "
+      if (producer_ok) {
+
+        verbose_message("Parallel %s parsed %zu seqs (%zu large, %zu small) "
                         "[%.1fGb / %.1fGb]\n",
+                        used_stream_reader ? (is_gz ? "streaming gzip" : "streaming")
+                                           : "mmap",
                         num_seqs, mmap_large.size(), mmap_small.size(),
                         getUsedPhysMem(), getTotalPhysMem() / 1024 / 1024);
 
@@ -2003,7 +2471,8 @@ int main(int ac, char *av[]) {
 
         parsed_ok = true;
       } else {
-        verbose_message("mmap failed, falling back to streaming kseq\n");
+        verbose_message("parallel %s parse failed, falling back to streaming kseq\n",
+                        is_gz ? "streaming gzip" : "mmap");
       }
     }
 
