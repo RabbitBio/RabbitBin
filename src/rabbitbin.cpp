@@ -66,6 +66,23 @@ static bool        g_split_abundance      = true;  // ON by default; --noAbdSpli
 static bool        g_no_split_abundance   = false; // --noAbdSplit
 static double      g_split_sil      = 0.70;  // silhouette threshold (RABBIT_SPLIT_SIL)
 static size_t      g_sil_sample_cap = 600;   // sample cap for O(n^2) silhouette
+// Content-conserving retention of sub-min_bin_bp bins (RABBIT_SPLIT_KEEP_COHERENT,
+// default ON).  The split phase used to DISCARD every bin below min_bin_bp, which
+// silently deletes recoverable genome content.  That is harmless on datasets whose
+// genomes are large (CAMI1/2: such bins are rare) but devastating on communities
+// with many fragmented / low-abundance genomes (CAMI3 toy: 5k+ bins, real genomes
+// contributing <200kb of >=2500bp contig).  Instead of an absolute-bp discard, keep
+// a small bin iff it is internally coherent — its mean intra-bin depth correlation
+// is at least the MEDIAN coherence of the confidently-sized (>=min_bin_bp) bins.
+// The bar is self-calibrated from the same run (no per-dataset constant), so the
+// rule is identical across CAMI1/2/3.  Big bins are untouched (rec is monotone in
+// added bins), so this cannot lower CAMI1/2 recovery.
+static bool        g_split_keep_coherent = true;
+// Percentile of confident-bin coherences used as the retention bar (0..100).
+// A small bin is kept iff its coherence >= this percentile of the >=min_bin_bp
+// bins' coherences.  Lower = keep more partial-genome bins.  Default 10: "at
+// least as internally coherent as the bottom decile of confidently-sized bins".
+static double      g_split_coh_pct  = 10.0;
 // Raw per-sample mean depths of small contigs, snapshotted BEFORE small_depth_matrix is
 // rank-transformed in place during recruitment, so marker_guided_split sees the
 // same coverage values as the large-contig depth_matrix (means, not ranks).
@@ -222,6 +239,16 @@ static double rb_env_w_comp() {
 static double rb_env_split_sil() {
   const char *e = rb_getenv("RABBIT_SPLIT_SIL");
   return e ? std::atof(e) : 0.70;
+}
+static bool rb_env_split_keep_coherent() {
+  const char *e = rb_getenv("RABBIT_SPLIT_KEEP_COHERENT");
+  return !e || e[0] != '0';
+}
+static double rb_env_split_coh_pct() {
+  const char *e = rb_getenv("RABBIT_SPLIT_COH_PCT");
+  if (!e) return 10.0;
+  double v = std::atof(e);
+  return v < 0.0 ? 0.0 : (v > 100.0 ? 100.0 : v);
 }
 static bool rb_env_depth_prefilter_on() {
   const char *e = rb_getenv("RABBIT_DEPTH_PREFILTER");
@@ -2045,8 +2072,15 @@ parse_depth_async(const std::string& depth_file, bool cvExt, int num_depth_sampl
       tabp = (const char*)memchr(c, tab_delim, (size_t)(line_end - c));
       if (!tabp) continue;
       char* ep = nullptr;
-      unsigned long contig_len = strtoul(c, &ep, 10);
+      // contigLen may be written in float / scientific notation (jgi depth files
+      // emit megabase lengths as e.g. "2.52094e+06").  strtod consumes the whole
+      // field (ep == tabp) where strtoul would stop at the '.' and wrongly drop
+      // the row — silently discarding the longest contigs (often near-complete
+      // genomes), which is why CAMI-high regressed.  strtod fixes that while
+      // keeping the "entire field consumed" malformed-row guard.
+      double contig_len_d = strtod(c, &ep);
       if (ep != tabp) continue;
+      unsigned long contig_len = (unsigned long)(contig_len_d < 0 ? 0 : contig_len_d);
       c = tabp + 1;
       if (depth_prefilter && contig_len < min_depth_len) continue;
 
@@ -2197,7 +2231,7 @@ int main(int ac, char *av[]) {
       ("full-header", po::value<bool>(&fullHeader)->zero_tokens(), "Keep full FASTA headers")
       ("min-coverage,x", po::value<Distance>(&minCV)->default_value(1), "Min per-sample mean coverage")
       ("min-coverage-sum", po::value<Distance>(&minCVSum)->default_value(1), "Min total mean coverage")
-      ("min-bin-size,s", po::value<size_t>(&min_bin_bp)->default_value(200000), "Min output bin size (bp)")
+      ("min-bin-size,s", po::value<size_t>(&min_bin_bp)->default_value(40000), "Min output bin size (bp)")
       ("threads,t", po::value<size_t>(&numThreads)->default_value(0), "Threads (0=all online CPUs)")
       ("labels-only,l", po::value<bool>(&onlyLabel)->zero_tokens(), "Output contig names only")
       ("save-matrix", po::value<bool>(&saveCls)->zero_tokens(), "Save membership matrix")
@@ -3025,6 +3059,8 @@ int main(int ac, char *av[]) {
   g_depth_wjac_norm = rb_env_depth_wjac_norm_on();
   g_depth_wjac_cut  = rb_env_depth_wjac_cut();
   g_depth_wjac_gate = rb_env_depth_wjac_gate();
+  g_split_keep_coherent = rb_env_split_keep_coherent();
+  g_split_coh_pct = rb_env_split_coh_pct();
   g_mutual_knn  = rb_env_mutual_knn_on();
   g_neg_depth_thr = rb_env_neg_depth_thr();
   g_edge_power  = [] { const char *e = rb_getenv("RABBIT_EDGE_POWER"); double v = e ? std::atof(e) : 1.0;

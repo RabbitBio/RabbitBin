@@ -109,7 +109,7 @@ static bool debug = false;
 static bool noBinOut = false;
 static bool noSampleDepths = false;
 static Distance mergeSamplesCosign = 1.0;
-static size_t min_bin_bp = 200000;
+static size_t min_bin_bp = 40000;
 static size_t minContig = 2500; // minimum contig size for binning
 static std::string inFile;
 static std::string depth_file;
