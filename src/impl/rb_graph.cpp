@@ -783,10 +783,7 @@ static Distance gen_fused_calib_graph(Graph &g, Distance coverage) {
           // Abundance-first exact upper-bound prune: skip the PMH kernel for
           // pairs whose best-case fused score is already below the cutoff.
           if (abdfirst) {
-            const float *ui = abd_u + i * ABD_S;
-            const float *uj = abd_u + j * ABD_S;
-            float c = 0.0f;
-            for (uint32_t k = 0; k < ABD_S; ++k) c += ui[k] * uj[k];
+            const float c = unit_dot_f(abd_u + i * ABD_S, abd_u + j * ABD_S, ABD_S);
             if (c < abd_corr_min_eps) continue;
           }
           StoredDistance sv = (StoredDistance)graph_sim(i, j);

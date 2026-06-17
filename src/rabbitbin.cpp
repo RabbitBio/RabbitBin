@@ -106,6 +106,11 @@ static double             g_depth_wjac_cut  = 0.0;
 static bool               g_depth_wjac_gate = false;
 static std::vector<float> g_depth_raw;             // nobs × num_depth_samples (raw, pre-rank)
 static std::vector<double> g_depth_colnorm;        // num_depth_samples (empty = no norm)
+// Centered + L2-normalised rank vectors (nobs × num_depth_samples).  Pearson on
+// ranks == dot product of these unit rows, so the edge-weight corr term becomes a
+// single length-S FMA dot product instead of the per-pair Welford (3 divisions /
+// sample + 2 sqrt / pair).  Built once after depth_matrix is rank-transformed.
+static std::vector<float>  g_depth_unit;           // nobs × num_depth_samples (unit ranks)
 
 // Minimum similarity floor (×1000) used during auto-calibration.
 // Sketch Jaccard on short metagenomic contigs typically spans 0–0.3.
@@ -273,6 +278,93 @@ static inline double cal_depth_wjac(size_t r1, size_t r2) {
   return mn / mx;
 }
 
+// Fast Pearson-on-ranks for two LARGE contigs via the precomputed unit vectors:
+// corr(i,j) == Σ_k u_i[k]·u_j[k] (g_depth_unit holds centered+L2-normalised rank
+// rows).  Pure FMA dot product — no per-element division, no per-pair sqrt — and
+// auto-vectorises.  Falls back to the Welford cal_depth_corr when the unit cache
+// is absent (e.g. centroid/small-contig variants build their own unit vectors).
+static inline double depth_corr_fast(size_t i, size_t j) {
+  if (g_depth_unit.empty()) return cal_depth_corr(i, j);
+  const float *a = g_depth_unit.data() + i * num_depth_samples;
+  const float *b = g_depth_unit.data() + j * num_depth_samples;
+  const size_t S = num_depth_samples;
+  size_t k = 0;
+  double s = 0.0;
+#if defined(__AVX512F__)
+  // Two float FMA accumulators (16 lanes each) for ILP, then one horizontal
+  // reduce — same pattern as k4_cosine_sim.  Unit rows are L2-normalised so the
+  // dot lies in [-1,1]; float accumulation error (~S·1e-7) is far below the
+  // edge-weight granularity.  S < 16 (e.g. CAMI-high, S=5) skips this entirely
+  // and uses the scalar double tail below, unchanged.
+  __m512 acc0 = _mm512_setzero_ps(), acc1 = _mm512_setzero_ps();
+  for (; k + 32 <= S; k += 32) {
+    acc0 = _mm512_fmadd_ps(_mm512_loadu_ps(a + k),      _mm512_loadu_ps(b + k),      acc0);
+    acc1 = _mm512_fmadd_ps(_mm512_loadu_ps(a + k + 16), _mm512_loadu_ps(b + k + 16), acc1);
+  }
+  for (; k + 16 <= S; k += 16)
+    acc0 = _mm512_fmadd_ps(_mm512_loadu_ps(a + k), _mm512_loadu_ps(b + k), acc0);
+  if (k > 0) s = (double)_mm512_reduce_add_ps(_mm512_add_ps(acc0, acc1));
+#elif defined(__AVX2__)
+  // AVX2 fallback: two 8-lane accumulators (mul+add; no FMA dependency so it
+  // works on plain AVX2 hosts).  S < 8 skips this and uses the scalar tail.
+  __m256 acc0 = _mm256_setzero_ps(), acc1 = _mm256_setzero_ps();
+  for (; k + 16 <= S; k += 16) {
+    acc0 = _mm256_add_ps(acc0, _mm256_mul_ps(_mm256_loadu_ps(a + k),     _mm256_loadu_ps(b + k)));
+    acc1 = _mm256_add_ps(acc1, _mm256_mul_ps(_mm256_loadu_ps(a + k + 8), _mm256_loadu_ps(b + k + 8)));
+  }
+  for (; k + 8 <= S; k += 8)
+    acc0 = _mm256_add_ps(acc0, _mm256_mul_ps(_mm256_loadu_ps(a + k), _mm256_loadu_ps(b + k)));
+  if (k > 0) {
+    __m256 v8 = _mm256_add_ps(acc0, acc1);
+    __m128 lo = _mm_add_ps(_mm256_castps256_ps128(v8), _mm256_extractf128_ps(v8, 1));
+    lo = _mm_add_ps(lo, _mm_movehl_ps(lo, lo));
+    lo = _mm_add_ss(lo, _mm_shuffle_ps(lo, lo, 0x1));
+    s = (double)_mm_cvtss_f32(lo);
+  }
+#endif
+  for (; k < S; ++k) s += (double)a[k] * (double)b[k];
+  return s;
+}
+
+// Vectorised float dot of two unit (centered+L2-normalised) rows of length S.
+// Used by the abundance-first prune in the O(N²/2) graph pass, evaluated for
+// EVERY candidate pair, so vectorising it is the single biggest pair-pass win on
+// many-sample data.  float accumulation differs from the scalar reference by
+// ~S·1e-7, far inside the prune's 1e-4 conservative safety margin, so pruning
+// decisions (and thus the graph) are unchanged.
+static inline float unit_dot_f(const float *__restrict__ a,
+                               const float *__restrict__ b, uint32_t S) {
+  uint32_t k = 0;
+  float r = 0.0f;
+#if defined(__AVX512F__)
+  __m512 acc0 = _mm512_setzero_ps(), acc1 = _mm512_setzero_ps();
+  for (; k + 32 <= S; k += 32) {
+    acc0 = _mm512_fmadd_ps(_mm512_loadu_ps(a + k),      _mm512_loadu_ps(b + k),      acc0);
+    acc1 = _mm512_fmadd_ps(_mm512_loadu_ps(a + k + 16), _mm512_loadu_ps(b + k + 16), acc1);
+  }
+  for (; k + 16 <= S; k += 16)
+    acc0 = _mm512_fmadd_ps(_mm512_loadu_ps(a + k), _mm512_loadu_ps(b + k), acc0);
+  if (k > 0) r = _mm512_reduce_add_ps(_mm512_add_ps(acc0, acc1));
+#elif defined(__AVX2__)
+  __m256 acc0 = _mm256_setzero_ps(), acc1 = _mm256_setzero_ps();
+  for (; k + 16 <= S; k += 16) {
+    acc0 = _mm256_add_ps(acc0, _mm256_mul_ps(_mm256_loadu_ps(a + k),     _mm256_loadu_ps(b + k)));
+    acc1 = _mm256_add_ps(acc1, _mm256_mul_ps(_mm256_loadu_ps(a + k + 8), _mm256_loadu_ps(b + k + 8)));
+  }
+  for (; k + 8 <= S; k += 8)
+    acc0 = _mm256_add_ps(acc0, _mm256_mul_ps(_mm256_loadu_ps(a + k), _mm256_loadu_ps(b + k)));
+  if (k > 0) {
+    __m256 v8 = _mm256_add_ps(acc0, acc1);
+    __m128 lo = _mm_add_ps(_mm256_castps256_ps128(v8), _mm256_extractf128_ps(v8, 1));
+    lo = _mm_add_ps(lo, _mm_movehl_ps(lo, lo));
+    lo = _mm_add_ss(lo, _mm_shuffle_ps(lo, lo, 0x1));
+    r = _mm_cvtss_f32(lo);
+  }
+#endif
+  for (; k < S; ++k) r += a[k] * b[k];
+  return r;
+}
+
 // Depth term for edge blending, dispatching on g_depth_sim.  Sets ok=false to
 // hard-cut the edge (non-finite, or strongly negative correlation).
 static inline double depth_edge_term(size_t i, size_t j, bool &ok) {
@@ -283,12 +375,12 @@ static inline double depth_edge_term(size_t i, size_t j, bool &ok) {
     if (g_depth_wjac_cut > 0.0 && wj < g_depth_wjac_cut) { ok = false; return 0.0; }
     // Hybrid: keep correlation's signed negative gate for strain separation.
     if (g_depth_wjac_gate && num_depth_samples > 1 && g_neg_depth_thr > -0.99) {
-      double corr = cal_depth_corr(i, j);
+      double corr = depth_corr_fast(i, j);
       if (std::isfinite(corr) && corr < g_neg_depth_thr) { ok = false; return 0.0; }
     }
     return wj < 0.0 ? 0.0 : (wj > 1.0 ? 1.0 : wj);
   }
-  double corr = cal_depth_corr(i, j);            // Spearman (default)
+  double corr = depth_corr_fast(i, j);           // Spearman (default)
   if (!std::isfinite(corr)) { ok = false; return 0.0; }
   if (g_neg_depth_thr > -0.99 && corr < g_neg_depth_thr) { ok = false; return 0.0; }
   double cp = corr < 0.0 ? 0.0 : corr;
@@ -540,6 +632,24 @@ static inline uint32_t pmh_match_count(const uint32_t *__restrict__ a,
   acc0 = _mm512_add_epi32(_mm512_add_epi32(acc0, acc1),
                           _mm512_add_epi32(acc2, acc3));
   cnt = (uint32_t)_mm512_reduce_add_epi32(acc0);
+#elif defined(__AVX2__)
+  // AVX2 fallback: compare 8×uint32 per step.  cmpeq yields 0xFFFFFFFF (= -1) in
+  // matching lanes; AND with NOT(a==0) excludes the unset-winner sentinel, then
+  // subtract (−(−1)=+1) into an int32 accumulator.  Bit-identical match count.
+  const __m256i vzero = _mm256_setzero_si256();
+  __m256i acc = vzero;
+  for (; k + 8 <= m; k += 8) {
+    __m256i va = _mm256_loadu_si256((const __m256i *)(a + k));
+    __m256i vb = _mm256_loadu_si256((const __m256i *)(b + k));
+    __m256i eq = _mm256_cmpeq_epi32(va, vb);            // -1 where a==b
+    __m256i nz = _mm256_cmpeq_epi32(va, vzero);         // -1 where a==0
+    acc = _mm256_sub_epi32(acc, _mm256_andnot_si256(nz, eq));
+  }
+  __m128i s128 = _mm_add_epi32(_mm256_castsi256_si128(acc),
+                               _mm256_extracti128_si256(acc, 1));
+  s128 = _mm_add_epi32(s128, _mm_shuffle_epi32(s128, _MM_SHUFFLE(1, 0, 3, 2)));
+  s128 = _mm_add_epi32(s128, _mm_shuffle_epi32(s128, _MM_SHUFFLE(2, 3, 0, 1)));
+  cnt = (uint32_t)_mm_cvtsi128_si32(s128);
 #endif
   for (; k < m; ++k)
     cnt += (a[k] != 0 && a[k] == b[k]) ? 1u : 0u;
@@ -616,6 +726,18 @@ static inline double k4_cosine_sim(const float * __restrict__ a,
   for (int v = 0; v < 256; v += 16)
     acc = _mm512_fmadd_ps(_mm512_loadu_ps(a + v), _mm512_loadu_ps(b + v), acc);
   s = (double)_mm512_reduce_add_ps(acc);
+#elif defined(__AVX2__)
+  // AVX2 fallback: two 8-lane accumulators over the fixed 256-float rows.
+  __m256 acc0 = _mm256_setzero_ps(), acc1 = _mm256_setzero_ps();
+  for (int v = 0; v < 256; v += 16) {
+    acc0 = _mm256_add_ps(acc0, _mm256_mul_ps(_mm256_loadu_ps(a + v),     _mm256_loadu_ps(b + v)));
+    acc1 = _mm256_add_ps(acc1, _mm256_mul_ps(_mm256_loadu_ps(a + v + 8), _mm256_loadu_ps(b + v + 8)));
+  }
+  __m256 v8 = _mm256_add_ps(acc0, acc1);
+  __m128 lo = _mm_add_ps(_mm256_castps256_ps128(v8), _mm256_extractf128_ps(v8, 1));
+  lo = _mm_add_ps(lo, _mm_movehl_ps(lo, lo));
+  lo = _mm_add_ss(lo, _mm_shuffle_ps(lo, lo, 0x1));
+  s = (double)_mm_cvtss_f32(lo);
 #else
   for (int v = 0; v < 256; ++v) s += (double)a[v] * (double)b[v];
 #endif
@@ -3123,6 +3245,30 @@ int main(int ac, char *av[]) {
                     g_pmh_baseline);
   }
 
+  // Precompute centered + L2-normalised rank vectors once (depth_matrix is fully
+  // rank-transformed by now).  Lets the O(E·S) edge-weight corr term be a pure
+  // dot product (depth_corr_fast) instead of the per-pair Welford (3 div/sample +
+  // 2 sqrt/pair).  Cost: one O(N·S) pass.  Identical Pearson-on-ranks value the
+  // abdfirst prune already relies on, so edge weights match within float noise.
+  if (num_depth_samples > 1) {
+    const size_t S = num_depth_samples;
+    g_depth_unit.assign(nobs * S, 0.0f);
+#pragma omp parallel for schedule(static) num_threads(numThreads)
+    for (size_t r = 0; r < nobs; ++r) {
+      double mean = 0.0;
+      for (size_t k = 0; k < S; ++k) mean += depth_matrix(r, k);
+      mean /= (double)S;
+      double ss = 0.0;
+      for (size_t k = 0; k < S; ++k) { double d = (double)depth_matrix(r, k) - mean; ss += d * d; }
+      if (ss > 0.0) {
+        const double inv = 1.0 / std::sqrt(ss);
+        float *u = g_depth_unit.data() + r * S;
+        for (size_t k = 0; k < S; ++k)
+          u[k] = (float)(((double)depth_matrix(r, k) - mean) * inv);
+      }
+    }
+  }
+
   BinMap cls;
   do {
     std::vector<size_t> mems;
@@ -3541,7 +3687,10 @@ int main(int ac, char *av[]) {
     // only for multi-sample depth (cal_depth_corr requires num_depth_samples>1);
     // the lambdas fall back to cal_depth_corr when the vectors are absent.
     const uint32_t ABD_S = (uint32_t)num_depth_samples;
-    std::vector<float> unit_large, unit_small;
+    // Large-contig unit vectors already live in the global g_depth_unit (built
+    // once before the graph loop); reuse it here instead of rebuilding an
+    // identical nobs×S array.  Only the small-contig unit vectors are local.
+    std::vector<float> unit_small;
     auto build_unit = [&](std::vector<float>& out, const Matrix& m, size_t rows) {
       out.assign(rows * ABD_S, 0.0f);
 #pragma omp parallel for schedule(static)
@@ -3559,18 +3708,22 @@ int main(int ac, char *av[]) {
         }
       }
     };
-    if (num_depth_samples > 1) build_unit(unit_large, depth_matrix, nobs);
+    // Large-large correlation: reuse the global g_depth_unit rows (identical to
+    // the old locally-rebuilt unit_large).  Kept as the original float scalar dot
+    // (NOT depth_corr_fast) so the accumulation order — and therefore every
+    // borderline recruit decision — is bit-identical to before; this commit only
+    // removes the redundant nobs×S rebuild, it must not perturb results.
     auto dcorr_ll = [&](size_t a, size_t b) -> double {
-      if (unit_large.empty()) return cal_depth_corr(a, b);
-      const float* ua = unit_large.data() + a * (size_t)ABD_S;
-      const float* ub = unit_large.data() + b * (size_t)ABD_S;
+      if (g_depth_unit.empty()) return cal_depth_corr(a, b);
+      const float* ua = g_depth_unit.data() + a * (size_t)ABD_S;
+      const float* ub = g_depth_unit.data() + b * (size_t)ABD_S;
       float c = 0.0f;
       for (uint32_t k = 0; k < ABD_S; ++k) c += ua[k] * ub[k];
       return (double)c;
     };
     auto dcorr_ls = [&](size_t a, size_t s) -> double {
-      if (unit_large.empty() || unit_small.empty()) return cal_depth_corr(a, s, true);
-      const float* ua = unit_large.data() + a * (size_t)ABD_S;
+      if (g_depth_unit.empty() || unit_small.empty()) return cal_depth_corr(a, s, true);
+      const float* ua = g_depth_unit.data() + a * (size_t)ABD_S;
       const float* us = unit_small.data() + s * (size_t)ABD_S;
       float c = 0.0f;
       for (uint32_t k = 0; k < ABD_S; ++k) c += ua[k] * us[k];
