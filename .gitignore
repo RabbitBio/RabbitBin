@@ -1,5 +1,9 @@
 build/
 build*/
+# Vendored ISA-L (igzip fast .gz inflate): source + build artifacts.
+# Rebuild locally with: cd thirdparty/isa-l && ./autogen.sh && \
+#   ./configure --prefix=$PWD/_inst && make -j && make install
+thirdparty/isa-l/
 rabbit_depth
 rabbit_overlap
 rabbitbin
