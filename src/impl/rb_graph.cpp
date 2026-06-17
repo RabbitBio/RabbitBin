@@ -599,6 +599,14 @@ static Distance gen_fused_calib_graph(Graph &g, Distance coverage) {
                   maxEdges * (sizeof(size_t) + sizeof(StoredDistance)))),
         (size_t)10);
   } catch (...) {}
+  // TILE only affects blocking (never the result), so it is a safe speed knob.
+  // The default sizes a tile-pair's two winner blocks for L2; larger tiles cut
+  // the number of tile-pairs (fewer g_win_flat DRAM re-reads) at the cost of
+  // spilling block reuse to L3.  RABBIT_TILE overrides for experimentation.
+  if (const char *e = getenv("RABBIT_TILE")) {
+    long v = atol(e);
+    if (v >= 10) TILE = (size_t)v;
+  }
 
   // Flatten the upper-triangle tile-pairs (jj ≥ ii) into a list so dynamic
   // scheduling balances load evenly (each tile-pair is ~equal work).
