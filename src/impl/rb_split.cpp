@@ -190,35 +190,43 @@ static void abundance_guided_split(BinMap &cls) {
     return bp;
   };
 
-  // ── Parallel over bins ──────────────────────────────────────────────────
-  // Each bin's KMeans+silhouette sweep is independent, so distribute bins
-  // across threads (this was a serial Amdahl bottleneck). Determinism is kept
-  // independent of thread count by seeding each bin's RNG from (seed, binIdx)
-  // instead of one shared, sequentially-advanced generator.
-  std::vector<const ContigVector*> binList;
-  binList.reserve(cls.size());
-  for (auto &kv : cls) binList.push_back(&kv.second);
-  const size_t nbins = binList.size();
+  // Mean intra-bin depth correlation over (up to 64) large-contig members,
+  // reusing the precomputed unit-rank vectors via depth_corr_fast.  Small contigs
+  // (index >= nobs) have no unit vector, so coherence is estimated on the large
+  // members that anchor the bin.  Returns -2 when it cannot be estimated.
+  auto bin_coherence = [&](const ContigVector &cs) -> double {
+    constexpr size_t CAP = 64;
+    std::vector<size_t> L;
+    L.reserve(cs.size());
+    for (size_t c : cs) if (c < nobs) L.push_back(c);
+    if (L.size() < 2) return -2.0;
+    if (L.size() > CAP) {                            // deterministic stride sample
+      std::vector<size_t> s; s.reserve(CAP);
+      const double step = (double)L.size() / (double)CAP;
+      for (size_t t = 0; t < CAP; ++t) s.push_back(L[(size_t)(t * step)]);
+      L.swap(s);
+    }
+    double sum = 0.0; size_t cnt = 0;
+    for (size_t a = 0; a < L.size(); ++a)
+      for (size_t b = a + 1; b < L.size(); ++b) {
+        double c = depth_corr_fast(L[a], L[b]);
+        if (std::isfinite(c)) { sum += c; ++cnt; }
+      }
+    return cnt ? sum / (double)cnt : -2.0;
+  };
 
-  // kind: 0 = dropped (<min_bin_bp), 1 = kept whole, 2 = split into emit[]
-  struct BinResult { std::vector<ContigVector> emit; int kind = 1; };
-  std::vector<BinResult> results(nbins);
-
-#pragma omp parallel for schedule(dynamic, 1) num_threads(numThreads)
-  for (size_t bi = 0; bi < nbins; ++bi) {
-    const ContigVector &contigs = *binList[bi];
-    BinResult &res = results[bi];
-
-    if (bin_bp(contigs) < min_bin_bp) { res.kind = 0; continue; }
+  // KMeans+silhouette split decision for one bin.  Returns true and fills `sub`
+  // with >=2 sub-clusters when the bin is multi-modal (best silhouette >= thr);
+  // false otherwise.  Identical maths to the historical split so the main path
+  // stays byte-for-byte unchanged.
+  auto split_bin = [&](const ContigVector &contigs, size_t bi,
+                       std::vector<ContigVector> &sub) -> bool {
     const size_t n = contigs.size();
-    if ((int)n < splitMinContigs) { res.kind = 1; res.emit.push_back(contigs); continue; }
-
+    if ((int)n < splitMinContigs) return false;
     std::vector<std::vector<float>> X(n, std::vector<float>(num_depth_samples));
     for (size_t r = 0; r < n; ++r)
       for (size_t i = 0; i < (size_t)num_depth_samples; ++i)
         X[r][i] = (float)std::log(depth_at(contigs[r], i) + 1.0);
-
-    // Per-bin RNG: thread-count-independent, reproducible.
     std::mt19937 rng((unsigned)((seed ? (uint64_t)seed : 1ULL)
                                 + bi * 2654435761ULL));
     int best_k = 1; double best_sil = -1.0; std::vector<int> best_labels;
@@ -230,14 +238,53 @@ static void abundance_guided_split(BinMap &cls) {
       double s = fkmv_silhouette(X, lab, k, rng);
       if (s > best_sil) { best_sil = s; best_k = k; best_labels = std::move(lab); }
     }
+    if (best_k <= 1 || best_sil < g_split_sil) return false;
+    sub.assign(best_k, ContigVector());
+    for (size_t r = 0; r < n; ++r) sub[best_labels[r]].push_back(contigs[r]);
+    return true;
+  };
 
-    if (best_k > 1 && best_sil >= g_split_sil) {
-      std::vector<ContigVector> sub(best_k);
-      for (size_t r = 0; r < n; ++r) sub[best_labels[r]].push_back(contigs[r]);
-      for (int t = 0; t < best_k; ++t) {
-        if (sub[t].empty()) continue;
-        if (bin_bp(sub[t]) < min_bin_bp) continue;  // drop tiny sub-products
-        res.emit.push_back(std::move(sub[t]));
+  // ── Parallel over bins ──────────────────────────────────────────────────
+  // Each bin's KMeans+silhouette sweep is independent, so distribute bins
+  // across threads (this was a serial Amdahl bottleneck). Determinism is kept
+  // independent of thread count by seeding each bin's RNG from (seed, binIdx)
+  // instead of one shared, sequentially-advanced generator.
+  std::vector<const ContigVector*> binList;
+  binList.reserve(cls.size());
+  for (auto &kv : cls) binList.push_back(&kv.second);
+  const size_t nbins = binList.size();
+
+  // Coherence machinery usable only with multi-sample abundance + unit vectors;
+  // otherwise the legacy absolute-bp discard runs and behaviour is unchanged.
+  const bool coh_gate = g_split_keep_coherent && num_depth_samples > 1 &&
+                        !g_depth_unit.empty();
+
+  // kind: 0 = captured sub-floor candidate (post-processed below),
+  //       1 = kept whole, 2 = split into emit[]
+  struct BinResult { std::vector<ContigVector> emit; int kind = 1; };
+  std::vector<BinResult> results(nbins);
+
+#pragma omp parallel for schedule(dynamic, 1) num_threads(numThreads)
+  for (size_t bi = 0; bi < nbins; ++bi) {
+    const ContigVector &contigs = *binList[bi];
+    BinResult &res = results[bi];
+
+    // ── MAIN PATH — IDENTICAL to the historical behaviour for >=min_bin_bp ──
+    // bins.  This guarantees confidently-sized bins (the only ones that matter
+    // on CAMI1/2) are byte-for-byte unchanged, so recovery there cannot drop.
+    if (bin_bp(contigs) < min_bin_bp) {
+      // Historically dropped (contigs lost).  With the coherence gate, capture
+      // them for an independent purification pass instead of discarding.
+      if (coh_gate) res.kind = 0;                    // post-processed below
+      else          res.kind = 1, res.emit.clear();  // legacy: emit nothing → drop
+      continue;
+    }
+    std::vector<ContigVector> sub;
+    if (split_bin(contigs, bi, sub)) {
+      for (auto &s : sub) {
+        if (s.empty()) continue;
+        if (bin_bp(s) < min_bin_bp) continue;        // legacy sub-product drop
+        res.emit.push_back(std::move(s));
       }
       if (!res.emit.empty()) res.kind = 2;
       else { res.kind = 1; res.emit.push_back(contigs); }  // nothing survived
@@ -246,21 +293,74 @@ static void abundance_guided_split(BinMap &cls) {
     }
   }
 
+  // ── Self-calibrated coherence bar over confident (kept/split) bins ────────
+  // bar = chosen percentile of the intra-bin coherence of the bins that passed
+  // the size floor.  Data-derived (no per-dataset constant); identical formula
+  // across datasets.  Used only to admit purified sub-floor pieces below.
+  double bar = 1.0;
+  if (coh_gate) {
+    std::vector<double> conf;
+    for (size_t bi = 0; bi < nbins; ++bi) {
+      if (results[bi].kind != 1 && results[bi].kind != 2) continue;
+      for (auto &v : results[bi].emit) {
+        double c = bin_coherence(v);
+        if (c > -1.5) conf.push_back(c);
+      }
+    }
+    if (!conf.empty()) {
+      std::sort(conf.begin(), conf.end());
+      size_t idx = (size_t)((g_split_coh_pct / 100.0) * (conf.size() - 1) + 0.5);
+      if (idx >= conf.size()) idx = conf.size() - 1;
+      bar = conf[idx];
+    }
+  }
+
+  // ── Purify + retain captured sub-floor bins (additive; main path untouched) ─
+  // Each captured <min_bin_bp bin is independently KMeans-split (separating any
+  // co-binned small genomes), then each resulting piece (or the whole bin) is
+  // kept iff it is internally at least as coherent as the bar.  Because these
+  // bins were going to be discarded, every retained piece is a pure addition —
+  // it cannot lower recovery on datasets where such bins are rare (CAMI1/2).
+  std::vector<size_t> captured;
+  for (size_t bi = 0; bi < nbins; ++bi)
+    if (results[bi].kind == 0) captured.push_back(bi);
+
+  std::vector<std::vector<ContigVector>> recov(captured.size());
+  if (coh_gate) {
+#pragma omp parallel for schedule(dynamic, 1) num_threads(numThreads)
+    for (size_t ci = 0; ci < captured.size(); ++ci) {
+      const ContigVector &contigs = *binList[captured[ci]];
+      std::vector<ContigVector> pieces, sub;
+      if (split_bin(contigs, captured[ci], sub)) {
+        for (auto &s : sub) if (!s.empty()) pieces.push_back(std::move(s));
+      } else {
+        pieces.push_back(contigs);
+      }
+      for (auto &p : pieces)
+        if (bin_coherence(p) >= bar) recov[ci].push_back(std::move(p));
+    }
+  }
+
   // ── Sequential merge (deterministic bin order + counts) ──────────────────
   BinMap out;
   int next = 0;
-  size_t n_split = 0, n_kept = 0, n_drop = 0;
+  size_t n_split = 0, n_kept = 0, n_drop = 0, n_recovered = 0;
   for (size_t bi = 0; bi < nbins; ++bi) {
     BinResult &res = results[bi];
-    if (res.kind == 0) { ++n_drop; continue; }
+    if (res.kind == 0) continue;                     // captured: emitted below
+    if (res.emit.empty()) { ++n_drop; continue; }    // legacy sub-floor drop
     if (res.kind == 2) ++n_split; else ++n_kept;
     for (auto &v : res.emit) out[next++] = std::move(v);
   }
+  for (size_t ci = 0; ci < captured.size(); ++ci) {
+    if (recov[ci].empty()) { ++n_drop; continue; }
+    for (auto &v : recov[ci]) { out[next++] = std::move(v); ++n_recovered; }
+  }
   cls.swap(out);
-  verbose_message("Abundance split (sil>=%.2f): %zu kept, %zu split, "
-                  "%zu dropped(<min_bin_bp) -> %d bins\n",
-                  g_split_sil, n_kept, n_split, n_drop, next);
-  // Sub-products may be < min_bin_bp; base bins were already gated above.
+  verbose_message("Abundance split (sil>=%.2f, bar=%.3f): %zu kept, %zu split, "
+                  "%zu recovered(purified<floor), %zu dropped -> %d bins\n",
+                  g_split_sil, bar, n_kept, n_split, n_recovered, n_drop, next);
+  // Retained pieces may be < min_bin_bp; the floor was already applied here.
   min_bin_bp = 0;
 }
 
