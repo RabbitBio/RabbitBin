@@ -62,6 +62,24 @@ else()
   message(STATUS "rabbitbin: ISA-L not found; .gz uses zlib (set -DISAL_ROOT to enable igzip)")
 endif()
 
+# ── libnuma: interleave the large read-only winner array across NUMA nodes ───
+# On a multi-socket box the O(N^2) pair-pass streams the (multi-GB) PMH winner
+# array from whichever node first-touched it, so all cores hammer one memory
+# controller and cross-socket reads cap throughput.  When libnuma is present we
+# migrate that array to MPOL_INTERLEAVE before the pass so both controllers
+# share the load.  Purely a memory-placement change — results are identical, and
+# without libnuma the code compiles to a no-op (HAVE_LIBNUMA undefined).
+find_library(NUMA_LIB NAMES numa)
+find_path(NUMA_INCLUDE_DIR numa.h)
+if(NUMA_LIB AND NUMA_INCLUDE_DIR)
+  target_compile_definitions(rabbitbin PRIVATE HAVE_LIBNUMA)
+  target_include_directories(rabbitbin PRIVATE ${NUMA_INCLUDE_DIR})
+  target_link_libraries(rabbitbin ${NUMA_LIB})
+  message(STATUS "rabbitbin: libnuma enabled (${NUMA_LIB}) — winner array NUMA interleave")
+else()
+  message(STATUS "rabbitbin: libnuma not found; NUMA interleave disabled")
+endif()
+
 include(CheckCXXCompilerFlag)
 check_cxx_compiler_flag("-march=native" COMPILER_SUPPORTS_MARCH_NATIVE)
 if(COMPILER_SUPPORTS_MARCH_NATIVE)

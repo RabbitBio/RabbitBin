@@ -106,7 +106,13 @@ static const std::string DATE = RabbitBin_BUILD_DATE;
 static bool verbose = false;
 static bool quiet = false;
 static bool debug = false;
-static bool noBinOut = false;
+// Per-bin FASTA output is OFF by default: at scale it produces tens of
+// thousands of files (a re-partition of the input) and forces all sequences to
+// stay resident.  The binning result is always written as the membership tables
+// (out.members.tsv / out.bins.tsv).  Pass --bin-fasta to also emit per-bin
+// FASTA (which then keeps sequences in RAM).
+static bool noBinOut = true;
+static bool binFastaWanted = false;   // set by --bin-fasta → noBinOut = false
 static bool noSampleDepths = false;
 static Distance mergeSamplesCosign = 1.0;
 static size_t min_bin_bp = 40000;

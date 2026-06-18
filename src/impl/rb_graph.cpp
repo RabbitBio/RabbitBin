@@ -540,7 +540,21 @@ static Distance gen_fused_calib_graph(Graph &g, Distance coverage) {
   // row_thresh[r] mirrors heaps[r].top() once the heap is full, so the common
   // low-similarity candidate is rejected with a single relaxed atomic read and
   // never contends for the lock.  Correctness is re-verified inside the lock.
-  using Heap = std::priority_queue<Edge, std::vector<Edge>, CompareEdge>;
+  // Compact 8-byte heap edge (uint32 neighbour id + float similarity) instead of
+  // the global 16-byte Edge (size_t id).  Contig ids are < nobs < 2^32, so this
+  // halves the per-row neighbour-heap footprint (≈6.8GB→3.4GB at nobs=2.1M,
+  // maxEdges=200) on all inputs — no preallocation, so no waste on sparse data.
+  // CompareEdge32 reproduces CompareEdge's total order exactly (min-heap on sv;
+  // equal-sv → larger id evicted first, so the smaller id is retained), keeping
+  // the kept edge set and drain order bit-identical.
+  struct Edge32 { uint32_t id; StoredDistance sv; };
+  struct CompareEdge32 {
+    constexpr bool operator()(Edge32 const &a, Edge32 const &b) const noexcept {
+      if (a.sv != b.sv) return a.sv > b.sv;
+      return a.id < b.id;
+    }
+  };
+  using Heap = std::priority_queue<Edge32, std::vector<Edge32>, CompareEdge32>;
   std::vector<Heap> heaps(nobs);
 
   // Per-row sync state (threshold + spinlock) co-located on its OWN cache line.
@@ -679,6 +693,34 @@ static Distance gen_fused_calib_graph(Graph &g, Distance coverage) {
   }
   const float *abd_u = abd_unit.empty() ? nullptr : abd_unit.data();
 
+  // ── Composition early-exit (exact) ───────────────────────────────────────
+  // For the default PMH winners metric a pair can only become an edge if its
+  // similarity beats at least one endpoint's current heap threshold.  After
+  // matching the first EE_P winners we have an upper bound on the full match
+  // fraction (= all remaining winners also match), hence — after the monotone
+  // baseline correction — an upper bound on the similarity sv.  If that upper
+  // bound is below BOTH endpoints' (monotonically rising) thresholds the pair
+  // can never be kept, so the remaining (g_pmh_m − EE_P) winner comparisons are
+  // skipped.  This is exact w.r.t. heap contents.  Sample endpoints feed the
+  // calibration maxsim[] and therefore always take the full compare, so the
+  // calibration (and hence simCutoff and every edge) is bit-identical.
+  // RABBIT_NO_COMP_EE=1 disables it for A/B comparison.
+  const bool win16 = (g_win_bits == 16);
+  const bool comp_ee = g_pmh_mode && !g_exact_cos_cmp && g_pmh_m >= 16 &&
+                       (win16 ? !g_win16.empty() : !g_win_flat.empty()) &&
+                       (getenv("RABBIT_NO_COMP_EE") == nullptr);
+  const uint32_t EE_P = (g_pmh_m >= 64) ? 64u : g_pmh_m;
+
+  // Spread the large read-mostly winner array over both memory controllers so
+  // the all-pairs scan is not bottlenecked on the first-touch socket's DRAM.
+  if (win16) {
+    if (!g_win16.empty())
+      numa_interleave_buffer(g_win16.data(), g_win16.size() * sizeof(uint16_t));
+  } else if (!g_win_flat.empty()) {
+    numa_interleave_buffer(g_win_flat.data(),
+                           g_win_flat.size() * sizeof(uint32_t));
+  }
+
   // ── Optional LSH candidate generation ───────────────────────────────────
   // Build B band buckets: for each band, contig ids sorted by the band's
   // R-winner hash so equal-hash contigs (candidates) form contiguous ranges.
@@ -735,10 +777,10 @@ static Distance gen_fused_calib_graph(Graph &g, Distance coverage) {
       std::memcpy(&sb, &sv, sizeof(sb));
       return ((uint64_t)sb << 32) | (uint32_t)(~(uint32_t)id);
     };
-    static const CompareEdge cmp_edge{};
-    auto store_thresh = [&](RowSync &rs, const Edge &top) {
-      rs.thresh_sv.store(top.second, std::memory_order_relaxed);
-      rs.thresh_key.store(edge_key(top.second, top.first),
+    static const CompareEdge32 cmp_edge{};
+    auto store_thresh = [&](RowSync &rs, const Edge32 &top) {
+      rs.thresh_sv.store(top.sv, std::memory_order_relaxed);
+      rs.thresh_key.store(edge_key(top.sv, top.id),
                           std::memory_order_relaxed);
     };
     auto update_row = [&](size_t r, size_t other, StoredDistance sv) {
@@ -762,7 +804,7 @@ static Distance gen_fused_calib_graph(Graph &g, Distance coverage) {
 #endif
       }
       Heap &h = heaps[r];
-      const Edge cand{other, sv};
+      const Edge32 cand{(uint32_t)other, sv};
       if (h.size() < (size_t)maxEdges) {
         h.push(cand);
         if (h.size() == (size_t)maxEdges) store_thresh(rs, h.top());
@@ -794,7 +836,45 @@ static Distance gen_fused_calib_graph(Graph &g, Distance coverage) {
             const float c = unit_dot_f(abd_u + i * ABD_S, abd_u + j * ABD_S, ABD_S);
             if (c < abd_corr_min_eps) continue;
           }
-          StoredDistance sv = (StoredDistance)graph_sim(i, j);
+          StoredDistance sv;
+          if (comp_ee && i_round < 0 && sample_round[j] < 0) {
+            // Partial winner match → exact upper bound on sv; prune if it cannot
+            // beat either endpoint's heap threshold.  Result is bit-identical to
+            // graph_sim(i,j) on the non-pruned path (same total match count).
+            uint32_t cP, cFull;
+            if (win16) {
+              const uint16_t *aw = g_win16.data() + i * (size_t)g_pmh_m;
+              const uint16_t *bw = g_win16.data() + j * (size_t)g_pmh_m;
+              cP = pmh_match_count16(aw, bw, EE_P);
+              double up = (double)(cP + (g_pmh_m - EE_P)) * g_inv_pmh_m;
+              if (g_pmh_base_on && g_pmh_baseline > 0.0 && g_pmh_baseline < 1.0) {
+                up = (up - g_pmh_baseline) * g_inv_one_minus_b0;
+                if (up < 0.0) up = 0.0;
+              }
+              if (up > 1.0 - 1e-6) up = 1.0 - 1e-6;
+              const float ti = rowsync[i].thresh_sv.load(std::memory_order_relaxed);
+              const float tj = rowsync[j].thresh_sv.load(std::memory_order_relaxed);
+              if ((float)up < (ti < tj ? ti : tj)) continue;  // exact: unkeepable
+              cFull = cP + pmh_match_count16(aw + EE_P, bw + EE_P, g_pmh_m - EE_P);
+            } else {
+              const uint32_t *aw = g_win_flat.data() + i * (size_t)g_pmh_m;
+              const uint32_t *bw = g_win_flat.data() + j * (size_t)g_pmh_m;
+              cP = pmh_match_count(aw, bw, EE_P);
+              double up = (double)(cP + (g_pmh_m - EE_P)) * g_inv_pmh_m;
+              if (g_pmh_base_on && g_pmh_baseline > 0.0 && g_pmh_baseline < 1.0) {
+                up = (up - g_pmh_baseline) * g_inv_one_minus_b0;
+                if (up < 0.0) up = 0.0;
+              }
+              if (up > 1.0 - 1e-6) up = 1.0 - 1e-6;
+              const float ti = rowsync[i].thresh_sv.load(std::memory_order_relaxed);
+              const float tj = rowsync[j].thresh_sv.load(std::memory_order_relaxed);
+              if ((float)up < (ti < tj ? ti : tj)) continue;  // exact: unkeepable
+              cFull = cP + pmh_match_count(aw + EE_P, bw + EE_P, g_pmh_m - EE_P);
+            }
+            sv = (StoredDistance)pmh_sv_from_count(cFull);
+          } else {
+            sv = (StoredDistance)graph_sim(i, j);
+          }
           update_row(i, j, sv);
           update_row(j, i, sv);
           if (i_round >= 0) {
@@ -899,8 +979,8 @@ static Distance gen_fused_calib_graph(Graph &g, Distance coverage) {
     for (size_t i = 0; i < nobs; ++i) {
       while (!heaps[i].empty()) {
         auto e = heaps[i].top(); heaps[i].pop();
-        size_t j   = e.first;
-        StoredDistance sv = e.second;
+        size_t j   = e.id;
+        StoredDistance sv = e.sv;
         if (sv <= cutoff) continue;
         if (i < j) {
           from.push_back(i); to.push_back(j); sComp.push_back(sv);
@@ -929,9 +1009,9 @@ static Distance gen_fused_calib_graph(Graph &g, Distance coverage) {
       std::vector<Nbr> &row = nbr[i];
       row.reserve(h.size());
       while (!h.empty()) {
-        const Edge &e = h.top();
-        if (e.second > cutoff)
-          row.emplace_back((uint32_t)e.first, e.second);
+        const Edge32 &e = h.top();
+        if (e.sv > cutoff)
+          row.emplace_back((uint32_t)e.id, e.sv);
         h.pop();
       }
       Heap().swap(h);   // release this row's heap buffer early
