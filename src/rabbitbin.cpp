@@ -38,9 +38,46 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <cstdio>   // sysconf(_SC_NPROCESSORS_ONLN) for true online-CPU count
+#ifdef HAVE_LIBNUMA
+#include <numa.h>
+#include <numaif.h>   // mbind / MPOL_INTERLEAVE
+#endif
 
 #include "rabbitbin.h"
 #include <iomanip>
+
+// Migrate a large read-mostly buffer to MPOL_INTERLEAVE across all NUMA nodes
+// so a multi-socket all-pairs scan spreads DRAM traffic over every memory
+// controller instead of saturating the first-touch node.  Page-aligned interior
+// only (edge pages stay put); no-op without libnuma, on single-node systems, or
+// when RABBIT_NO_NUMA_INTERLEAVE is set.  Pure placement change — bit-identical
+// results.
+static inline void numa_interleave_buffer(void *ptr, size_t bytes) {
+#ifdef HAVE_LIBNUMA
+  if (getenv("RABBIT_NO_NUMA_INTERLEAVE")) return;
+  if (numa_available() < 0) return;
+  const int nnodes = numa_num_configured_nodes();
+  if (nnodes < 2) return;
+  const size_t pg = (size_t)sysconf(_SC_PAGESIZE);
+  uintptr_t base = (uintptr_t)ptr;
+  uintptr_t a = (base + pg - 1) & ~(uintptr_t)(pg - 1);   // round up to page
+  uintptr_t b = (base + bytes) & ~(uintptr_t)(pg - 1);    // round down to page
+  if (b <= a) return;
+  unsigned long maxnode = (unsigned long)nnodes + 1;
+  std::vector<unsigned long> mask((maxnode + 8 * sizeof(unsigned long) - 1) /
+                                      (8 * sizeof(unsigned long)),
+                                  0UL);
+  for (int n = 0; n < nnodes; ++n)
+    mask[n / (8 * sizeof(unsigned long))] |=
+        (1UL << (n % (8 * sizeof(unsigned long))));
+  // MPOL_MF_MOVE physically migrates already-faulted pages (the winner array is
+  // built during the parse, so it is faulted by the time we get here).
+  (void)mbind((void *)a, (size_t)(b - a), MPOL_INTERLEAVE, mask.data(),
+              maxnode, MPOL_MF_MOVE);
+#else
+  (void)ptr; (void)bytes;
+#endif
+}
 
 // ── Sketch global parameters ────────────────────────────────────────────────
 static int      sketch_kmer_size  = 8;     // k-mer size for sketching (8 gives best coverage)
@@ -167,6 +204,18 @@ static uint64_t g_pmh_seed = 42;
 static bool     g_pmh_built_streaming = false;
 static std::vector<uint32_t> g_win_flat;  // nobs × g_pmh_m winner identities (folded 64→32-bit, for SIMD sim kernel)
 static std::vector<uint64_t> g_win64_flat; // nobs × g_pmh_m full 64-bit winners (for inverted-index key lookup)
+// 16-bit packed winners (default kernel input): each 32-bit folded winner is
+// XOR-folded to 16 bits.  Halves the (post-seq-drop dominant) winner array and
+// lets the SIMD match kernel compare 32 lanes/AVX-512 op.  The extra 1/65536
+// chance collision is absorbed by the baseline correction (re-estimated on the
+// packed data).  g_win_bits selects which array the similarity kernel reads.
+static std::vector<uint16_t> g_win16;
+static int g_win_bits = 32;               // 32 = g_win_flat (uint32); 16 = g_win16
+static inline uint16_t fold_win16(uint32_t w) {
+  if (w == 0) return 0;                    // preserve the unset-winner sentinel
+  uint16_t h = (uint16_t)(w ^ (w >> 16));
+  return h ? h : (uint16_t)1;              // never alias the 0 sentinel
+}
 
 // Baseline-corrected winner-match estimator.  At small k all contigs share
 // nearly the same k-mer universe, so unrelated contigs already collide on a
@@ -683,6 +732,54 @@ static inline uint32_t pmh_match_count(const uint32_t *__restrict__ a,
   return cnt;
 }
 
+// 16-bit winner-match count (mirrors pmh_match_count for the packed array):
+// counts lanes where a==b AND a!=0 (0 = unset-winner sentinel).
+static inline uint32_t pmh_match_count16(const uint16_t *__restrict__ a,
+                                         const uint16_t *__restrict__ b,
+                                         uint32_t m) {
+  uint32_t cnt = 0, k = 0;
+#if defined(__AVX512BW__)
+  const __m512i vz = _mm512_setzero_si512();
+  for (; k + 32 <= m; k += 32) {
+    __m512i va = _mm512_loadu_si512((const void *)(a + k));
+    __m512i vb = _mm512_loadu_si512((const void *)(b + k));
+    __mmask32 eq = _mm512_cmpeq_epi16_mask(va, vb);
+    __mmask32 nz = _mm512_cmpneq_epi16_mask(va, vz);
+    cnt += (uint32_t)__builtin_popcount((unsigned)(eq & nz));
+  }
+#elif defined(__AVX2__)
+  const __m256i vz = _mm256_setzero_si256();
+  __m256i acc = vz;
+  for (; k + 16 <= m; k += 16) {
+    __m256i va = _mm256_loadu_si256((const __m256i *)(a + k));
+    __m256i vb = _mm256_loadu_si256((const __m256i *)(b + k));
+    __m256i eq = _mm256_cmpeq_epi16(va, vb);
+    __m256i nz = _mm256_cmpeq_epi16(va, vz);         // -1 where a==0
+    acc = _mm256_sub_epi16(acc, _mm256_andnot_si256(nz, eq));
+  }
+  // horizontal sum of 16 int16 lanes (counts ≤ 16 per lane block, no overflow
+  // across the ≤ m/16 iterations because we widen below)
+  alignas(32) int16_t tmp[16];
+  _mm256_store_si256((__m256i *)tmp, acc);
+  for (int t = 0; t < 16; ++t) cnt += (uint32_t)tmp[t];
+#endif
+  for (; k < m; ++k)
+    cnt += (a[k] != 0 && a[k] == b[k]) ? 1u : 0u;
+  return cnt;
+}
+
+// Apply the baseline correction + clamp to a raw winner-match count → sim.
+// Shared by the 32-bit and 16-bit similarity paths so both stretch identically.
+static inline double pmh_sv_from_count(uint32_t cnt) {
+  double j = (double)cnt * g_inv_pmh_m;
+  if (g_pmh_base_on && g_pmh_baseline > 0.0 && g_pmh_baseline < 1.0) {
+    j = (j - g_pmh_baseline) * g_inv_one_minus_b0;
+    if (j < 0.0) j = 0.0;
+  }
+  if (j > 1.0 - 1e-6) j = 1.0 - 1e-6;
+  return j;
+}
+
 // Winner-match fraction in [0,1].  Kept for callers that want it directly;
 // uses the precomputed reciprocal when m matches the global sketch size.
 static inline double pmh_match_frac(const uint32_t *__restrict__ a,
@@ -730,6 +827,11 @@ static double estimate_pmh_baseline(size_t nobs) {
       const float *a = g_k4cosine_flat.data() + i * 256;
       const float *b = g_k4cosine_flat.data() + j * 256;
       vals.push_back((float)k4_cosine_sim(a, b));
+    } else if (g_win_bits == 16) {
+      if (g_pmh_m == 0) continue;
+      const uint16_t *a = g_win16.data() + i * g_pmh_m;
+      const uint16_t *b = g_win16.data() + j * g_pmh_m;
+      vals.push_back((float)((double)pmh_match_count16(a, b, g_pmh_m) * g_inv_pmh_m));
     } else {
       if (g_pmh_m == 0) continue;
       const uint32_t *a = g_win_flat.data() + i * g_pmh_m;
@@ -785,6 +887,11 @@ static inline double graph_sim(size_t i, size_t j) {
     return (s < 0.0) ? 0.0 : (s > 1.0) ? 1.0 : s;
   }
   if (g_pmh_mode) {
+    if (g_win_bits == 16) {
+      const uint16_t *a = g_win16.data() + (size_t)i * g_pmh_m;
+      const uint16_t *b = g_win16.data() + (size_t)j * g_pmh_m;
+      return pmh_sv_from_count(pmh_match_count16(a, b, g_pmh_m));
+    }
     const uint32_t *a = g_win_flat.data() + (size_t)i * g_pmh_m;
     const uint32_t *b = g_win_flat.data() + (size_t)j * g_pmh_m;
     return pmh_sim_rows(a, b, g_pmh_m);
@@ -1178,6 +1285,10 @@ static bool parse_fasta_mmap_parallel(
   std::vector<std::vector<std::pair<std::string,std::string>>> tl_tiny(nthreads);
   std::vector<size_t> tl_numseqs(nthreads, 0);
   std::vector<std::vector<uint64_t>> tl_scratch(nthreads); // PMH scratch
+  // Per-thread reusable multi-line compaction scratch, used ONLY when sequences
+  // are not retained (no_store_seqs): each record is compacted here, sketched,
+  // then overwritten by the next record, so the persistent arena never grows.
+  std::vector<std::string> tl_seqbuf(nthreads);
   // Per-thread compacted-sequence arenas (multi-line records).  Each thread
   // appends only to its own arena, so there is no cross-thread contention; the
   // arenas are retained globally so seq views stay valid for the whole run.
@@ -1192,13 +1303,15 @@ static bool parse_fasta_mmap_parallel(
     auto &my_small  = tl_small[t];
     auto &my_tiny   = tl_tiny[t];
     auto &my_scratch= tl_scratch[t];
+    auto &my_seqbuf = tl_seqbuf[t];
     size_t &my_nseq = tl_numseqs[t];
 
     // Reserve the arena once to the chunk's byte span: sequence content is the
     // vast majority of a FASTA chunk, so this avoids std::string's doubling
     // growth (which would over-allocate up to ~2× and inflate peak RSS) while
     // never reallocating during the parse.
-    g_seq_arenas[t].reserve((size_t)(splits[t + 1] - splits[t]));
+    if (!no_store_seqs_arg)
+      g_seq_arenas[t].reserve((size_t)(splits[t + 1] - splits[t]));
 
     // Incremental mmap page release: this thread reads its file region exactly
     // once, sequentially.  For multi-line records the bytes are compacted into
@@ -1291,19 +1404,26 @@ static bool parse_fasta_mmap_parallel(
         if (seq_len > 0 && p[seq_len - 1] == '\r') --seq_len;
         // view_ptr set below, only once the record is known to be kept.
       } else {
-        arena_off = my_arena.size();
+        // Multi-line: compact (strip newlines).  When sequences are not retained
+        // (no_store_seqs), compact into a reusable per-thread scratch that is
+        // overwritten each record, so the persistent arena never grows — the
+        // dominant RAM saving on multi-line assemblies.  Otherwise append to the
+        // retained arena so stored views stay valid.
+        std::string &dst = no_store_seqs_arg ? my_seqbuf : my_arena;
+        if (no_store_seqs_arg) dst.clear();
+        arena_off = dst.size();
         const char *seg = p;
         while (seg < seq_end) {
           const char *seg_nl = (const char *)memchr(seg, '\n', (size_t)(seq_end - seg));
           const char *seg_e  = seg_nl ? seg_nl : seq_end;
           size_t slen = (size_t)(seg_e - seg);
           if (slen > 0 && seg[slen - 1] == '\r') --slen;
-          if (slen > 0) my_arena.append(seg, slen);
+          if (slen > 0) dst.append(seg, slen);
           if (!seg_nl) break;
           seg = seg_nl + 1;
         }
-        seq_len   = my_arena.size() - arena_off;
-        arena_tid = t;
+        seq_len   = dst.size() - arena_off;
+        if (!no_store_seqs_arg) arena_tid = t;
       }
 
       p = seq_end;
@@ -1326,10 +1446,15 @@ static bool parse_fasta_mmap_parallel(
         size_t sp = name.find_first_of(" \t");
         if (sp != std::string::npos) name.resize(sp);
       }
-      if (single_line) { view_ptr = seq_region; can_release = false; }
-      // Pointer to raw sequence bytes (mmap view or arena slice) for k-mer scan.
-      // Valid here because the arena is not appended again before this use.
-      const char *seq_bytes = view_ptr ? view_ptr : (my_arena.data() + arena_off);
+      // Single-line records keep a zero-copy mmap view; that pins the mmap pages
+      // so page release must stop.  When the view is NOT retained (no_store_seqs)
+      // we only read it now for sketching, so pages can still be released.
+      if (single_line) { view_ptr = seq_region; if (!no_store_seqs_arg) can_release = false; }
+      // Pointer to raw sequence bytes (mmap view, arena slice, or reusable
+      // no-store scratch) for the k-mer scan.  Valid here because the chosen
+      // buffer is not appended again before this use.
+      const char *seq_bytes = view_ptr ? view_ptr
+                              : ((no_store_seqs_arg ? my_seqbuf : my_arena).data() + arena_off);
 
       if (is_large) {
         ContigRec rec;
@@ -1359,9 +1484,11 @@ static bool parse_fasta_mmap_parallel(
         rec.name = std::move(name);
         rec.len  = seq_len;
         rec.is_small = true;
-        rec.seq_view_ptr = view_ptr;
-        rec.arena_tid    = arena_tid;
-        rec.arena_off    = arena_off;
+        if (!no_store_seqs_arg) {
+          rec.seq_view_ptr = view_ptr;
+          rec.arena_tid    = arena_tid;
+          rec.arena_off    = arena_off;
+        }
         my_small.push_back(std::move(rec));
       } else {
         // Tiny contig, kept only because collect_tiny is set (unbinned output):
@@ -2236,7 +2363,8 @@ int main(int ac, char *av[]) {
       ("labels-only,l", po::value<bool>(&onlyLabel)->zero_tokens(), "Output contig names only")
       ("save-matrix", po::value<bool>(&saveCls)->zero_tokens(), "Save membership matrix")
       ("unbinned", po::value<bool>(&outUnbinned)->zero_tokens(), "Write unbinned FASTA")
-      ("no-bin-fasta", po::value<bool>(&noBinOut)->zero_tokens(), "Skip per-bin FASTA output")
+      ("no-bin-fasta", po::value<bool>(&noBinOut)->zero_tokens(), "Skip per-bin FASTA output (default)")
+      ("bin-fasta", po::value<bool>(&binFastaWanted)->zero_tokens(), "Also write per-bin FASTA files (keeps sequences in RAM)")
       ("no-sample-depths", po::value<bool>(&noSampleDepths)->zero_tokens(), "Omit per-sample depths in headers")
       ("seed", po::value<unsigned long long>(&seed)->default_value(0), "Random seed (0=time)")
       ("marker-seed", po::value<std::string>(&marker_seed_file)->default_value(""), "Optional marker seed file")
@@ -2251,6 +2379,10 @@ int main(int ac, char *av[]) {
   po::variables_map vm;
   po::store(po::command_line_parser(ac, av).options(desc).positional({}).run(), vm);
   po::notify(vm);
+
+  // Per-bin FASTA is off by default; --bin-fasta re-enables it (and so keeps
+  // sequences resident for the output stage).
+  if (binFastaWanted) noBinOut = false;
 
   if (vm.count("help") || inFile.empty() || outFile.empty()) {
     cerr << "\nRabbitBin: sketch-based metagenome binning "
@@ -2490,7 +2622,15 @@ int main(int ac, char *av[]) {
     if (!parsed_ok) {
       const bool stream_pmh_mmap = rb_env_pmh_on();
       const bool no_store_seqs_mmap = [&]() -> bool {
-        const char *e = rb_getenv("RABBIT_NOSTORE_SEQS"); return e && e[0] == '1';
+        if (const char *e = rb_getenv("RABBIT_NOSTORE_SEQS")) return e[0] == '1';
+        // Auto-drop: the stored contig bytes (≈ the whole assembly — the single
+        // largest RAM consumer) are read again ONLY to write per-bin/unbinned
+        // FASTA, to feed composition-sketch recruitment, or for the RB_SEQHASH
+        // debug.  When PMH winners are built during this parse and none of those
+        // consumers is active, the bytes are dead weight, so we skip storing them
+        // and cut peak RSS by roughly the input size.  Bit-identical results.
+        return stream_pmh_mmap && noBinOut && !outUnbinned &&
+               recruitSimFactor <= 0.0 && getenv("RB_SEQHASH") == nullptr;
       }();
       const int pmh_k_mmap = [&]() -> int {
         const char *e = rb_getenv("RABBIT_PMHK"); return e ? std::atoi(e) : 4;
@@ -2640,7 +2780,7 @@ int main(int ac, char *av[]) {
           if (has_depth && small_contigs.find(rec.name) != small_contigs.end()) { nskip1++; had_dup_names = true; continue; }
           small_contigs[rec.name] = nobs1 + nskip1;
           small_contig_names.push_back(std::move(rec.name));
-          small_seqs.push_back(rec_view(rec));
+          if (!no_store_seqs_mmap) small_seqs.push_back(rec_view(rec));
           small_seq_lens.push_back(rec.len);
           nobs1++;
         }
@@ -2761,7 +2901,13 @@ int main(int ac, char *av[]) {
       const bool no_store_seqs = [&]() -> bool {
         // RABBIT_NOSTORE_SEQS=1: skip in-RAM sequence storage (saves 100GB+ for
         // huge assemblies); forces label-only output since sequences are gone.
-        const char *e = rb_getenv("RABBIT_NOSTORE_SEQS"); return e && e[0] == '1';
+        if (const char *e = rb_getenv("RABBIT_NOSTORE_SEQS")) return e[0] == '1';
+        // Auto-drop when sequences have no downstream consumer (no per-bin/
+        // unbinned FASTA, no composition-sketch recruit, no RB_SEQHASH) and PMH
+        // winners are produced during this streaming parse — bit-identical, and
+        // removes the dominant (~assembly-sized) memory cost.
+        return stream_pmh && noBinOut && !outUnbinned &&
+               recruitSimFactor <= 0.0 && getenv("RB_SEQHASH") == nullptr;
       }();
       const uint32_t s_pmh_m = sketch_size;
       const int s_pmh_k = [&]() -> int {
@@ -3269,6 +3415,31 @@ int main(int ac, char *av[]) {
   // Precompute per-contig abundance non-zero flags so is_nz() in the O(N²)
   // graph loop reduces to two byte loads instead of an num_depth_samples matrix scan.
   build_anynz_cache();
+
+  // Pack the 32-bit folded winners to 16 bits for the all-pairs kernel.  Must
+  // run BEFORE baseline estimation so b0 is measured on the same representation
+  // the graph kernel uses.  Default ON; RABBIT_WIN_BITS=32 keeps the exact
+  // 32-bit path.  LSH (reads 32-bit winner bands) and exact-cosine paths keep
+  // the 32-bit array.
+  {
+    int wb = 16;
+    if (const char *e = getenv("RABBIT_WIN_BITS")) wb = atoi(e);
+    const bool lsh_on = [] { const char *e = getenv("RABBIT_LSH");
+                             return e && e[0] == '1'; }();
+    if (wb == 16 && g_pmh_mode && !g_exact_cos_cmp && !lsh_on &&
+        !g_win_flat.empty()) {
+      g_win16.resize(g_win_flat.size());
+#pragma omp parallel for schedule(static)
+      for (size_t t = 0; t < g_win_flat.size(); ++t)
+        g_win16[t] = fold_win16(g_win_flat[t]);
+      g_win_bits = 16;
+      std::vector<uint32_t>().swap(g_win_flat);   // free the 32-bit array
+      verbose_message("Winner array packed to 16-bit (%.2f GB freed) "
+                      "[%.1fGb / %.1fGb]\n",
+                      g_win16.size() * 2.0 / (1ull << 30),
+                      getUsedPhysMem(), getTotalPhysMem() / 1024 / 1024);
+    }
+  }
 
   // Estimate the winner-match baseline b0 before calibration so that both the
   // pSim auto-calibration and the graph edge weights see the stretched scale.
@@ -3900,6 +4071,52 @@ int main(int ac, char *av[]) {
       verbose_message("Done with large cluster corr calcs                 \n");
     }
 
+    // ── Fast recruit path: flatten eligible clusters into contiguous centroid
+    //    unit vectors so each leftover/small recruit becomes a single dot
+    //    product (centroid · u_x) instead of a per-member scan over an
+    //    unordered_map.  This relies on the identity
+    //        mean_corr(x, cluster) = (1/cs) Σ_i u_{c[i]} · u_x = centroid · u_x ,
+    //    where centroid is the mean of the member unit depth vectors.  It also
+    //    drops the partial-minCS early-exit gate (the centroid yields the exact
+    //    full mean directly), so it is enabled only for the default depth-corr
+    //    recruit (no abd-centroid, no sketch cutoff) with multi-sample depth
+    //    where the unit vectors exist; otherwise the original loops run.  The
+    //    per-bin decision (recruit iff full mean >= bin threshold, and unique)
+    //    is unchanged, only the inner accumulation is folded into the centroid.
+    const bool fast_recruit =
+        !recruit_to_depth_centroid && recruitSimFactor <= 0.0 &&
+        num_depth_samples > 1 && !g_depth_unit.empty() &&
+        !getenv("RABBIT_NO_FAST_RECRUIT");
+    std::vector<int>   recruit_clsid;     // eligible cluster ids (cs >= minCS)
+    std::vector<float> recruit_centroid;  // numElig × ABD_S mean unit vectors
+    std::vector<float> recruit_thresh;    // numElig per-bin corr thresholds
+    if (fast_recruit) {
+      recruit_clsid.reserve(cls.size());
+      for (auto &kv : cls)
+        if (kv.second.size() >= minCS) recruit_clsid.push_back(kv.first);
+      const size_t numElig = recruit_clsid.size();
+      recruit_centroid.assign(numElig * (size_t)ABD_S, 0.0f);
+      recruit_thresh.assign(numElig, std::numeric_limits<float>::max());
+#pragma omp parallel for schedule(dynamic, 64)
+      for (size_t e = 0; e < numElig; ++e) {
+        const auto &c = cls.find(recruit_clsid[e])->second;
+        const size_t cs = c.size();
+        float *cen = recruit_centroid.data() + e * (size_t)ABD_S;
+        for (size_t i = 0; i < cs; ++i) {
+          const float *ui = g_depth_unit.data() + c[i] * (size_t)ABD_S;
+          for (uint32_t k = 0; k < ABD_S; ++k) cen[k] += ui[k];
+        }
+        const float inv = 1.0f / (float)cs;
+        for (uint32_t k = 0; k < ABD_S; ++k) cen[k] *= inv;
+        auto itc = cls_corr.find(recruit_clsid[e]);
+        if (itc != cls_corr.end()) recruit_thresh[e] = (float)itc->second;
+      }
+      verbose_message("Flattened %d eligible bins for fast recruit "
+                      "[%.1fGb / %.1fGb]\n",
+                      numElig, getUsedPhysMem(),
+                      getTotalPhysMem() / 1024 / 1024);
+    }
+
     // ── Recruit leftover (un-binned) contigs ──────────────────────────────
     verbose_message("Binning lost contigs over %d leftovers and %d bins...      "
                     "          \n",
@@ -3915,6 +4132,19 @@ int main(int ac, char *av[]) {
         verbose_message("Finding lost contigs %s\r", lost_progress.getProgress());
 
       int best_cls = -1;
+      if (fast_recruit) {
+        const float *ul = g_depth_unit.data() + leftovers[l] * (size_t)ABD_S;
+        const size_t numElig = recruit_clsid.size();
+        for (size_t e = 0; e < numElig; ++e) {
+          const float *cen = recruit_centroid.data() + e * (size_t)ABD_S;
+          float corr = 0.0f;
+          for (uint32_t k = 0; k < ABD_S; ++k) corr += cen[k] * ul[k];
+          if (corr >= recruit_thresh[e]) {
+            if (best_cls > -1) { best_cls = -1; break; }
+            best_cls = recruit_clsid[e];
+          }
+        }
+      } else
       for (auto it = cls.begin(); it != cls.end(); ++it) {
         size_t kk = it->first;
         const auto &c = it->second;
@@ -3995,6 +4225,45 @@ int main(int ac, char *av[]) {
       if (num_depth_samples > 1) build_unit(unit_small, small_depth_matrix, nobs1);
 
       ProgressTracker small_progress(nobs1);
+      if (fast_recruit) {
+        // Cache-blocked recruit: stream the flat centroid array once per block
+        // of SB small contigs (each centroid row, read once, is reused across
+        // SB contigs) instead of re-reading the whole centroid array per small
+        // contig.  The per-contig decision is unchanged — recruit iff exactly
+        // one eligible bin has centroid·u_s >= its threshold — only the loop
+        // order is blocked, so the result is identical to the per-contig path.
+        const size_t numElig = recruit_clsid.size();
+        constexpr size_t SB = 64;
+#pragma omp parallel for schedule(dynamic)
+        for (size_t s0 = 0; s0 < nobs1; s0 += SB) {
+          const size_t s1 = std::min(s0 + SB, nobs1);
+          const size_t nb = s1 - s0;
+          int     best[SB];
+          uint8_t ncand[SB];
+          for (size_t t = 0; t < nb; ++t) { best[t] = -1; ncand[t] = 0; }
+          for (size_t e = 0; e < numElig; ++e) {
+            const float *cen = recruit_centroid.data() + e * (size_t)ABD_S;
+            const float  th  = recruit_thresh[e];
+            const int    cid = recruit_clsid[e];
+            for (size_t t = 0; t < nb; ++t) {
+              if (ncand[t] >= 2) continue;        // already ambiguous -> rejected
+              const float *us = unit_small.data() + (s0 + t) * (size_t)ABD_S;
+              float corr = 0.0f;
+              for (uint32_t k = 0; k < ABD_S; ++k) corr += cen[k] * us[k];
+              if (corr >= th && ++ncand[t] == 1) best[t] = cid;
+            }
+          }
+          for (size_t t = 0; t < nb; ++t) {
+            if (ncand[t] == 1) {
+#pragma omp critical(ADD_SMALL_CONTIGS)
+              cls_small[best[t]].push_back((s0 + t) + nobs);
+            }
+          }
+          small_progress.track(nb);
+          if (verbose && omp_get_thread_num() == 0 && small_progress.isStepMarker())
+            verbose_message("Binning small contigs %s\r", small_progress.getProgress());
+        }
+      } else
 #pragma omp parallel for schedule(dynamic)
       for (size_t s = 0; s < nobs1; ++s) {
         small_progress.track();
