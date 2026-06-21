@@ -115,7 +115,7 @@ static bool noBinOut = true;
 static bool binFastaWanted = false;   // set by --bin-fasta → noBinOut = false
 static bool noSampleDepths = false;
 static Distance mergeSamplesCosign = 1.0;
-static size_t min_bin_bp = 40000;
+static size_t min_bin_bp = 50000;
 static size_t minContig = 2500; // minimum contig size for binning
 static std::string inFile;
 static std::string depth_file;
