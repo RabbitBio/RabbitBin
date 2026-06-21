@@ -2358,7 +2358,7 @@ int main(int ac, char *av[]) {
       ("full-header", po::value<bool>(&fullHeader)->zero_tokens(), "Keep full FASTA headers")
       ("min-coverage,x", po::value<Distance>(&minCV)->default_value(1), "Min per-sample mean coverage")
       ("min-coverage-sum", po::value<Distance>(&minCVSum)->default_value(1), "Min total mean coverage")
-      ("min-bin-size,s", po::value<size_t>(&min_bin_bp)->default_value(40000), "Min output bin size (bp)")
+      ("min-bin-size,s", po::value<size_t>(&min_bin_bp)->default_value(50000), "Min output bin size (bp)")
       ("threads,t", po::value<size_t>(&numThreads)->default_value(0), "Threads (0=all online CPUs)")
       ("labels-only,l", po::value<bool>(&onlyLabel)->zero_tokens(), "Output contig names only")
       ("save-matrix", po::value<bool>(&saveCls)->zero_tokens(), "Save membership matrix")
