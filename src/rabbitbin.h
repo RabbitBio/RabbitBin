@@ -119,6 +119,16 @@ static size_t min_bin_bp = 50000;
 static size_t minContig = 2500; // minimum contig size for binning
 static std::string inFile;
 static std::string depth_file;
+#ifdef RABBITBIN_FUSE
+// Fused build only: compute depth in-process from sorted BAMs (no temp file) so
+// BAM decompression overlaps the FASTA/sketch pass. These mirror the
+// rabbit_depth CLI defaults so the in-memory depth is byte-identical.
+static std::vector<std::string> fuse_bams;
+static int fuse_pctid = 97;
+static int fuse_min_contig_len = 1000;
+static double fuse_min_contig_depth = 1.0;
+static int fuse_max_edge = 75;
+#endif
 static bool cvExt;
 static bool fullHeader = false;
 static std::string outFile;

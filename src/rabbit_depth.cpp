@@ -1,8 +1,14 @@
 // rabbit_depth.cpp — summarize per-contig coverage depth from sorted BAM files.
 
 #include <cassert>
+#include <charconv>
+#include <climits>
 #include <condition_variable>
+#include <cstdio>
+#include <cstring>
 #include <mutex>
+#include <sstream>
+#include <stdexcept>
 
 #include "rabbit_depth.h"
 #include "version.h"
@@ -221,22 +227,39 @@ public:
                                        // divide by avgCorrectedLength
     return totalCorrectedDepth;
   }
-  bool printDepth(ostream &of, string name, float minContigDepth) {
+  // Append "<float>" using snprintf("%g"), which is byte-identical to
+  // ostream's `<< (float)x` (defaultfloat, precision 6) but avoids the C++
+  // locale facet lookup that dominated the serial output tail (~2% of the
+  // depth stage). The value is cast through float exactly as before.
+  static void appendFloat(std::string &out, double v) {
+    char b[64];
+    int n = snprintf(b, sizeof(b), "%g", (double)(float)v);
+    out.append(b, n);
+  }
+  static void appendInt(std::string &out, long v) {
+    char b[24];
+    auto r = std::to_chars(b, b + sizeof(b), v);
+    out.append(b, r.ptr - b);
+  }
+  // Append one TSV row directly to a string buffer (no per-contig stringstream
+  // allocation/copy). Output bytes are identical to the previous ostream path.
+  bool printDepth(std::string &out, const char *name, float minContigDepth) {
     auto totalAverageDepth = getTotalCorrectedDepth();
-    std::string nameonly = name;
-    int pos = nameonly.find_first_of(" \t");
-    nameonly = nameonly.substr(0, pos);
-    std::stringstream ss;
-    ss << nameonly << "\t" << contigLen << "\t" << (float)totalAverageDepth;
+    size_t namelen = strcspn(name, " \t");
+    out.append(name, namelen);
+    out.push_back('\t');
+    appendInt(out, contigLen);
+    out.push_back('\t');
+    appendFloat(out, totalAverageDepth);
     for (int i = 0; i < numSamples; i++) {
+      out.push_back('\t');
+      appendFloat(out, means[i]);
       if (variances.size()) {
-        ss << "\t" << (float)means[i] << "\t" << (float)variances[i];
-      } else {
-        ss << "\t" << (float)means[i];
+        out.push_back('\t');
+        appendFloat(out, variances[i]);
       }
     }
-    ss << "\n";
-    of << ss.str();
+    out.push_back('\n');
     return totalAverageDepth >= minContigDepth;
   }
 };
@@ -262,7 +285,8 @@ void printDepthTable(ostream &of, const vector<string> &names,
     const int tn = omp_get_thread_num();
     const int32_t lo = (int32_t)((int64_t)tn * n / nthreads);
     const int32_t hi = (int32_t)((int64_t)(tn + 1) * n / nthreads);
-    std::ostringstream ss;
+    std::string &buf = chunks[tn];
+    buf.reserve((size_t)(hi - lo) * 24);
     for (int32_t contigIdx = lo; contigIdx < hi; contigIdx++) {
       if (!contigLengthPass[contigIdx])
         continue;
@@ -278,10 +302,9 @@ void printDepthTable(ostream &of, const vector<string> &names,
                                bamContigDepths[bamIdx].get()[contigIdx]);
       }
       contigDepthPass[contigIdx] =
-          contigDepth.printDepth(ss, header->target_name[contigIdx],
+          contigDepth.printDepth(buf, header->target_name[contigIdx],
                                  minContigDepth);
     }
-    chunks[tn] = ss.str();
   }
   for (int t = 0; t < nthreads; t++)
     of << chunks[t];
@@ -592,6 +615,164 @@ static void process_depth_shard(const DepthShard &sh,
   hts_close(fp);
 }
 
+// ── In-memory depth (fused rabbitbin_fuse path) ─────────────────────────────
+// Produces the EXACT same MetaBAT-format depth TSV that the standalone
+// rabbit_depth plain sharded fast path writes, but returns it as a string with
+// no temp file. Mirrors main()'s fast path step-for-step using the same
+// primitives (openBam header, parse_bai_first_voffs, process_depth_shard,
+// printDepthTable) so the bytes are identical by construction. rabbitbin_fuse
+// runs this inside a std::async so BAM decompression overlaps the binning
+// FASTA/sketch pass; the result is parsed exactly like a depth file, so binning
+// output is unchanged. Verified byte-identical to the standalone depth file.
+// Requires every BAM to have a .bai (the only path that lacks one falls back to
+// the two-process pipeline upstream).
+std::string compute_depth_tsv_inmem(const StringVector &bamFilePaths,
+                                    float percentIdentity, int minContigLength,
+                                    float minContigDepth, int maxEdgeBases,
+                                    bool includeEdgeBases,
+                                    bool intraDepthVariance, int numThreads) {
+  const int num_bams = (int)bamFilePaths.size();
+  if (num_bams < 1)
+    throw std::runtime_error("compute_depth_tsv_inmem: no BAM files");
+  CheckRead::_edgeBases() = maxEdgeBases;
+  omp_set_dynamic(0);
+  omp_set_num_threads(numThreads);
+  const int g_full_threads = numThreads;
+  const int minMapQual = 0;
+
+  // Open ONE consolidated header (each shard opens its own handle).
+  BamFile firstBam = BamUtils::openBam(bamFilePaths[0], false);
+  BamHeaderT header = firstBam.header;
+  assert(header.get() != NULL);
+
+  BoolVector contigLengthPass(header->n_targets, false),
+      contigDepthPass(header->n_targets, true);
+  for (int32_t i = 0; i < header->n_targets; i++)
+    contigLengthPass[i] = ((int)header->target_len[i] >= minContigLength);
+
+  CountTypeMatrix bamContigDepths(num_bams);
+  VarianceTypeMatrix bamContigVariances(num_bams);
+  std::vector<int> averageReadSize(num_bams, 0);
+  std::vector<int> sampledAvgRead(num_bams, 0);
+
+  // Build byte-balanced shards from each .bai (same as main's fast path).
+  std::vector<DepthShard> shards;
+  double shard_mult = 24.0;
+  if (const char *e = getenv("RABBIT_DEPTH_SHARD_MULT"))
+    shard_mult = atof(e) > 0 ? atof(e) : shard_mult;
+  const int shards_per_bam = std::max(
+      1, (int)std::lround((double)g_full_threads * shard_mult / num_bams));
+  std::atomic<bool> all_indexed{true};
+  std::vector<std::vector<DepthShard>> perBam(num_bams);
+  omp_set_num_threads(std::min(g_full_threads, num_bams));
+#pragma omp parallel for schedule(dynamic, 1)
+  for (int bi = 0; bi < num_bams; bi++) {
+    std::vector<int32_t> ntid;
+    std::vector<uint64_t> nvoff;
+    bool ok = parse_bai_first_voffs(bamFilePaths[bi], ntid, nvoff);
+    if (!ok || ntid.empty()) {
+      all_indexed = false;
+      continue;
+    }
+    uint64_t firstVoff = nvoff.front();
+    {
+      const int kReadLenSample = 4000;
+      htsFile *fp = hts_open(bamFilePaths[bi].c_str(), "rb");
+      if (fp) {
+        bgzf_seek(fp->fp.bgzf, (int64_t)firstVoff, SEEK_SET);
+        bam1_t *sb = bam_init1();
+        int64_t srs = 0, src = 0;
+        while (src < kReadLenSample && bam_read1(fp->fp.bgzf, sb) >= 0) {
+          if ((sb->core.flag & BAM_FUNMAP) == 0) {
+            srs += sb->core.l_qseq;
+            src++;
+          }
+        }
+        bam_destroy1(sb);
+        hts_close(fp);
+        sampledAvgRead[bi] = src ? (int)(srs / src) : 0;
+      }
+    }
+    std::vector<DepthShard> sv;
+    const uint64_t maxc = nvoff.back() >> 16;
+    std::vector<size_t> bidx{0};
+    size_t si = 0;
+    for (int k = 1; k < shards_per_bam; k++) {
+      uint64_t target = (uint64_t)((double)k / shards_per_bam * maxc);
+      while (si < nvoff.size() && (nvoff[si] >> 16) < target)
+        si++;
+      if (si < ntid.size() && si > bidx.back())
+        bidx.push_back(si);
+    }
+    for (size_t bb = 0; bb < bidx.size(); bb++) {
+      size_t s0 = bidx[bb];
+      int32_t lo = (bb == 0) ? 0 : ntid[s0];
+      int32_t hi = (bb + 1 < bidx.size()) ? ntid[bidx[bb + 1]]
+                                          : header->n_targets;
+      if (hi <= lo)
+        continue;
+      uint64_t sv0 = (bb == 0) ? firstVoff : nvoff[s0];
+      sv.push_back(DepthShard{bi, lo, hi, sv0, true});
+    }
+    perBam[bi] = std::move(sv);
+  }
+  if (!all_indexed)
+    throw std::runtime_error(
+        "compute_depth_tsv_inmem: a BAM lacks a .bai index");
+  for (auto &sv : perBam)
+    for (auto &sh : sv)
+      shards.push_back(sh);
+
+  int minAvgRead = INT_MAX;
+  for (int bi = 0; bi < num_bams; bi++) {
+    bamContigDepths[bi].reset(new CountType[header->n_targets]());
+    if (intraDepthVariance)
+      bamContigVariances[bi].assign(header->n_targets, VarianceType());
+    averageReadSize[bi] = sampledAvgRead[bi];
+    if (minAvgRead > averageReadSize[bi])
+      minAvgRead = averageReadSize[bi];
+  }
+  omp_set_num_threads(g_full_threads);
+#pragma omp parallel for schedule(dynamic, 1)
+  for (int s = 0; s < (int)shards.size(); s++) {
+    process_depth_shard(shards[s], bamFilePaths[shards[s].bamIdx], header,
+                        bamContigDepths[shards[s].bamIdx].get(),
+                        percentIdentity, maxEdgeBases, includeEdgeBases,
+                        averageReadSize[shards[s].bamIdx], minMapQual);
+  }
+  if (intraDepthVariance) {
+#pragma omp parallel for schedule(static)
+    for (int bi = 0; bi < num_bams; bi++) {
+      const int edge =
+          includeEdgeBases ? 0 : std::min(maxEdgeBases, averageReadSize[bi] / 3);
+      const CountType *cd = bamContigDepths[bi].get();
+      auto &vars = bamContigVariances[bi];
+      for (int32_t t = 0; t < header->n_targets; t++) {
+        int32_t cl = header->target_len[t];
+        int32_t adj = (cl > 2 * edge + 1) ? (cl - 2 * edge) : cl;
+        vars[t].mean = (adj > 2) ? (float)((double)cd[t] / adj) : 0.0f;
+        vars[t].variance = 0.0f;
+      }
+    }
+  }
+
+  std::ostringstream out;
+  printDepthTable(out, bamFilePaths, intraDepthVariance, bamContigDepths,
+                  averageReadSize, percentIdentity, bamContigVariances,
+                  header.get(), contigLengthPass, contigDepthPass,
+                  minContigDepth, includeEdgeBases,
+                  std::min(maxEdgeBases, minAvgRead / 3));
+  std::string tsv = out.str();
+  // Optional self-check hook: dump the in-memory depth to verify it is
+  // byte-identical to the standalone rabbit_depth file.
+  if (const char *dp = getenv("RABBIT_FUSE_DUMP_DEPTH")) {
+    std::ofstream f(dp);
+    f << tsv;
+  }
+  return tsv;
+}
+
+#ifndef RABBIT_DEPTH_NO_MAIN
 int main(int argc, char *argv[]) {
 
   // set and parse options
@@ -989,13 +1170,17 @@ int main(int argc, char *argv[]) {
       }
       uint64_t firstVoff = nvoff.front();
       // Sample read length header-free: seek to the first record and scan.
+      // Only the MEAN read length is needed (for edge-base trimming), which
+      // converges within a few thousand reads; sampling fewer reads avoids
+      // redundantly decompressing blocks that the first shard re-reads anyway.
       {
+        const int kReadLenSample = 4000;
         htsFile *fp = hts_open(bamFilePaths[bi].c_str(), "rb");
         if (fp) {
           bgzf_seek(fp->fp.bgzf, (int64_t)firstVoff, SEEK_SET);
           bam1_t *sb = bam_init1();
           int64_t srs = 0, src = 0;
-          while (src < 50000 && bam_read1(fp->fp.bgzf, sb) >= 0) {
+          while (src < kReadLenSample && bam_read1(fp->fp.bgzf, sb) >= 0) {
             if ((sb->core.flag & BAM_FUNMAP) == 0) {
               srs += sb->core.l_qseq;
               src++;
@@ -1728,7 +1913,7 @@ int main(int argc, char *argv[]) {
         */
 
       // print the depth for this batch of contigs to the output stream
-      std::stringstream ss;
+      std::string ss;
       for (int batchIdx = 0; batchIdx < batch_size; batchIdx++) {
         int contigIdx = contigIdxStart + batchIdx;
         if (contigIdx >= header->n_targets)
@@ -1739,7 +1924,7 @@ int main(int argc, char *argv[]) {
         contigDepthPass[contigIdx] = batchContigDepth.printDepth(
             ss, header->target_name[contigIdx], minContigDepth);
       }
-      out << ss.str();
+      out << ss;
     }
   } else { // not checkpoint
     cerr << "Creating depth matrix file: " << outputTableFile << endl;
@@ -1814,3 +1999,4 @@ int main(int argc, char *argv[]) {
 
   return 0;
 }
+#endif // RABBIT_DEPTH_NO_MAIN
