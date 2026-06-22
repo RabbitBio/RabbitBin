@@ -17,6 +17,10 @@
 // ── K-mer sketch (self-contained, no external deps) ──────────────────────
 #include "rabbit_sketch.h"
 #include "rabbit_invidx.h"
+#ifdef RABBITBIN_FUSE
+// Fused build: in-process BAM→depth (defined in rabbit_depth.cpp, linked in).
+#include "rabbit_depth_fuse.h"
+#endif
 // ── ProbMinHash4 weighted path (RabbitSketch), selectable via RABBIT_PMH=1 ──
 #include "probmh.h"
 #include <queue>
@@ -2130,22 +2134,18 @@ struct RawDepthEntry {
 // file, split it into per-thread line-aligned chunks, and parse each field with
 // strtof (no stringstream, no exceptions, no locale). Field separators are tabs;
 // strtof stops cleanly at the tab/newline that follows each number.
+// Core parser over an in-memory TSV buffer [buf, buf+fsz). Shared by the file
+// path (parse_depth_async, which mmaps) and the fused in-process path (which
+// passes the depth string returned by compute_depth_tsv_inmem). Identical
+// parsing for both, so binning results do not depend on whether depth came from
+// a file or memory.
 static phmap::flat_hash_map<std::string, RawDepthEntry>
-parse_depth_async(const std::string& depth_file, bool cvExt, int num_depth_samples, bool fullHeader,
-                int nthreads) {
+parse_depth_buf(const char* buf, size_t fsz, bool cvExt, int num_depth_samples,
+                bool fullHeader, int nthreads) {
   using Map = phmap::flat_hash_map<std::string, RawDepthEntry>;
   Map result;
   if (nthreads < 1) nthreads = 1;
-
-  int fd = ::open(depth_file.c_str(), O_RDONLY);
-  if (fd < 0) return result;
-  struct stat st;
-  if (fstat(fd, &st) != 0 || st.st_size <= 0) { ::close(fd); return result; }
-  const size_t fsz = (size_t)st.st_size;
-  const char* buf = (const char*)mmap(nullptr, fsz, PROT_READ, MAP_PRIVATE, fd, 0);
-  ::close(fd);
-  if (buf == MAP_FAILED) return result;
-  madvise((void*)buf, fsz, MADV_SEQUENTIAL);
+  if (!buf || fsz == 0) return result;
 
   const char* data_end = buf + fsz;
   // Skip header line: data starts after the first newline.
@@ -2242,8 +2242,6 @@ parse_depth_async(const std::string& depth_file, bool cvExt, int num_depth_sampl
     }
   }
 
-  munmap((void*)buf, fsz);
-
   size_t total = 0;
   for (auto& v : tl) total += v.size();
   result.reserve(total);
@@ -2251,6 +2249,25 @@ parse_depth_async(const std::string& depth_file, bool cvExt, int num_depth_sampl
     for (auto& kv : v) result.emplace(std::move(kv.first), std::move(kv.second));
     std::vector<std::pair<std::string, RawDepthEntry>>().swap(v);
   }
+  return result;
+}
+
+// File path: mmap the depth file then parse with the shared buffer core.
+static phmap::flat_hash_map<std::string, RawDepthEntry>
+parse_depth_async(const std::string& depth_file, bool cvExt, int num_depth_samples, bool fullHeader,
+                int nthreads) {
+  using Map = phmap::flat_hash_map<std::string, RawDepthEntry>;
+  int fd = ::open(depth_file.c_str(), O_RDONLY);
+  if (fd < 0) return Map();
+  struct stat st;
+  if (fstat(fd, &st) != 0 || st.st_size <= 0) { ::close(fd); return Map(); }
+  const size_t fsz = (size_t)st.st_size;
+  const char* buf = (const char*)mmap(nullptr, fsz, PROT_READ, MAP_PRIVATE, fd, 0);
+  ::close(fd);
+  if (buf == MAP_FAILED) return Map();
+  madvise((void*)buf, fsz, MADV_SEQUENTIAL);
+  Map result = parse_depth_buf(buf, fsz, cvExt, num_depth_samples, fullHeader, nthreads);
+  munmap((void*)buf, fsz);
   return result;
 }
 
@@ -2374,10 +2391,30 @@ int main(int ac, char *av[]) {
       ("split-silhouette", po::value<double>(&g_split_sil)->default_value(rb_env_split_sil()), "Silhouette split threshold")
       ("debug", po::value<bool>(&debug)->zero_tokens(), "Debug output")
       ("quiet,q", po::value<bool>(&quiet)->zero_tokens(), "Less verbose")
+#ifdef RABBITBIN_FUSE
+      ("bam", po::value<std::vector<std::string>>(&fuse_bams)->multitoken(),
+       "Sorted BAM(s); depth is computed in-process (overlaps FASTA parse). "
+       "Mutually exclusive with --depth. BAMs may also be given positionally.")
+      ("percent-identity", po::value<int>(&fuse_pctid)->default_value(97),
+       "[--bam] Min mapped-read percent identity")
+      ("min-contig-length", po::value<int>(&fuse_min_contig_len)->default_value(1000),
+       "[--bam] Min contig length emitted into depth")
+      ("min-contig-depth", po::value<double>(&fuse_min_contig_depth)->default_value(1.0),
+       "[--bam] Min contig depth emitted into depth")
+      ("max-edge-bases", po::value<int>(&fuse_max_edge)->default_value(75),
+       "[--bam] Max edge bases trimmed per contig end")
+#endif
       ("verbose,v", po::value<bool>(&verbose)->zero_tokens(), "Verbose progress (default ON)");
 
   po::variables_map vm;
+#ifdef RABBITBIN_FUSE
+  // Allow `rabbitbin_fuse -a asm -o out bam1 bam2 ...` (BAMs positional).
+  po::positional_options_description pos;
+  pos.add("bam", -1);
+  po::store(po::command_line_parser(ac, av).options(desc).positional(pos).run(), vm);
+#else
   po::store(po::command_line_parser(ac, av).options(desc).positional({}).run(), vm);
+#endif
   po::notify(vm);
 
   // Per-bin FASTA is off by default; --bin-fasta re-enables it (and so keeps
@@ -2489,6 +2526,20 @@ int main(int ac, char *av[]) {
 
   const int nNonFeat = cvExt ? 1 : 3;
   bool has_depth = depth_file.length() > 0;
+#ifdef RABBITBIN_FUSE
+  const bool fuse_mode = !fuse_bams.empty();
+  if (fuse_mode) {
+    if (has_depth) {
+      cerr << "[Error!] --bam and --depth are mutually exclusive\n";
+      return 1;
+    }
+    // In-process depth: variance columns present (mean+var per sample), so this
+    // matches a standalone rabbit_depth file with default intraDepthVariance.
+    cvExt = false;
+    has_depth = true;
+    num_depth_samples = (int)fuse_bams.size();
+  }
+#endif
 
   // ── Validate FASTA / depth files ─────────────────────────────────────────
   // depth_future: async pre-parse of the depth_matrix file into a name→values map.
@@ -2497,6 +2548,32 @@ int main(int ac, char *av[]) {
   using DepthMap = phmap::flat_hash_map<std::string, RawDepthEntry>;
   std::future<DepthMap> depth_future;
   {
+#ifdef RABBITBIN_FUSE
+    if (fuse_mode) {
+      verbose_message("Computing depth in-process from %zu BAM(s) "
+                      "(overlaps FASTA parse) [%.1fGb / %.1fGb]\n",
+                      fuse_bams.size(), getUsedPhysMem(),
+                      getTotalPhysMem() / 1024 / 1024);
+      // Compute depth from BAMs AND parse the resulting TSV on the background
+      // thread, so the (dominant) BAM decompression runs concurrently with the
+      // FASTA decompression + sketch pass below. num_depth_samples already set.
+      std::vector<std::string> bams = fuse_bams;
+      float pctid = (float)fuse_pctid / 100.0f;
+      int mcl = fuse_min_contig_len;
+      double mcd = fuse_min_contig_depth;
+      int medge = fuse_max_edge;
+      bool fH = fullHeader;
+      bool cv = cvExt;
+      int nds = num_depth_samples;
+      int nt = (int)numThreads;
+      depth_future = std::async(std::launch::async, [=]() -> DepthMap {
+        std::string tsv = compute_depth_tsv_inmem(
+            bams, pctid, mcl, (float)mcd, medge,
+            /*includeEdgeBases=*/false, /*intraDepthVariance=*/true, nt);
+        return parse_depth_buf(tsv.data(), tsv.size(), cv, nds, fH, nt);
+      });
+    } else
+#endif
     if (has_depth) {
       verbose_message("Parsing abundance file header [%.1fGb / %.1fGb]\n",
                       getUsedPhysMem(), getTotalPhysMem() / 1024 / 1024);

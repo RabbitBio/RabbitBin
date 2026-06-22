@@ -158,3 +158,61 @@ endif()
 install(TARGETS ${targets}
         DESTINATION bin/
        )
+
+# ── rabbitbin_fuse: single-process BAM → depth → binning ────────────────────
+# Fuses the depth summarizer (rabbit_depth.cpp, main guarded out via
+# RABBIT_DEPTH_NO_MAIN) into the binning program so BAM decompression overlaps
+# the FASTA/sketch pass and no depth TSV is written to disk. The standalone
+# `rabbitbin` and `rabbit_depth` binaries above are built from the same sources
+# WITHOUT these defines, so their behavior is unchanged. The only shared global
+# symbol between the two .cpp files is main(), which the define removes.
+if(DEFLATE_LIB)
+  add_executable(rabbitbin_fuse rabbitbin.cpp probmh.cpp rabbit_depth.cpp)
+  if(NOT "${EXTRA_DEPENDENCIES}" STREQUAL "")
+    add_dependencies(rabbitbin_fuse ${EXTRA_DEPENDENCIES})
+  endif()
+  # Target-wide defines (NOT set_source_files_properties, which would leak onto
+  # the standalone rabbit_depth/rabbitbin targets that share these sources):
+  #   RABBITBIN_FUSE      → rabbitbin.cpp enables the --bam in-process path
+  #   RABBIT_DEPTH_NO_MAIN→ rabbit_depth.cpp drops its main() (only shared symbol)
+  #   USE_RABBITBAM       → rabbit_depth.cpp/rabbitbam parallel reader
+  # Each .cpp ignores the macros it does not reference, so this is safe.
+  target_compile_definitions(rabbitbin_fuse PRIVATE RABBITBIN_FUSE RABBIT_DEPTH_NO_MAIN)
+  target_include_directories(rabbitbin_fuse PRIVATE
+    ${HTSlib_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/rabbitbam)
+  target_link_libraries(rabbitbin_fuse
+    ${HTSlib_LIBRARIES} ${ZLIB_LIBRARIES} ${Boost_LIBRARIES} ${EXTRALIBS}
+    RabbitBin_VERSION_LIB ${DEFLATE_LIB})
+
+  # Vendored RabbitBAM parallel reader (same as rabbit_depth) for the fast path.
+  if(RABBITBIN_USE_VENDORED_BAM)
+    target_sources(rabbitbin_fuse PRIVATE ${RABBITBAM_SRC})
+    target_compile_definitions(rabbitbin_fuse PRIVATE USE_RABBITBAM)
+  endif()
+
+  # Match rabbitbin codegen so the binning half is identical (AVX-512 / LTO).
+  if(COMPILER_SUPPORTS_MARCH_NATIVE)
+    target_compile_options(rabbitbin_fuse PRIVATE -march=native)
+  elseif(COMPILER_SUPPORTS_AVX2)
+    target_compile_options(rabbitbin_fuse PRIVATE -mavx2)
+  endif()
+  if(COMPILER_SUPPORTS_LTO)
+    target_compile_options(rabbitbin_fuse PRIVATE -flto)
+    target_link_options(rabbitbin_fuse PRIVATE -flto)
+    if(COMPILER_SUPPORTS_MARCH_NATIVE)
+      target_link_options(rabbitbin_fuse PRIVATE -march=native)
+    endif()
+  endif()
+  if(ISAL_LIB AND ISAL_INCLUDE_DIR)
+    target_compile_definitions(rabbitbin_fuse PRIVATE USE_IGZIP)
+    target_include_directories(rabbitbin_fuse PRIVATE ${ISAL_INCLUDE_DIR})
+    target_link_libraries(rabbitbin_fuse ${ISAL_LIB})
+  endif()
+  if(NUMA_LIB AND NUMA_INCLUDE_DIR)
+    target_compile_definitions(rabbitbin_fuse PRIVATE HAVE_LIBNUMA)
+    target_include_directories(rabbitbin_fuse PRIVATE ${NUMA_INCLUDE_DIR})
+    target_link_libraries(rabbitbin_fuse ${NUMA_LIB})
+  endif()
+  install(TARGETS rabbitbin_fuse DESTINATION bin/)
+  message(STATUS "rabbitbin_fuse: fused BAM→depth→binning enabled")
+endif()
