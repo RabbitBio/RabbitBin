@@ -55,8 +55,9 @@ BamCompleteBlock::BamCompleteBlock(int BufferSize) {
 
 
 bam_complete_block *BamCompleteBlock::getEmpty() {
+    int spins = 0;
     while ((complete_ed + 1) % complete_size == complete_bg) {
-        std::this_thread::yield();
+        rb_backoff(spins);
     }
     int num = complete_bg;
     complete_bg = (complete_bg + 1) % complete_size;
@@ -71,10 +72,11 @@ void BamCompleteBlock::inputCompleteBlock(bam_complete_block *block) {
 
 
 bam_complete_block *BamCompleteBlock::getCompleteBlock() {
+    int spins = 0;
     mtx_consumer.lock();
     while ((consumer_ed + 1) % consumer_size == consumer_bg) {
         mtx_consumer.unlock();
-        std::this_thread::yield();
+        rb_backoff(spins);
         if (BlockComplete && (consumer_ed + 1) % consumer_size == consumer_bg) return nullptr;
         mtx_consumer.lock();
     }

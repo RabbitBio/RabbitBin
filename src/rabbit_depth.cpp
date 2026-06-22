@@ -251,24 +251,40 @@ void printDepthTable(ostream &of, const vector<string> &names,
 
   printDepthTableHeader(of, names, intraDepthVariance);
 
-  for (int32_t contigIdx = 0; contigIdx < header->n_targets; contigIdx++) {
-    if (!contigLengthPass[contigIdx])
-      continue;
-
-    int contigLen = header->target_len[contigIdx];
-    ContigDepth contigDepth(names.size(), contigLen, includeEdgeBases,
-                            maxEdgeBases, intraDepthVariance);
-    for (int bamIdx = 0; bamIdx < (int)names.size(); bamIdx++) {
-      if (intraDepthVariance)
-        contigDepth.addDepth(averageReadSize[bamIdx],
-                             bamContigVariances[bamIdx][contigIdx]);
-      else
-        contigDepth.addDepth(averageReadSize[bamIdx],
-                             bamContigDepths[bamIdx].get()[contigIdx]);
+  // Formatting ~240k rows × 40+ float fields is otherwise a serial tail. Split
+  // the contig range into one CONTIGUOUS block per thread, format each block into
+  // its own buffer, then emit buffers in order (preserves contig order exactly).
+  const int32_t n = header->n_targets;
+  const int nthreads = std::max(1, omp_get_max_threads());
+  std::vector<std::string> chunks(nthreads);
+#pragma omp parallel num_threads(nthreads)
+  {
+    const int tn = omp_get_thread_num();
+    const int32_t lo = (int32_t)((int64_t)tn * n / nthreads);
+    const int32_t hi = (int32_t)((int64_t)(tn + 1) * n / nthreads);
+    std::ostringstream ss;
+    for (int32_t contigIdx = lo; contigIdx < hi; contigIdx++) {
+      if (!contigLengthPass[contigIdx])
+        continue;
+      int contigLen = header->target_len[contigIdx];
+      ContigDepth contigDepth(names.size(), contigLen, includeEdgeBases,
+                              maxEdgeBases, intraDepthVariance);
+      for (int bamIdx = 0; bamIdx < (int)names.size(); bamIdx++) {
+        if (intraDepthVariance)
+          contigDepth.addDepth(averageReadSize[bamIdx],
+                               bamContigVariances[bamIdx][contigIdx]);
+        else
+          contigDepth.addDepth(averageReadSize[bamIdx],
+                               bamContigDepths[bamIdx].get()[contigIdx]);
+      }
+      contigDepthPass[contigIdx] =
+          contigDepth.printDepth(ss, header->target_name[contigIdx],
+                                 minContigDepth);
     }
-    contigDepthPass[contigIdx] = contigDepth.printDepth(
-        of, header->target_name[contigIdx], minContigDepth);
+    chunks[tn] = ss.str();
   }
+  for (int t = 0; t < nthreads; t++)
+    of << chunks[t];
 }
 
 void printPairedContigs(ostream &of, const int numThreads,
@@ -400,6 +416,180 @@ void writeUnmapedFastqFile(BamFile &myBam, string unmappedFastqFile,
 
   cerr << "Freeing up memory for " << myBam.getBamName() << endl;
   bamReadIds.clear();
+}
+
+// ── Contig-sharded parallel depth (plain depth case; means only) ────────────
+// The per-bam consumer is serial, so with only num_bams files the box tops out
+// at ~num_bams busy cores. Coordinate-sorted BAMs let us shard each file by
+// contig (tid) range and process ranges concurrently: a contig's reads live
+// entirely in one shard, so each shard owns a DISJOINT set of contigs and
+// writes its own per-contig depth with no locks and no cross-shard merge.
+//
+// Profiling showed the per-read time was dominated by (a) the RabbitBAM reader's
+// mutex contention and (b) calculateVarianceContig + the per-base depthCounts
+// array — and RabbitBin never reads the variance columns. So this fast path:
+//   • reads raw records via header-free hts_open + bam_read1 (no reader locks,
+//     no re-parsing the 6.1M-contig @SQ header per shard),
+//   • computes ONLY the scalar per-contig depth (one caldepth() pass per read;
+//     caldepth's return value is independent of the per-base buffer, so the mean
+//     is byte-identical to the serial path), and
+//   • leaves the variance columns at 0 (RabbitBin ignores them; see
+//     rb_env_depth_parse_var()).
+// avgRead is fixed per bam (reads are fixed length here) so the edge trim — and
+// thus the depth — matches the serial path exactly.
+struct DepthShard {
+  int      bamIdx;
+  int32_t  lo, hi;     // contig (tid) range [lo, hi)
+  uint64_t startVoff;  // BGZF virtual offset of first record in the range
+  bool     hasData;
+};
+
+// Parse a .bai directly to extract each non-empty contig's first record virtual
+// offset (the first non-zero entry of its linear index). This SKIPS htslib's
+// bam_index_load, which builds bin-hash structures for all 6.1M contigs and costs
+// ~8s per file; we only read the raw .bai sequentially and grab the linear-index
+// offsets we need for record-aligned shard starts. Returns false on any format
+// surprise so the caller can fall back to the index path.
+static bool parse_bai_first_voffs(const std::string &bamPath,
+                                  std::vector<int32_t> &outTid,
+                                  std::vector<uint64_t> &outVoff) {
+  std::string bai = bamPath + ".bai";
+  FILE *f = fopen(bai.c_str(), "rb");
+  if (!f)
+    return false;
+  fseek(f, 0, SEEK_END);
+  long sz = ftell(f);
+  fseek(f, 0, SEEK_SET);
+  if (sz < 8) {
+    fclose(f);
+    return false;
+  }
+  std::vector<char> buf(sz);
+  if (fread(buf.data(), 1, sz, f) != (size_t)sz) {
+    fclose(f);
+    return false;
+  }
+  fclose(f);
+  const char *p = buf.data();
+  const char *end = p + sz;
+  if (memcmp(p, "BAI\1", 4) != 0)
+    return false;
+  p += 4;
+  int32_t n_ref;
+  memcpy(&n_ref, p, 4);
+  p += 4;
+  for (int32_t r = 0; r < n_ref; r++) {
+    if (p + 4 > end)
+      return false;
+    int32_t n_bin;
+    memcpy(&n_bin, p, 4);
+    p += 4;
+    for (int32_t b = 0; b < n_bin; b++) {
+      if (p + 8 > end)
+        return false;
+      p += 4; // bin id
+      int32_t n_chunk;
+      memcpy(&n_chunk, p, 4);
+      p += 4;
+      p += (size_t)n_chunk * 16; // skip chunk beg/end pairs
+      if (p > end)
+        return false;
+    }
+    if (p + 4 > end)
+      return false;
+    int32_t n_intv;
+    memcpy(&n_intv, p, 4);
+    p += 4;
+    if ((size_t)(end - p) < (size_t)n_intv * 8)
+      return false;
+    uint64_t voff = 0;
+    for (int32_t k = 0; k < n_intv; k++) {
+      uint64_t o;
+      memcpy(&o, p + (size_t)k * 8, 8);
+      if (o != 0) {
+        voff = o;
+        break;
+      }
+    }
+    p += (size_t)n_intv * 8;
+    if (voff != 0) {
+      outTid.push_back(r);
+      outVoff.push_back(voff);
+    }
+  }
+  return true;
+}
+
+static uint64_t shard_start_voff(hts_idx_t *idx, int32_t lo, int32_t hi,
+                                 bool &hasData) {
+  hasData = false;
+  for (int32_t t = lo; t < hi; ++t) {
+    hts_itr_t *it = sam_itr_queryi(idx, t, 0, HTS_POS_MAX);
+    if (it) {
+      if (it->n_off > 0) {
+        uint64_t v = it->off[0].u;
+        hts_itr_destroy(it);
+        hasData = true;
+        return v;
+      }
+      hts_itr_destroy(it);
+    }
+  }
+  return 0;
+}
+
+static void process_depth_shard(const DepthShard &sh,
+                                const std::string &bamPath,
+                                const BamHeaderT &header,
+                                CountType *contigDepths, float percentIdentity,
+                                int maxEdgeBases, bool includeEdgeBases,
+                                int avgRead, int minMapQual) {
+  if (!sh.hasData)
+    return;
+  htsFile *fp = hts_open(bamPath.c_str(), "rb");
+  if (!fp)
+    return;
+  BGZF *bgzf = fp->fp.bgzf;
+  if (bgzf_seek(bgzf, (int64_t)sh.startVoff, SEEK_SET) < 0) {
+    hts_close(fp);
+    return;
+  }
+  bam1_t *b = bam_init1();
+  DepthCounts none{};
+  const int32_t n_targets = header->n_targets;
+  const int edge = includeEdgeBases ? 0 : std::min(maxEdgeBases, avgRead / 3);
+
+  while (bam_read1(bgzf, b) >= 0) {
+    int32_t tid = b->core.tid;
+    int32_t pos = b->core.pos;
+    if (tid >= sh.hi)
+      break;              // reached the next shard's contigs
+    if (tid < sh.lo)
+      continue;           // straggler from block-aligned seek, or unmapped(-1)
+    if ((b->core.flag & BAM_FUNMAP) == 0 && (tid >= n_targets || pos < 0))
+      continue;
+    if ((b->core.flag & (BAM_FPAIRED | BAM_FMUNMAP)) == BAM_FPAIRED &&
+        (b->core.mtid < 0 || b->core.mtid >= n_targets))
+      continue;
+    if (BamNameTrackingChooser::unsupportedRead(b))
+      continue;
+    if ((b->core.flag & BAM_FUNMAP) == BAM_FUNMAP || b->core.qual < minMapQual)
+      continue;
+    if (!CheckRead::checkEnd(b, header.get())) {
+      b = CheckRead::fixEndClip(b, header.get());
+      if (!CheckRead::checkEnd(b, header.get()))
+        continue;
+    }
+    ReadStatistics rs;
+    // One pass: caldepth's return (edge-trimmed overlap) is identical with or
+    // without a per-base buffer, so this matches the serial depth exactly.
+    CountType ov =
+        caldepth(b, none, header->target_len[tid], NULL, edge, &rs);
+    if (rs.isValid() && rs.getPctId() >= percentIdentity)
+      contigDepths[tid] += ov;
+  }
+  bam_destroy1(b);
+  hts_close(fp);
 }
 
 int main(int argc, char *argv[]) {
@@ -552,7 +742,13 @@ int main(int argc, char *argv[]) {
   std::vector<string> referenceSequences;
   std::vector<int> referenceSequenceLens;
   std::vector<string> referenceSequenceNames;
-  if (!referenceFastaFile.empty()) {
+  // The reference FASTA is read only to VALIDATE the contig set/lengths against
+  // the BAM header (the depth math uses header->target_len). For the plain
+  // sharded fast path we can skip the multi-second serial 3.8GB parse entirely.
+  bool skip_fasta = pairedContigsFile.empty() && unmappedFastqFile.empty() &&
+                    !checkpoint && !store_sequences && !showDepth &&
+                    getenv("RABBIT_DEPTH_NO_SHARD") == NULL;
+  if (!referenceFastaFile.empty() && !skip_fasta) {
     cout << "Reading reference fasta file: " << referenceFastaFile << endl;
     KseqReader reference(referenceFastaFile);
     while (reference.hasNext()) {
@@ -621,6 +817,13 @@ int main(int argc, char *argv[]) {
          << bamFilePaths[0] << endl;
     firstBam = BamUtils::openBam(bamFilePaths[0], false);
     header = firstBam.header;
+  } else if (skip_fasta) {
+    // Fast (sharded) path: only the consolidated header is needed (each shard
+    // opens its own handle), so parse ONE header instead of all num_bams.
+    cerr << "Opening first bam for header (sharded fast path)" << endl;
+    firstBam = BamUtils::openBam(bamFilePaths[0], false);
+    header = firstBam.header;
+    preprocess_complete = true;
   } else {
     cerr << "Opening all bam files and validating headers" << endl;
     header = BamUtils::openBamsAndConsolidateHeaders(bamFilePaths, bams, false);
@@ -692,11 +895,10 @@ int main(int argc, char *argv[]) {
       if (header->target_len[i] > largest_contig)
         largest_contig = header->target_len[i];
   }
+  // Full online-core count, captured before the per-bam cap below; the
+  // contig-sharded fast path uses ALL cores, not just num_bams.
+  const int g_full_threads = numThreads;
 #ifdef USE_RABBITBAM
-  // Budget RabbitBAM decompression threads BEFORE the per-bam cap below throttles
-  // numThreads down to num_bams. The outer loop parallelises across bam files
-  // (≤ num_bams threads); RabbitBAM then fills the remaining idle cores with
-  // per-file BGZF decompression workers. Total ≈ original core count.
   const int rbam_total_threads = numThreads;
   int rbam_read_threads =
       std::max(1, rbam_total_threads / std::max(1, (int)num_bams));
@@ -747,6 +949,139 @@ int main(int argc, char *argv[]) {
   if (!outputKmersFile.empty() && !referenceSequences.empty()) {
     ourMappedKmersStats = new MappedKmersStats();
   }
+  // Shared by both code paths (used after the consumer loop and at output).
+  bool isSorted = true;
+  int minAvgRead = maxEdgeBases * 3;
+  vector<string> partialFiles(num_bams);
+
+  // ── Fast path: contig-sharded means-only depth (see process_depth_shard) ──
+  bool plain_mode = pairedContigsFile.empty() && unmappedFastqFile.empty() &&
+                    !checkpoint && readGCStats.empty() &&
+                    outputKmersFile.empty() && outputReadStatsFile.empty() &&
+                    !showDepth && referenceSequences.empty() && weightMapQual == 0.0;
+  bool use_sharded = plain_mode && getenv("RABBIT_DEPTH_NO_SHARD") == NULL;
+  std::vector<DepthShard> shards;
+  std::vector<int> sampledAvgRead(num_bams, 0);
+  if (use_sharded) {
+    // Many shards, balanced by COMPRESSED BYTES (≈ read count ≈ decode work),
+    // not contig length: high-coverage contigs hold far more reads per base, so
+    // length-balanced shards leave decode badly skewed (→ idle cores). The .bai
+    // gives each contig's start virtual offset; coffset = voff>>16 is its
+    // position in the compressed file, which we sample to cut equal-byte ranges.
+    double shard_mult = 24.0;
+    if (const char *e = getenv("RABBIT_DEPTH_SHARD_MULT"))
+      shard_mult = atof(e) > 0 ? atof(e) : shard_mult;
+    const int shards_per_bam =
+        std::max(1, (int)std::lround((double)g_full_threads * shard_mult / num_bams));
+    std::atomic<bool> all_indexed{true};
+    std::vector<std::vector<DepthShard>> perBam(num_bams);
+    omp_set_num_threads(std::min(g_full_threads, (int)num_bams));
+#pragma omp parallel for schedule(dynamic, 1)
+    for (int bi = 0; bi < (int)num_bams; bi++) {
+      // Read the .bai directly for every non-empty contig's first record voff
+      // (skips htslib's ~8s/file bin-hash construction).
+      std::vector<int32_t> ntid;
+      std::vector<uint64_t> nvoff;
+      bool ok = parse_bai_first_voffs(bamFilePaths[bi], ntid, nvoff);
+      if (!ok || ntid.empty()) {
+        all_indexed = false;
+        continue;
+      }
+      uint64_t firstVoff = nvoff.front();
+      // Sample read length header-free: seek to the first record and scan.
+      {
+        htsFile *fp = hts_open(bamFilePaths[bi].c_str(), "rb");
+        if (fp) {
+          bgzf_seek(fp->fp.bgzf, (int64_t)firstVoff, SEEK_SET);
+          bam1_t *sb = bam_init1();
+          int64_t srs = 0, src = 0;
+          while (src < 50000 && bam_read1(fp->fp.bgzf, sb) >= 0) {
+            if ((sb->core.flag & BAM_FUNMAP) == 0) {
+              srs += sb->core.l_qseq;
+              src++;
+            }
+          }
+          bam_destroy1(sb);
+          hts_close(fp);
+          sampledAvgRead[bi] = src ? (int)(srs / src) : 0;
+        }
+      }
+      // Select up to shards_per_bam boundaries at equal compressed-byte spacing
+      // among the (many) non-empty contigs.
+      std::vector<DepthShard> sv;
+      const uint64_t maxc = nvoff.back() >> 16;
+      std::vector<size_t> bidx{0};
+      size_t si = 0;
+      for (int k = 1; k < shards_per_bam; k++) {
+        uint64_t target = (uint64_t)((double)k / shards_per_bam * maxc);
+        while (si < nvoff.size() && (nvoff[si] >> 16) < target)
+          si++;
+        if (si < ntid.size() && si > bidx.back())
+          bidx.push_back(si);
+      }
+      for (size_t bb = 0; bb < bidx.size(); bb++) {
+        size_t s0 = bidx[bb];
+        int32_t lo = (bb == 0) ? 0 : ntid[s0];
+        int32_t hi = (bb + 1 < bidx.size()) ? ntid[bidx[bb + 1]]
+                                            : header->n_targets;
+        if (hi <= lo)
+          continue;
+        uint64_t sv0 = (bb == 0) ? firstVoff : nvoff[s0];
+        sv.push_back(DepthShard{bi, lo, hi, sv0, true});
+      }
+      perBam[bi] = std::move(sv);
+    }
+    if (!all_indexed) {
+      use_sharded = false;
+      cerr << "Some bams lack a .bai index; using the per-bam depth path"
+           << endl;
+    } else {
+      for (auto &sv : perBam)
+        for (auto &sh : sv)
+          shards.push_back(sh);
+    }
+  }
+
+  if (use_sharded) {
+    cerr << "Contig-sharded depth (means-only): " << shards.size()
+         << " shards over " << g_full_threads << " threads" << endl;
+    for (int bi = 0; bi < (int)num_bams; bi++) {
+      bamContigDepths[bi].reset(new CountType[header->n_targets]());
+      if (intraDepthVariance)
+        bamContigVariances[bi].assign(header->n_targets, VarianceType());
+      averageReadSize[bi] = sampledAvgRead[bi];
+      if (minAvgRead > averageReadSize[bi])
+        minAvgRead = averageReadSize[bi];
+    }
+    omp_set_num_threads(g_full_threads);
+#pragma omp parallel for schedule(dynamic, 1)
+    for (int s = 0; s < (int)shards.size(); s++) {
+      process_depth_shard(shards[s], bamFilePaths[shards[s].bamIdx], header,
+                          bamContigDepths[shards[s].bamIdx].get(),
+                          percentIdentity, maxEdgeBases, includeEdgeBases,
+                          averageReadSize[shards[s].bamIdx], minMapQual);
+    }
+    // Output reads the per-bam mean from VarianceType.mean. Fill it from the
+    // scalar depth sum using calculateVarianceContig's exact formula
+    // (mean = sum(edge-trimmed coverage) / adjustedContigLength); variance stays
+    // 0 (RabbitBin ignores it). This makes the mean depth byte-identical to the
+    // serial path without ever building the per-base array.
+    if (intraDepthVariance) {
+#pragma omp parallel for schedule(static)
+      for (int bi = 0; bi < (int)num_bams; bi++) {
+        const int edge =
+            includeEdgeBases ? 0 : std::min(maxEdgeBases, averageReadSize[bi] / 3);
+        const CountType *cd = bamContigDepths[bi].get();
+        auto &vars = bamContigVariances[bi];
+        for (int32_t t = 0; t < header->n_targets; t++) {
+          int32_t cl = header->target_len[t];
+          int32_t adj = (cl > 2 * edge + 1) ? (cl - 2 * edge) : cl;
+          vars[t].mean = (adj > 2) ? (float)((double)cd[t] / adj) : 0.0f;
+          vars[t].variance = 0.0f;
+        }
+      }
+    }
+  } else {
   DepthCounts noDepthCounts{};
   vector<DepthCounts> workingDepthCounts(omp_get_max_threads());
 #pragma omp parallel for schedule(dynamic, 1)
@@ -756,12 +1091,9 @@ int main(int argc, char *argv[]) {
 
   std::mutex m;
   std::condition_variable cv;
-  bool isSorted = true;
   CountTypeMatrix threadWorkingContigDepths(omp_get_max_threads());
   VarianceTypeMatrix threadWorkingVariance(omp_get_max_threads());
 
-  int minAvgRead = maxEdgeBases * 3;
-  vector<string> partialFiles(num_bams);
 #pragma omp parallel for schedule(static, 1)
   for (int bamIdx = 0; bamIdx < (int)num_bams; bamIdx++) {
 
@@ -1244,6 +1576,7 @@ int main(int argc, char *argv[]) {
       minAvgRead = avgRead;
   } // foreach bamIdx
   workingDepthCounts.clear();
+  } // end per-bam (non-sharded) path
   if (!isSorted) {
     cerr << "Please execute 'samtools sort' on unsorted input bam files and "
             "try again!"

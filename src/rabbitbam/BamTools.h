@@ -19,6 +19,37 @@
 #include <vector>
 #include <omp.h>
 #include <cmath>
+#include <chrono>
+
+// ── Adaptive backoff for the ring-buffer wait loops ────────────────────────
+// The vendored queues hand blocks between the read / decompress / assign /
+// consumer threads via ring buffers and previously busy-waited with a bare
+// std::this_thread::yield() on every miss. That is fine when threads <= cores
+// (single / few-BAM runs), but the depth stage spawns ONE BamReader per BAM:
+// a 20-BAM run puts ~120 helper threads on 64 cores. Under that ~2x
+// oversubscription a bare yield() spins hot — every starved thread keeps
+// re-polling the ring and hammers the scheduler (measured: 2298s system time,
+// 943M involuntary context switches for ~1150s of real work).
+//
+// rb_backoff keeps the low-latency fast path (a brief yield phase, so a block
+// produced microseconds later is still picked up at once) but parks a thread
+// with a short real sleep once it has clearly been starved for a while. A
+// parked thread stops burning a core, freeing it for the productive
+// decompression threads. Unlike the old fixed 5ms/1ms sleep, the sleep path is
+// only reached AFTER the yield phase, so a flowing pipeline never sleeps and
+// steady-state throughput is unchanged. Pass a per-wait counter (reset to 0
+// before each wait loop); semantics/ordering of the queues are untouched.
+inline void rb_backoff(int &spins) {
+    if (spins < 256) {
+        std::this_thread::yield();
+        ++spins;
+    } else if (spins < 1024) {
+        std::this_thread::sleep_for(std::chrono::microseconds(20));
+        ++spins;
+    } else {
+        std::this_thread::sleep_for(std::chrono::microseconds(200));
+    }
+}
 
 #define BLOCK_HEADER_LENGTH 18
 #define BLOCK_FOOTER_LENGTH 8
