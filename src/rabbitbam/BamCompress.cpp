@@ -55,15 +55,17 @@ BamCompress::BamCompress(int BufferSize, int threadNumber) {
 
 
 bam_block *BamCompress::getEmpty() {
+    int spins = 0;
     mtx_compress.lock();
     while ((compress_ed + 1) % compress_size == compress_bg) {
         mtx_compress.unlock();
         // Was sleep_for(5ms): a fixed 5 ms stall whenever the empty-block ring
-        // is momentarily drained throttled the decompression threads to ~200
-        // acquisitions/s. yield() relinquishes the core to the consumer without
-        // a fixed delay, so a refill is picked up within microseconds. Pure
-        // scheduling change — the same blocks flow through in the same order.
-        std::this_thread::yield();
+        // is momentarily drained throttled the decompression threads. rb_backoff
+        // yields first (refill picked up within microseconds, same as the old
+        // bare yield), then parks only if persistently starved so a starved
+        // decode thread stops thrashing the scheduler under oversubscription.
+        // Pure scheduling change — the same blocks flow through in the same order.
+        rb_backoff(spins);
         mtx_compress.lock();
     }
     int num = compress_bg;
@@ -76,9 +78,10 @@ bam_block *BamCompress::getEmpty() {
 
 void BamCompress::inputUnCompressData(bam_block *data, int block_num) {
 
+    int spins = 0;
     while (block_num != blockNum.load(std::memory_order_acq_rel)) {
         wait_num += 1;
-        std::this_thread::sleep_for(std::chrono::nanoseconds(block_num - blockNum) / 8);
+        rb_backoff(spins);
     }
 
     consumer_data[(consumer_ed + 1) % consumer_size] = data;
@@ -87,11 +90,13 @@ void BamCompress::inputUnCompressData(bam_block *data, int block_num) {
 }
 
 bam_block *BamCompress::getUnCompressData() {
+    int spins = 0;
     while ((consumer_ed + 1) % consumer_size == consumer_bg) {
         // Was sleep_for(1ms): the single assign thread polled decompressed
-        // blocks only 1000×/s, capping whole-file throughput. yield() picks up
-        // a freshly produced block within microseconds. Same data, same order.
-        std::this_thread::yield();
+        // blocks only 1000×/s, capping whole-file throughput. rb_backoff picks
+        // up a freshly produced block within microseconds, then parks if the
+        // producers fall behind. Same data, same order.
+        rb_backoff(spins);
         if (compressThread == 0 && (consumer_ed + 1) % consumer_size == consumer_bg) return nullptr;
     }
     int num = consumer_bg;

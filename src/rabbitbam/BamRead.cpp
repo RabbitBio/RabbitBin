@@ -41,8 +41,9 @@ BamRead::BamRead(int BufferSize) {
 }
 
 bam_block *BamRead::getEmpty() {
+    int spins = 0;
     while ((read_ed + 1) % readBlockSize == read_bg) {
-        std::this_thread::yield();
+        rb_backoff(spins);
     }
     int num = read_bg;
     read_bg = (read_bg + 1) % readBlockSize;
@@ -55,10 +56,11 @@ void BamRead::inputBlock(bam_block *block) {
 }
 
 std::pair<bam_block *, int> BamRead::getReadBlock() {
+    int spins = 0;
     while (1) {
         int num = blockTot;
         while (blockNum.compare_exchange_strong(num, num, std::memory_order_relaxed)) {
-            std::this_thread::yield();
+            rb_backoff(spins);
             if (read_complete && blockNum.load(std::memory_order_relaxed) == blockTot)
                 return std::pair<bam_block *, int>(NULL, -1);
             num = blockTot;
