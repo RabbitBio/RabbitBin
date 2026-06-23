@@ -140,6 +140,39 @@ On CAMI3 (RabbitBin + MetaBAT2) this lifts SCG high-quality MAGs from 120/136
 (inputs) to 154 (consensus) in ~0.04 s. Note `refine` optimises the SCG/CheckM
 metric (what you see without a gold standard), not gold-genome recovery.
 
+### 9. Production MAG run (quality-annotated, purified, labelled)
+
+```bash
+rabbitbin bin \
+  --fasta contigs.fa --depth depth.tsv -t 64 \
+  --markers contigs.markers.tsv \
+  --qc \                 # completeness/contamination columns in bins.tsv
+  --purify \             # drop SCG-duplicate depth-outlier contigs
+  --taxonomy contig2lineage.tsv \   # per-bin majority lineage (optional)
+  --bioboxes \           # also emit <prefix>.binning
+  --bin-fasta \
+  --output mags
+```
+
+### 10. Long-read and CRAM input
+
+```bash
+# Nanopore/PacBio BAMs (lower identity threshold)
+rabbitbin bin --fasta contigs.fa --bam ont1.bam ont2.bam --long-read -o out
+
+# CRAM input (needs the reference)
+rabbitbin bin --fasta contigs.fa --bam s1.cram --reference contigs.fa -o out
+rabbitbin depth --bam s1.cram --reference contigs.fa -o depth.tsv
+```
+
+### 11. Multiple resolutions from one graph
+
+```bash
+rabbitbin bin --fasta contigs.fa --depth depth.tsv \
+  --resolutions "strict:200000:0.80,relaxed:20000:0.60" -o out
+# writes out.strict.* and out.relaxed.*  (name:min-bin-bp:split-silhouette)
+```
+
 ## Outputs (`bin`)
 
 | File | Description |
@@ -168,8 +201,17 @@ metric (what you see without a gold standard), not gold-genome recovery.
 | `--sketch-k` / `--sketch-m` | 8 / 500 | Sketch k-mer size / ProbMinHash registers |
 | `--percent-identity` | 97 | Min read identity when reading BAMs |
 | `--save-cache` / `--load-cache` | — | Write / re-bin from a feature-graph cache |
-| `--auto` | off | Sweep configs, auto-select best by SCG quality (needs `--markers`) |
-| `--markers` | — | Contig→marker map for `--auto` (from `rabbitbin_markers.sh`) |
+| `--markers` | — | Contig→marker map (from `rabbitbin_markers.sh`); enables `--auto`/`--autotune`/`--qc`/`--purify` |
+| `--auto` | off | Sweep α/edge-power, auto-select best by SCG quality |
+| `--autotune` | off | Self-tune α × edge-power × split-silhouette by SCG quality |
+| `--qc` | off | Annotate `bins.tsv` with completeness/contamination + MIMAG tier |
+| `--keep-hq-only` | off | Output only high-quality bins (comp>90, cont<5) |
+| `--purify` | off | Drop depth-outlier contigs carrying duplicated single-copy markers |
+| `--taxonomy` | — | Contig→lineage TSV; tag each bin with its majority lineage |
+| `--bioboxes` | off | Also write a CAMI bioboxes `<prefix>.binning` |
+| `--resolutions` | — | Emit several bin sets from one graph, e.g. `strict:200000:0.80,relaxed:20000:0.60` |
+| `--long-read` | off | Long-read (ONT/PacBio) coverage preset for `--bam` |
+| `--reference` | — | Reference FASTA for CRAM `--bam` input |
 | `--bin-fasta` | off | Also write per-bin FASTA files |
 | `--unbinned` | off | Write unbinned contigs to FASTA |
 
@@ -185,6 +227,8 @@ Run `rabbitbin <command> --help` for the full option list.
 | `--min-contig-length` | 1 | Min contig length emitted |
 | `--max-edge-bases` | 75 | Bases trimmed per contig end |
 | `--no-variance` | off | Omit per-sample variance columns |
+| `--long-read` | off | Long-read preset (percent-identity default 80) |
+| `--reference` | — | Reference FASTA (required for CRAM input) |
 
 ## Key options (`amber`)
 
