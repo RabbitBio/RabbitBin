@@ -2445,6 +2445,9 @@ static int rb_cmd_bin(int ac, char *av[]) {
       ("split-bins", po::value<bool>(&g_split_abundance)->zero_tokens(), "Abundance bin splitting (default ON)")
       ("no-split", po::value<bool>(&g_no_split_abundance)->zero_tokens(), "Disable abundance splitting")
       ("split-silhouette", po::value<double>(&g_split_sil)->default_value(rb_env_split_sil()), "Silhouette split threshold")
+      ("auto", po::value<bool>(&g_auto_select)->zero_tokens(), "Build the graph once, sweep configs, and auto-select the partition with the most near-complete bins (needs --markers)")
+      ("ensemble", po::value<bool>(&g_ensemble)->zero_tokens(), "[experimental] Consensus over the swept configs: greedily keep the highest-quality non-overlapping bins (needs --markers). Note: the swept configs share one graph and are highly correlated, so on well-tuned data this rarely beats --auto; intended for diverse/independent partitions.")
+      ("markers", po::value<std::string>(&g_markers_file), "Contig->marker map for --auto/--ensemble (from scripts/rabbitbin_markers.sh)")
       ("debug", po::value<bool>(&debug)->zero_tokens(), "Debug output")
       ("quiet,q", po::value<bool>(&quiet)->zero_tokens(), "Less verbose")
 #ifdef RABBITBIN_FUSE
@@ -3755,9 +3758,26 @@ static int rb_cmd_bin(int ac, char *av[]) {
       std::vector<size_t> membership;     // shared by the two branches below
       bool used_no_gold = false;
       const char *sweep_env = getenv("RABBIT_REUSE_SWEEP");
-      if (no_gold || sweep_env) {
+      const bool qc_auto = (g_auto_select || g_ensemble);
+      if (no_gold || sweep_env || qc_auto) {
         const bool dump = (getenv("RABBIT_NO_GOLD_DUMP") != nullptr) ||
                           (sweep_env && !no_gold);
+
+        // --auto/--ensemble: load the SCG marker map so each swept partition can
+        // be scored by genome quality (completeness/contamination) instead of
+        // the label-free modularity proxy.
+        bool qc_ready = false;
+        if (qc_auto) {
+          if (g_markers_file.empty()) {
+            cerr << "[Error!] --auto/--ensemble require --markers FILE "
+                    "(generate once via scripts/rabbitbin_markers.sh)\n";
+            return 1;
+          }
+          qc_ready = rb_load_markers_for_contigs(g_markers_file);
+          if (!qc_ready)
+            cerr << "[Warn] no markers matched contigs; falling back to "
+                    "modularity selection\n";
+        }
         using clk = std::chrono::steady_clock;
         auto ms_since = [](clk::time_point t0) {
           return std::chrono::duration<double, std::milli>(clk::now() - t0).count();
@@ -3903,10 +3923,13 @@ static int rb_cmd_bin(int ac, char *av[]) {
           return Wintra * invWtot - sumsq;
         };
 
-        // ── Per-config cheap tail: edgeScore + incs + LP + modularity ─────────
+        // ── Per-config cheap tail: edgeScore + incs + LP + modularity (+QC) ───
         double tail_total = 0.0;
         std::vector<double> qscore(M, 0.0);
+        std::vector<long>   qc_nc(M, 0);     // near-complete bin count per config
+        std::vector<double> qc_sum(M, 0.0);  // summed completeness (tie-break)
         size_t best_c = 0; double best_q = -1e300;
+        size_t best_qc_c = 0; long best_nc = -1; double best_ncsum = -1.0;
         for (size_t c = 0; c < M; ++c) {
           g_w_comp     = cfgs[c].first;
           g_edge_power = cfgs[c].second;
@@ -3924,6 +3947,16 @@ static int rb_cmd_bin(int ac, char *av[]) {
           auto bc = count_bins(mems_all[c]);
           qscore[c] = modularity(mems_all[c]);
           if (qscore[c] > best_q) { best_q = qscore[c]; best_c = c; }
+          if (qc_ready) {
+            std::vector<char> binned(nobs, 0);
+            for (size_t i = 0; i < nobs; ++i) binned[i] = !g.incs[i].empty();
+            rb_qc_score_membership(mems_all[c], binned, 90.0, 5.0,
+                                   qc_nc[c], qc_sum[c]);
+            if (qc_nc[c] > best_nc ||
+                (qc_nc[c] == best_nc && qc_sum[c] > best_ncsum)) {
+              best_nc = qc_nc[c]; best_ncsum = qc_sum[c]; best_qc_c = c;
+            }
+          }
           if (dump) {
             char path[4096];
             snprintf(path, sizeof(path), "%s.reuse.cfg%zu_a%.2f_p%.2f.binning",
@@ -3932,30 +3965,50 @@ static int rb_cmd_bin(int ac, char *av[]) {
           }
           fprintf(stderr,
                   "[REUSE] cfg%zu a=%.2f p=%.2f | edgeScore=%.1fms incs=%.1fms "
-                  "LP=%.1fms pass=%.1fms | bins=%zu binned=%zu Q=%.5f\n",
+                  "LP=%.1fms pass=%.1fms | bins=%zu binned=%zu Q=%.5f"
+                  " HQ~=%ld\n",
                   c, cfgs[c].first, cfgs[c].second, es_ms, inc_ms, lp_ms,
-                  pass_ms, bc.first, bc.second, qscore[c]);
+                  pass_ms, bc.first, bc.second, qscore[c],
+                  qc_ready ? qc_nc[c] : -1L);
         }
 
-        // ── No-ground-truth selection: argmax modularity ──────────────────────
+        // ── Selection: QC near-complete count (--auto/--ensemble) else Q ──────
         // Re-materialise the selected config's edgeScore + incidence so the
         // downstream collect-bins / recruit / split / output stages operate on
         // exactly the chosen partition. membership is the selected LP labelling.
+        if (qc_ready) best_c = best_qc_c;
         g_w_comp     = cfgs[best_c].first;
         g_edge_power = cfgs[best_c].second;
         compute_edgescore();
         rebuild_incs();
         membership = mems_all[best_c];
         used_no_gold = true;
+
+        // ── --ensemble: greedy consensus across ALL swept partitions ──────────
+        // DAS Tool-style: collect every (config, cluster) as a candidate bin,
+        // score each by SCG quality, then greedily accept the best bins whose
+        // contigs do not overlap already-accepted bins. Cheap because all
+        // partitions came from one graph build. Produces `membership` directly.
+        if (g_ensemble && qc_ready) {
+          rb_qc_ensemble(mems_all, g, membership);
+        }
+
         if (dump) {
           char path[4096];
           snprintf(path, sizeof(path), "%s.reuse.selected.binning", base.c_str());
           write_binning(membership, path);
         }
-        fprintf(stderr,
-                "[REUSE] SELECTED (max modularity) = cfg%zu a=%.2f p=%.2f "
-                "Q=%.5f\n",
-                best_c, cfgs[best_c].first, cfgs[best_c].second, best_q);
+        if (qc_ready)
+          fprintf(stderr,
+                  "[REUSE] SELECTED (max near-complete) = cfg%zu a=%.2f p=%.2f "
+                  "HQ~=%ld%s\n",
+                  best_c, cfgs[best_c].first, cfgs[best_c].second, best_nc,
+                  g_ensemble ? " then ensemble-consensus" : "");
+        else
+          fprintf(stderr,
+                  "[REUSE] SELECTED (max modularity) = cfg%zu a=%.2f p=%.2f "
+                  "Q=%.5f\n",
+                  best_c, cfgs[best_c].first, cfgs[best_c].second, best_q);
 
         // ── Pairwise edge-agreement (diversity proxy; lower = more diverse) ────
         if (dump && M >= 2) {
@@ -4713,6 +4766,8 @@ static int rb_cmd_depth(int ac, char *av[]) {
 
 // ── amber subcommand (fast, multithreaded genome-binning evaluation) ────────
 #include "impl/rb_amber.cpp"
+// ── qc subcommand (reference-free SCG completeness/contamination) ───────────
+#include "impl/rb_qc.cpp"
 
 // main: subcommand dispatch (bin / depth / amber). A bare `rabbitbin -a ... -o`
 // (no recognised subcommand) is treated as the legacy bin invocation so all
@@ -4724,13 +4779,17 @@ int main(int ac, char *av[]) {
     if (sub == "bin")   return rb_cmd_bin(ac - 1, av + 1);
     if (sub == "depth") return rb_cmd_depth(ac - 1, av + 1);
     if (sub == "amber") return rb_cmd_amber(ac - 1, av + 1);
+    if (sub == "qc")    return rb_cmd_qc(ac - 1, av + 1);
+    if (sub == "refine") return rb_cmd_refine(ac - 1, av + 1);
     if (sub == "--help" || sub == "-h") {
       cerr << "RabbitBin " << version << " (" << DATE << ")\n\n"
            << "Usage: rabbitbin <command> [options]\n\n"
            << "Commands:\n"
            << "  bin     Metagenome binning (default; legacy `rabbitbin -a ... -o ...` also works)\n"
            << "  depth   Summarize sorted BAM(s) into a MetaBAT/JGI depth TSV\n"
-           << "  amber   Fast multithreaded genome-binning evaluation (AMBER-compatible)\n\n"
+           << "  amber   Fast multithreaded genome-binning evaluation (AMBER-compatible)\n"
+           << "  qc      Reference-free bin quality (SCG completeness/contamination)\n"
+           << "  refine  DAS Tool-style SCG consensus over multiple binnings\n\n"
            << "Run `rabbitbin <command> --help` for command-specific options.\n";
       return 0;
     }
