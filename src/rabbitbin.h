@@ -125,8 +125,8 @@ static std::string depth_file;
 // rabbit_depth CLI defaults so the in-memory depth is byte-identical.
 static std::vector<std::string> fuse_bams;
 static int fuse_pctid = 97;
-static int fuse_min_contig_len = 1000;
-static double fuse_min_contig_depth = 1.0;
+static int fuse_min_contig_len = 1;
+static double fuse_min_contig_depth = 0.0;
 static int fuse_max_edge = 75;
 #endif
 static bool cvExt;
