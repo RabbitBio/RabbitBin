@@ -142,7 +142,7 @@ static double      g_split_coh_pct  = 10.0;
 // from a harmful genome halving — co-binned strains share near-identical depth
 // profiles, so the parent stays coherent and the (correct) strain split is
 // wrongly vetoed.  The "shattered large genomes" that motivated this were a
-// min-bin-size=42 artifact; in the default 50k config those genomes are already
+// min-bin-size=42 artifact; in the default 200k config those genomes are already
 // recovered.  Kept as an opt-in knob (RABBIT_SPLIT_GUARD=1) for experimentation;
 // a useful version would need a COMPOSITION (k-mer) criterion, not depth.
 static bool        g_split_guard       = false;
@@ -2431,7 +2431,7 @@ static int rb_cmd_bin(int ac, char *av[]) {
       ("full-header", po::value<bool>(&fullHeader)->zero_tokens(), "Keep full FASTA headers")
       ("min-coverage,x", po::value<Distance>(&minCV)->default_value(1), "Min per-sample mean coverage")
       ("min-coverage-sum", po::value<Distance>(&minCVSum)->default_value(1), "Min total mean coverage")
-      ("min-bin-size,s", po::value<size_t>(&min_bin_bp)->default_value(50000), "Min output bin size (bp)")
+      ("min-bin-size,s", po::value<size_t>(&min_bin_bp)->default_value(200000), "Min output bin size (bp)")
       ("threads,t", po::value<size_t>(&numThreads)->default_value(0), "Threads (0=all online CPUs)")
       ("labels-only,l", po::value<bool>(&onlyLabel)->zero_tokens(), "Output contig names only")
       ("save-matrix", po::value<bool>(&saveCls)->zero_tokens(), "Save membership matrix")
