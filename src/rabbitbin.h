@@ -132,6 +132,7 @@ static std::string cache_load_file;
 // BAM decompression overlaps the FASTA/sketch pass. These mirror the
 // rabbit_depth CLI defaults so the in-memory depth is byte-identical.
 static std::vector<std::string> fuse_bams;
+static std::string fuse_bam_list;   // --bam-list: file with one BAM path per line
 static int fuse_pctid = 97;
 static int fuse_min_contig_len = 1;
 static double fuse_min_contig_depth = 0.0;
