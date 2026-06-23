@@ -2446,8 +2446,17 @@ static int rb_cmd_bin(int ac, char *av[]) {
       ("no-split", po::value<bool>(&g_no_split_abundance)->zero_tokens(), "Disable abundance splitting")
       ("split-silhouette", po::value<double>(&g_split_sil)->default_value(rb_env_split_sil()), "Silhouette split threshold")
       ("auto", po::value<bool>(&g_auto_select)->zero_tokens(), "Build the graph once, sweep configs, and auto-select the partition with the most near-complete bins (needs --markers)")
+      ("autotune", po::value<bool>(&g_autotune)->zero_tokens(), "Self-tuning: search alpha x edge-power x split-silhouette by SCG quality and use the best (needs --markers)")
       ("ensemble", po::value<bool>(&g_ensemble)->zero_tokens(), "[experimental] Consensus over the swept configs: greedily keep the highest-quality non-overlapping bins (needs --markers). Note: the swept configs share one graph and are highly correlated, so on well-tuned data this rarely beats --auto; intended for diverse/independent partitions.")
-      ("markers", po::value<std::string>(&g_markers_file), "Contig->marker map for --auto/--ensemble (from scripts/rabbitbin_markers.sh)")
+      ("markers", po::value<std::string>(&g_markers_file), "Contig->marker map for --auto/--autotune/--qc/--purify (from scripts/rabbitbin_markers.sh)")
+      ("qc", po::value<bool>(&g_qc_annotate)->zero_tokens(), "Annotate bins.tsv with SCG completeness/contamination + MIMAG tier (needs --markers)")
+      ("keep-hq-only", po::value<bool>(&g_keep_hq_only)->zero_tokens(), "Only output high-quality bins (comp>90,cont<5) (implies --qc; needs --markers)")
+      ("purify", po::value<bool>(&g_purify)->zero_tokens(), "Remove depth-outlier contigs carrying duplicated single-copy markers (needs --markers)")
+      ("taxonomy", po::value<std::string>(&g_taxonomy_file), "Contig->lineage TSV; annotate each bin with its length-weighted majority lineage")
+      ("bioboxes", po::value<bool>(&g_write_bioboxes)->zero_tokens(), "Also write a CAMI bioboxes <prefix>.binning file")
+      ("resolutions", po::value<std::string>(&g_resolutions), "Emit multiple bin sets from one graph, e.g. \"strict:200000:0.80,relaxed:20000:0.60\" (name:min-bin-bp:split-sil)")
+      ("long-read", po::value<bool>(&g_long_read)->zero_tokens(), "Long-read (ONT/PacBio) coverage preset for --bam input")
+      ("reference", po::value<std::string>(&g_reference_file), "Reference FASTA for CRAM --bam input")
       ("debug", po::value<bool>(&debug)->zero_tokens(), "Debug output")
       ("quiet,q", po::value<bool>(&quiet)->zero_tokens(), "Less verbose")
 #ifdef RABBITBIN_FUSE
@@ -2670,6 +2679,9 @@ static int rb_cmd_bin(int ac, char *av[]) {
   // Launched immediately after the header scan so it runs in parallel with
   // the FASTA decompression (the main bottleneck).
   {
+  if (!has_depth)
+    verbose_message("No --depth/--bam: composition-only binning "
+                    "(abundance split/recruit disabled).\n");
   using DepthMap = phmap::flat_hash_map<std::string, RawDepthEntry>;
   std::future<DepthMap> depth_future;
   {
@@ -2683,6 +2695,7 @@ static int rb_cmd_bin(int ac, char *av[]) {
       // thread, so the (dominant) BAM decompression runs concurrently with the
       // FASTA decompression + sketch pass below. num_depth_samples already set.
       std::vector<std::string> bams = fuse_bams;
+      if (g_long_read && fuse_pctid == 97) fuse_pctid = 80;   // long-read preset
       float pctid = (float)fuse_pctid / 100.0f;
       int mcl = fuse_min_contig_len;
       double mcd = fuse_min_contig_depth;
@@ -2691,10 +2704,18 @@ static int rb_cmd_bin(int ac, char *av[]) {
       bool cv = cvExt;
       int nds = num_depth_samples;
       int nt = (int)numThreads;
+      std::string ref = g_reference_file;
+      bool any_cram = !ref.empty();
+      for (const auto &p : bams)
+        if (p.size() >= 5 && p.compare(p.size() - 5, 5, ".cram") == 0) any_cram = true;
       depth_future = std::async(std::launch::async, [=]() -> DepthMap {
-        std::string tsv = compute_depth_tsv_inmem(
-            bams, pctid, mcl, (float)mcd, medge,
-            /*includeEdgeBases=*/false, /*intraDepthVariance=*/true, nt);
+        std::string tsv = any_cram
+            ? compute_depth_tsv_generic(bams, pctid, mcl, (float)mcd, medge,
+                                        /*includeEdgeBases=*/false,
+                                        /*intraDepthVariance=*/true, nt, ref)
+            : compute_depth_tsv_inmem(bams, pctid, mcl, (float)mcd, medge,
+                                      /*includeEdgeBases=*/false,
+                                      /*intraDepthVariance=*/true, nt);
         return parse_depth_buf(tsv.data(), tsv.size(), cv, nds, fH, nt);
       });
     } else
@@ -3758,7 +3779,7 @@ static int rb_cmd_bin(int ac, char *av[]) {
       std::vector<size_t> membership;     // shared by the two branches below
       bool used_no_gold = false;
       const char *sweep_env = getenv("RABBIT_REUSE_SWEEP");
-      const bool qc_auto = (g_auto_select || g_ensemble);
+      const bool qc_auto = (g_auto_select || g_ensemble || g_autotune);
       if (no_gold || sweep_env || qc_auto) {
         const bool dump = (getenv("RABBIT_NO_GOLD_DUMP") != nullptr) ||
                           (sweep_env && !no_gold);
@@ -3947,7 +3968,7 @@ static int rb_cmd_bin(int ac, char *av[]) {
           auto bc = count_bins(mems_all[c]);
           qscore[c] = modularity(mems_all[c]);
           if (qscore[c] > best_q) { best_q = qscore[c]; best_c = c; }
-          if (qc_ready) {
+          if (qc_ready && !g_autotune) {
             std::vector<char> binned(nobs, 0);
             for (size_t i = 0; i < nobs; ++i) binned[i] = !g.incs[i].empty();
             rb_qc_score_membership(mems_all[c], binned, 90.0, 5.0,
@@ -3956,6 +3977,37 @@ static int rb_cmd_bin(int ac, char *av[]) {
                 (qc_nc[c] == best_nc && qc_sum[c] > best_ncsum)) {
               best_nc = qc_nc[c]; best_ncsum = qc_sum[c]; best_qc_c = c;
             }
+          } else if (qc_ready && g_autotune) {
+            // --autotune: also sweep split-silhouette and score POST-split bins
+            // (where most HQ bins come from). Pick (alpha,edge_power,split_sil)
+            // maximising near-complete bins. Reuses g_contig_marker_ids (large).
+            static const double sil_grid[] = {0.60, 0.70, 0.80};
+            const double invG = (g_marker_set_size > 0) ? 100.0 / g_marker_set_size : 0.0;
+            const size_t saved_min = min_bin_bp;
+            const bool sv = verbose; verbose = false;
+            for (double sil : sil_grid) {
+              BinMap c2;
+              for (size_t i = 0; i < nobs; ++i)
+                if (!g.incs[i].empty()) c2[mems_all[c][i]].push_back(i);
+              min_bin_bp = saved_min; g_split_sil = sil;
+              if (g_split_abundance || !g_no_split_abundance) abundance_guided_split(c2);
+              long nc = 0;
+              for (auto &kv : c2) {
+                phmap::flat_hash_map<int, int> cnt;
+                for (size_t x : kv.second)
+                  if (x < (size_t)nobs)
+                    for (int m : g_contig_marker_ids[x]) cnt[m] += 1;
+                long pres = 0, extra = 0;
+                for (auto &mp : cnt) { if (mp.second >= 1) ++pres; if (mp.second > 1) extra += mp.second - 1; }
+                double comp = pres * invG, cont = extra * invG;
+                if (comp > 90.0 && cont < 5.0) ++nc;
+              }
+              if (nc > best_nc) {
+                best_nc = nc; best_qc_c = c; g_autotune_best_sil = sil;
+              }
+            }
+            min_bin_bp = saved_min; verbose = sv;
+            qc_nc[c] = best_nc;
           }
           if (dump) {
             char path[4096];
@@ -3977,6 +4029,11 @@ static int rb_cmd_bin(int ac, char *av[]) {
         // downstream collect-bins / recruit / split / output stages operate on
         // exactly the chosen partition. membership is the selected LP labelling.
         if (qc_ready) best_c = best_qc_c;
+        if (qc_ready && g_autotune) {
+          g_split_sil = g_autotune_best_sil;     // lock in the tuned split threshold
+          fprintf(stderr, "[REUSE] autotune: best split-silhouette=%.2f\n",
+                  g_autotune_best_sil);
+        }
         g_w_comp     = cfgs[best_c].first;
         g_edge_power = cfgs[best_c].second;
         compute_edgescore();
@@ -4641,20 +4698,72 @@ static int rb_cmd_bin(int ac, char *av[]) {
   verbose_message("Rescuing singleton large contigs\n");
   promote_singleton_bins(cls);
 
-  // ── Phase 2: split contaminated/multi-modal bins ─────────────────────────
-  // An explicit --marker-seed takes priority (marker-guided); otherwise the
-  // default marker-free abundance split runs (disable with --noAbdSplit).
-  if (!marker_seed_file.empty()) {
-    verbose_message("Marker-guided bin splitting...\n");
-    marker_guided_split(cls);
-  } else if (g_split_abundance) {
-    verbose_message("Abundance-guided bin splitting (marker-free)...\n");
-    abundance_guided_split(cls);
-  }
+  // ── Output-time annotations: load SCG markers / taxonomy if requested ─────
+  if (g_keep_hq_only) g_qc_annotate = true;
+  if ((g_qc_annotate || g_purify) && !g_markers_file.empty())
+    rb_load_markers_unified();
+  else if ((g_qc_annotate || g_purify) && g_markers_file.empty())
+    cerr << "[Warn] --qc/--purify need --markers; skipping annotation\n";
+  if (!g_taxonomy_file.empty()) rb_load_taxonomy_unified();
 
-  rb_phase("split done");
-  verbose_message("Outputting bins\n");
-  output_bins(cls);
+  // ── Phase 2: split contaminated/multi-modal bins (+ optional purify) ──────
+  // An explicit --marker-seed takes priority (marker-guided); otherwise the
+  // default marker-free abundance split runs (disable with --no-split).
+  auto do_split_purify = [&](BinMap &c) {
+    if (!marker_seed_file.empty()) {
+      verbose_message("Marker-guided bin splitting...\n");
+      marker_guided_split(c);
+    } else if (g_split_abundance) {
+      verbose_message("Abundance-guided bin splitting (marker-free)...\n");
+      abundance_guided_split(c);
+    }
+    if (g_purify) {
+      verbose_message("Contamination-aware purification...\n");
+      rb_purify_bins(c);
+    }
+  };
+
+  if (g_resolutions.empty()) {
+    do_split_purify(cls);
+    rb_phase("split done");
+    verbose_message("Outputting bins\n");
+    output_bins(cls);
+  } else {
+    // Multi-resolution (feature #9): emit several bin sets from ONE graph.
+    // Spec: "name:min_bin_bp:split_sil,name2:min2:sil2,...".
+    const std::string base = outFile;
+    const size_t saved_min = min_bin_bp;
+    const double saved_sil = g_split_sil;
+    std::vector<std::tuple<std::string, size_t, double>> res;
+    {
+      std::string spec = g_resolutions; size_t p = 0;
+      while (p < spec.size()) {
+        size_t comma = spec.find(',', p);
+        std::string tok = spec.substr(p, comma == std::string::npos ? std::string::npos : comma - p);
+        size_t c1 = tok.find(':'), c2 = (c1 == std::string::npos) ? std::string::npos : tok.find(':', c1 + 1);
+        if (c1 != std::string::npos) {
+          std::string nm = tok.substr(0, c1);
+          size_t mb = (c2 == std::string::npos) ? saved_min
+                       : (size_t)strtoull(tok.substr(c1 + 1, c2 - c1 - 1).c_str(), nullptr, 10);
+          double sl = (c2 == std::string::npos) ? saved_sil : atof(tok.substr(c2 + 1).c_str());
+          res.emplace_back(nm, mb, sl);
+        }
+        if (comma == std::string::npos) break;
+        p = comma + 1;
+      }
+    }
+    for (auto &r : res) {
+      BinMap c = cls;                         // fresh pre-split copy per resolution
+      min_bin_bp = std::get<1>(r);
+      g_split_sil = std::get<2>(r);
+      outFile = base + "." + std::get<0>(r);
+      verbose_message("[resolution %s] min-bin-bp=%zu split-sil=%.2f\n",
+                      std::get<0>(r).c_str(), min_bin_bp, g_split_sil);
+      do_split_purify(c);
+      output_bins(c);
+    }
+    outFile = base; min_bin_bp = saved_min; g_split_sil = saved_sil;
+  }
   rb_phase("output done");
 
   verbose_message("Finished\n");
@@ -4679,25 +4788,27 @@ static int rb_cmd_depth(int ac, char *av[]) {
           "(libdeflate missing); use the standalone rabbit_depth tool.\n";
   return 1;
 #else
-  std::string fasta, out_path;
+  std::string fasta, out_path, reference;
   std::vector<std::string> bams;
   std::string bam_list;
-  int pctid = 97, min_contig_len = 1, max_edge = 75;
+  int pctid = -1, min_contig_len = 1, max_edge = 75;
   double min_contig_depth = 0.0;
   size_t threads = 0;
-  bool no_variance = false;
+  bool no_variance = false, long_read = false;
 
   po::options_description desc("rabbitbin depth options", 100, 50);
   desc.add_options()
       ("help,h", "Show help")
       ("fasta", po::value<std::string>(&fasta), "Contig FASTA (optional; for CLI parity)")
       ("assembly,a", po::value<std::string>(&fasta), "Alias for --fasta")
-      ("bam", po::value<std::vector<std::string>>(&bams)->multitoken(), "Sorted BAM(s)")
-      ("bam-list", po::value<std::string>(&bam_list), "File with one sorted-BAM path per line")
+      ("bam", po::value<std::vector<std::string>>(&bams)->multitoken(), "Sorted BAM/CRAM(s)")
+      ("bam-list", po::value<std::string>(&bam_list), "File with one sorted-BAM/CRAM path per line")
       ("out,o", po::value<std::string>(&out_path), "Output depth TSV (default: stdout)")
       ("output", po::value<std::string>(&out_path), "Alias for --out")
+      ("reference", po::value<std::string>(&reference), "Reference FASTA (required for CRAM input)")
+      ("long-read", po::value<bool>(&long_read)->zero_tokens(), "Long-read (ONT/PacBio) preset (percent-identity default 80)")
       ("threads,t", po::value<size_t>(&threads)->default_value(0), "Threads (0=all online CPUs)")
-      ("percent-identity", po::value<int>(&pctid)->default_value(97), "Min mapped-read percent identity")
+      ("percent-identity", po::value<int>(&pctid), "Min mapped-read percent identity (default 97; 80 with --long-read)")
       ("min-contig-length", po::value<int>(&min_contig_len)->default_value(1), "Min contig length emitted")
       ("min-contig-depth", po::value<double>(&min_contig_depth)->default_value(0.0), "Min contig depth emitted")
       ("max-edge-bases", po::value<int>(&max_edge)->default_value(75), "Max edge bases trimmed per contig end")
@@ -4734,17 +4845,32 @@ static int rb_cmd_depth(int ac, char *av[]) {
   long onln = sysconf(_SC_NPROCESSORS_ONLN);
   size_t hw = (onln > 0) ? (size_t)onln : 1;
   if (threads == 0) threads = hw; else threads = std::min(threads, hw);
+  if (pctid < 0) pctid = long_read ? 80 : 97;          // long-read preset
 
-  fprintf(stderr, "[rabbitbin depth] %zu BAM(s), %zu threads, pctid=%d, "
-                  "min-contig-length=%d, min-contig-depth=%.3g, max-edge-bases=%d\n",
-          bams.size(), threads, pctid, min_contig_len, min_contig_depth, max_edge);
+  // CRAM (or an explicit --reference) routes through the generic htslib path;
+  // plain sorted BAM uses the fast sharded raw-BGZF path.
+  bool any_cram = !reference.empty();
+  for (const auto &p : bams)
+    if (p.size() >= 5 && p.compare(p.size() - 5, 5, ".cram") == 0) any_cram = true;
+
+  fprintf(stderr, "[rabbitbin depth] %zu file(s), %zu threads, pctid=%d, "
+                  "min-contig-length=%d, max-edge-bases=%d%s%s\n",
+          bams.size(), threads, pctid, min_contig_len, max_edge,
+          long_read ? ", long-read" : "", any_cram ? ", CRAM/generic" : "");
 
   std::string tsv;
   try {
-    tsv = compute_depth_tsv_inmem(bams, (float)pctid / 100.0f, min_contig_len,
-                                  (float)min_contig_depth, max_edge,
-                                  /*includeEdgeBases=*/false,
-                                  /*intraDepthVariance=*/!no_variance, (int)threads);
+    if (any_cram)
+      tsv = compute_depth_tsv_generic(bams, (float)pctid / 100.0f, min_contig_len,
+                                      (float)min_contig_depth, max_edge,
+                                      /*includeEdgeBases=*/false,
+                                      /*intraDepthVariance=*/!no_variance,
+                                      (int)threads, reference);
+    else
+      tsv = compute_depth_tsv_inmem(bams, (float)pctid / 100.0f, min_contig_len,
+                                    (float)min_contig_depth, max_edge,
+                                    /*includeEdgeBases=*/false,
+                                    /*intraDepthVariance=*/!no_variance, (int)threads);
   } catch (const std::exception &e) {
     cerr << "[Error!] depth computation failed: " << e.what() << "\n";
     return 1;

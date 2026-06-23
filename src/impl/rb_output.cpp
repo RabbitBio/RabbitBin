@@ -5,15 +5,31 @@ void output_bins(BinMap &cls) {
   {
 #pragma omp single
     {
+      const bool do_qc  = g_qc_annotate && g_marker_set_size > 0 && !g_allcontig_markers.empty();
+      const bool do_tax = !g_contig_taxon.empty();
+
       std::string outFile_info = rb_bins_info_path();
       std::ofstream os_info(outFile_info.c_str());
       verbose_message("Writing cluster stats to: %s\n", outFile_info.c_str());
-      os_info << "BinNum\tNumContigs\tTotalLength\tLengthWeightedAvgCoveage\tFileName\n";
+      os_info << "BinNum\tNumContigs\tTotalLength\tLengthWeightedAvgCoveage\tFileName";
+      if (do_qc)  os_info << "\tCompleteness\tContamination\tTier";
+      if (do_tax) os_info << "\tTaxonomy";
+      os_info << "\n";
 
       std::string outFile_members = rb_members_path();
       std::ofstream os_members(outFile_members.c_str());
       verbose_message("Writing Members stats to: %s\n", outFile_members.c_str());
       os_members << "BinNum\tSequenceName\tTotalDepth\n";
+
+      // Optional CAMI bioboxes output (<prefix>.binning).
+      std::ofstream os_bbx;
+      if (g_write_bioboxes) {
+        std::string bbx = outFile + ".binning";
+        os_bbx.open(bbx.c_str());
+        verbose_message("Writing bioboxes binning to: %s\n", bbx.c_str());
+        os_bbx << "@Version:0.9.0\n@SampleID:" << outFile << "\n"
+               << "@@SEQUENCEID\tBINID\t_LENGTH\n";
+      }
 
       Distance binnedSize = 0, binnedSize1 = 0;
       std::vector<size_t> clsMap(nobs + nobs1, 0);
@@ -24,6 +40,7 @@ void output_bins(BinMap &cls) {
         size_t numContigs = 0, totalLength = 0;
         double lengthWeightedAvgCoverage = 0;
         size_t s = 0, s1 = 0;
+        std::string outFile_cls = rb_bin_output_path(bin_id);
         {
           const auto &cluster = it->second;
           std::stringstream ss;
@@ -44,19 +61,43 @@ void output_bins(BinMap &cls) {
             ss << bin_id << "\t" << sequence_name << "\t" << total << "\n";
           }
           if (s + s1 < min_bin_bp) continue;
+
+          // Per-bin SCG quality / taxonomy (features #1/#8) + --keep-hq-only.
+          double comp = 0.0, cont = 0.0; int taxid = -1;
+          if (do_qc)  rb_bin_qc(cluster, comp, cont);
+          if (do_tax) taxid = rb_bin_taxon(cluster);
+          bool is_hq = do_qc && comp > g_hq_comp && cont < g_hq_cont;
+          if (g_keep_hq_only && !is_hq) continue;
+
           os_members << ss.str();
           for (size_t i = 0; i < cluster.size(); ++i) {
             assert(cluster[i] < (int)clsMap.size());
             clsMap[cluster[i]] = kk + 1;
           }
+          if (g_write_bioboxes) {
+            for (auto c : cluster) {
+              auto idx = (c < nobs) ? c : c - nobs;
+              const string &n = (c < nobs) ? contig_names[idx] : small_contig_names[idx];
+              size_t len = (c < nobs) ? seq_lens[idx] : small_seq_lens[idx];
+              os_bbx << n << "\t" << bin_id << "\t" << len << "\n";
+            }
+          }
+
+          if (totalLength > 0) lengthWeightedAvgCoverage /= totalLength;
+          else                 lengthWeightedAvgCoverage = 0;
+          os_info << bin_id << "\t" << numContigs << "\t" << totalLength << "\t"
+                  << lengthWeightedAvgCoverage << "\t" << outFile_cls;
+          if (do_qc) {
+            const char *tier = is_hq ? "HQ"
+                             : (comp >= g_mq_comp && cont < g_mq_cont) ? "MQ" : "LQ";
+            os_info << "\t" << std::fixed << std::setprecision(2) << comp
+                    << "\t" << cont << "\t" << tier;
+            os_info.unsetf(std::ios::fixed);
+          }
+          if (do_tax)
+            os_info << "\t" << (taxid >= 0 ? g_taxon_names[taxid] : "unclassified");
+          os_info << "\n";
         }
-
-        std::string outFile_cls = rb_bin_output_path(bin_id);
-
-        if (totalLength > 0) lengthWeightedAvgCoverage /= totalLength;
-        else                 lengthWeightedAvgCoverage = 0;
-        os_info << bin_id << "\t" << numContigs << "\t" << totalLength << "\t"
-                << lengthWeightedAvgCoverage << "\t" << outFile_cls << "\n";
 
         binnedSize  += s;
         binnedSize1 += s1;
