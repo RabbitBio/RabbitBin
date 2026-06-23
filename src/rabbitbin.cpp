@@ -2401,13 +2401,14 @@ static std::vector<int> rb_kmeans(const std::vector<std::vector<float>> &X,
 // ── cache I/O (before main; used by both the save hook and the load path) ──
 #include "impl/rb_cache.cpp"
 
-// main
+// bin subcommand (also the legacy default entry point)
 // ═══════════════════════════════════════════════════════════════════════════
-int main(int ac, char *av[]) {
+static int rb_cmd_bin(int ac, char *av[]) {
   po::options_description desc("RabbitBin options", 100, 50);
   desc.add_options()
       ("help,h", "Show help")
       ("assembly,a", po::value<std::string>(&inFile), "Contig FASTA assembly (gzip ok) [required]")
+      ("fasta", po::value<std::string>(&inFile), "Alias for --assembly")
       ("output,o", po::value<std::string>(&outFile), "Output path prefix [required]")
       ("depth,d", po::value<std::string>(&depth_file), "Coverage depth TSV")
       ("save-cache", po::value<std::string>(&cache_save_file), "Write a re-binning cache after the similarity graph is built, then continue normally")
@@ -2450,6 +2451,8 @@ int main(int ac, char *av[]) {
       ("bam", po::value<std::vector<std::string>>(&fuse_bams)->multitoken(),
        "Sorted BAM(s); depth is computed in-process (overlaps FASTA parse). "
        "Mutually exclusive with --depth. BAMs may also be given positionally.")
+      ("bam-list", po::value<std::string>(&fuse_bam_list),
+       "File with one sorted-BAM path per line (appended to --bam)")
       ("percent-identity", po::value<int>(&fuse_pctid)->default_value(97),
        "[--bam] Min mapped-read percent identity")
       ("min-contig-length", po::value<int>(&fuse_min_contig_len)->default_value(1),
@@ -2472,6 +2475,22 @@ int main(int ac, char *av[]) {
   po::store(po::command_line_parser(ac, av).options(desc).positional({}).run(), vm);
 #endif
   po::notify(vm);
+
+#ifdef RABBITBIN_FUSE
+  // --bam-list: append each non-blank line (a BAM path) to the BAM vector so the
+  // fuse path treats it identically to repeated --bam / positional args.
+  if (!fuse_bam_list.empty()) {
+    std::ifstream bl(fuse_bam_list);
+    if (!bl) { cerr << "[Error!] cannot open --bam-list file: " << fuse_bam_list << "\n"; return 1; }
+    std::string ln;
+    while (std::getline(bl, ln)) {
+      size_t b = ln.find_first_not_of(" \t\r\n");
+      if (b == std::string::npos) continue;
+      size_t e = ln.find_last_not_of(" \t\r\n");
+      fuse_bams.push_back(ln.substr(b, e - b + 1));
+    }
+  }
+#endif
 
   // Whether the user explicitly passed --seed (vs the default 0). In cache-load
   // mode this decides whether to reproduce the cached run's seed or honour an
@@ -4594,3 +4613,128 @@ int main(int ac, char *av[]) {
 #include "impl/rb_graph.cpp"
 #include "impl/rb_abundance.cpp"
 #include "impl/rb_output.cpp"
+
+// ── depth subcommand ────────────────────────────────────────────────────────
+// `rabbitbin depth --bam-list bams.txt --out depth.tsv` (or repeated --bam /
+// positional BAMs) computes a MetaBAT/JGI-format depth table in-process, byte-
+// identical to the standalone rabbit_depth tool. --fasta is accepted for CLI
+// parity but is optional: the depth table derives contig names+lengths from the
+// BAM header.
+static int rb_cmd_depth(int ac, char *av[]) {
+#ifndef RABBITBIN_FUSE
+  cerr << "[Error!] this rabbitbin build has no in-process BAM support "
+          "(libdeflate missing); use the standalone rabbit_depth tool.\n";
+  return 1;
+#else
+  std::string fasta, out_path;
+  std::vector<std::string> bams;
+  std::string bam_list;
+  int pctid = 97, min_contig_len = 1, max_edge = 75;
+  double min_contig_depth = 0.0;
+  size_t threads = 0;
+  bool no_variance = false;
+
+  po::options_description desc("rabbitbin depth options", 100, 50);
+  desc.add_options()
+      ("help,h", "Show help")
+      ("fasta", po::value<std::string>(&fasta), "Contig FASTA (optional; for CLI parity)")
+      ("assembly,a", po::value<std::string>(&fasta), "Alias for --fasta")
+      ("bam", po::value<std::vector<std::string>>(&bams)->multitoken(), "Sorted BAM(s)")
+      ("bam-list", po::value<std::string>(&bam_list), "File with one sorted-BAM path per line")
+      ("out,o", po::value<std::string>(&out_path), "Output depth TSV (default: stdout)")
+      ("output", po::value<std::string>(&out_path), "Alias for --out")
+      ("threads,t", po::value<size_t>(&threads)->default_value(0), "Threads (0=all online CPUs)")
+      ("percent-identity", po::value<int>(&pctid)->default_value(97), "Min mapped-read percent identity")
+      ("min-contig-length", po::value<int>(&min_contig_len)->default_value(1), "Min contig length emitted")
+      ("min-contig-depth", po::value<double>(&min_contig_depth)->default_value(0.0), "Min contig depth emitted")
+      ("max-edge-bases", po::value<int>(&max_edge)->default_value(75), "Max edge bases trimmed per contig end")
+      ("no-variance", po::value<bool>(&no_variance)->zero_tokens(), "Omit per-sample variance columns");
+
+  po::variables_map vm;
+  po::positional_options_description pos;
+  pos.add("bam", -1);
+  po::store(po::command_line_parser(ac, av).options(desc).positional(pos).run(), vm);
+  po::notify(vm);
+
+  if (!bam_list.empty()) {
+    std::ifstream bl(bam_list);
+    if (!bl) { cerr << "[Error!] cannot open --bam-list file: " << bam_list << "\n"; return 1; }
+    std::string ln;
+    while (std::getline(bl, ln)) {
+      size_t b = ln.find_first_not_of(" \t\r\n");
+      if (b == std::string::npos) continue;
+      size_t e = ln.find_last_not_of(" \t\r\n");
+      bams.push_back(ln.substr(b, e - b + 1));
+    }
+  }
+
+  if (vm.count("help") || bams.empty()) {
+    cerr << "\nrabbitbin depth: BAM(s) -> MetaBAT/JGI depth TSV\n\n"
+         << "Usage: rabbitbin depth --bam-list bams.txt --out depth.tsv\n"
+         << "       rabbitbin depth --fasta contigs.fa --bam s1.bam s2.bam -o depth.tsv\n\n"
+         << desc << "\n";
+    if (!vm.count("help") && bams.empty())
+      cerr << "[Error!] at least one BAM is required (--bam / --bam-list / positional)\n";
+    return vm.count("help") ? 0 : 1;
+  }
+
+  long onln = sysconf(_SC_NPROCESSORS_ONLN);
+  size_t hw = (onln > 0) ? (size_t)onln : 1;
+  if (threads == 0) threads = hw; else threads = std::min(threads, hw);
+
+  fprintf(stderr, "[rabbitbin depth] %zu BAM(s), %zu threads, pctid=%d, "
+                  "min-contig-length=%d, min-contig-depth=%.3g, max-edge-bases=%d\n",
+          bams.size(), threads, pctid, min_contig_len, min_contig_depth, max_edge);
+
+  std::string tsv;
+  try {
+    tsv = compute_depth_tsv_inmem(bams, (float)pctid / 100.0f, min_contig_len,
+                                  (float)min_contig_depth, max_edge,
+                                  /*includeEdgeBases=*/false,
+                                  /*intraDepthVariance=*/!no_variance, (int)threads);
+  } catch (const std::exception &e) {
+    cerr << "[Error!] depth computation failed: " << e.what() << "\n";
+    return 1;
+  }
+
+  if (out_path.empty() || out_path == "-") {
+    fwrite(tsv.data(), 1, tsv.size(), stdout);
+  } else {
+    FILE *f = fopen(out_path.c_str(), "wb");
+    if (!f) { cerr << "[Error!] cannot open output: " << out_path << "\n"; return 1; }
+    fwrite(tsv.data(), 1, tsv.size(), f);
+    fclose(f);
+    fprintf(stderr, "[rabbitbin depth] wrote %s (%zu bytes)\n",
+            out_path.c_str(), tsv.size());
+  }
+  return 0;
+#endif
+}
+
+// ── amber subcommand (fast, multithreaded genome-binning evaluation) ────────
+#include "impl/rb_amber.cpp"
+
+// main: subcommand dispatch (bin / depth / amber). A bare `rabbitbin -a ... -o`
+// (no recognised subcommand) is treated as the legacy bin invocation so all
+// existing scripts keep working.
+// ═══════════════════════════════════════════════════════════════════════════
+int main(int ac, char *av[]) {
+  if (ac >= 2) {
+    std::string sub = av[1];
+    if (sub == "bin")   return rb_cmd_bin(ac - 1, av + 1);
+    if (sub == "depth") return rb_cmd_depth(ac - 1, av + 1);
+    if (sub == "amber") return rb_cmd_amber(ac - 1, av + 1);
+    if (sub == "--help" || sub == "-h") {
+      cerr << "RabbitBin " << version << " (" << DATE << ")\n\n"
+           << "Usage: rabbitbin <command> [options]\n\n"
+           << "Commands:\n"
+           << "  bin     Metagenome binning (default; legacy `rabbitbin -a ... -o ...` also works)\n"
+           << "  depth   Summarize sorted BAM(s) into a MetaBAT/JGI depth TSV\n"
+           << "  amber   Fast multithreaded genome-binning evaluation (AMBER-compatible)\n\n"
+           << "Run `rabbitbin <command> --help` for command-specific options.\n";
+      return 0;
+    }
+  }
+  // Legacy / default: treat all args as bin options.
+  return rb_cmd_bin(ac, av);
+}
