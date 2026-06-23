@@ -410,6 +410,28 @@ void output_bins(BinMap &cls);
 // state; rb_load_cache restores it into the globals + the graph staging arrays.
 bool rb_write_cache(const std::string &path, const Graph &g, bool has_depth);
 bool rb_load_cache(const std::string &path);
+
+// ── QC-guided auto-selection / ensemble (impl/rb_qc.cpp) ───────────────────
+static bool g_auto_select = false;         // --auto: pick config by SCG quality
+static bool g_ensemble = false;            // --ensemble: consensus across configs
+static std::string g_markers_file;         // --markers: contig->marker map
+static std::vector<std::vector<int>> g_contig_marker_ids;  // [nobs] markers per large contig
+static long g_marker_set_size = 0;         // total markers in the set (G)
+// Load the contig->marker map and project it onto the large-contig index space
+// (matches contig_names[0..nobs)). Fills g_contig_marker_ids + g_marker_set_size.
+bool rb_load_markers_for_contigs(const std::string &path);
+// Score a large-contig membership by single-copy-gene quality: count bins with
+// completeness > comp_thr% and contamination < cont_thr%; sum_comp accumulates
+// completeness over scored bins (tie-break). `binned[i]` gates contig i.
+void rb_qc_score_membership(const std::vector<size_t> &mem,
+                            const std::vector<char> &binned,
+                            double comp_thr, double cont_thr,
+                            long &near_complete, double &sum_comp);
+// Greedy consensus across all swept partitions: rank every (config,cluster) by
+// SCG quality and keep the best non-overlapping bins. Writes a fresh per-contig
+// membership (accepted bins share an id; leftovers get unique ids).
+void rb_qc_ensemble(const std::vector<std::vector<size_t>> &mems_all,
+                    const Graph &g, std::vector<size_t> &out_membership);
 size_t calibrate_sim_cutoff(Distance coverage = 1., bool full = false);
 double cal_depth_corr(size_t r1, size_t r2, bool second_is_small = false,
                     bool first_is_centroid = false);

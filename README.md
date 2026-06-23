@@ -2,13 +2,15 @@
 
 Fast, sketch-based metagenome binning. RabbitBin clusters assembly contigs into
 genome bins (MAGs) from a composition–abundance similarity graph, with optional
-abundance-guided bin splitting. It ships as a single binary with three commands:
+abundance-guided bin splitting. It ships as a single binary with these commands:
 
 | Command | What it does |
 |---------|--------------|
 | `rabbitbin bin`   | Bin contigs into genomes (the main pipeline) |
 | `rabbitbin depth` | Turn sorted BAM(s) into a MetaBAT/JGI depth TSV |
 | `rabbitbin amber` | Fast, multithreaded AMBER-compatible binning evaluation |
+| `rabbitbin qc`    | Reference-free bin quality (SCG completeness/contamination) |
+| `rabbitbin refine`| DAS Tool-style SCG consensus over multiple binnings |
 
 `rabbitbin bin` is the default: a bare `rabbitbin -a contigs.fa -o out` still works.
 
@@ -18,6 +20,7 @@ abundance-guided bin splitting. It ships as a single binary with three commands:
 - **CMake** ≥ 3.5
 - **Boost** ≥ 1.66 (`program_options filesystem system graph serialization iostreams`)
 - **zlib** ≥ 1.2.11 and **HTSlib** ≥ 1.13 — auto-downloaded if not found on the system
+- *(optional, only for `qc` / `--auto`)* **Prodigal** and **HMMER** (`hmmsearch`) on `PATH` to build the SCG marker map
 
 ## Build
 
@@ -90,6 +93,53 @@ rabbitbin amber \
   --threads 64
 ```
 
+### 6. Reference-free bin quality (no gold standard needed)
+
+Build the single-copy-gene (SCG) marker map once per assembly (Prodigal +
+hmmsearch; the expensive step), then score any binning in milliseconds:
+
+```bash
+# once per assembly
+scripts/rabbitbin_markers.sh contigs.fa contigs.markers.tsv 64
+
+# score a binning (completeness / contamination, MIMAG HQ/MQ tiers)
+rabbitbin qc \
+  --members results/out.members.tsv \
+  --markers contigs.markers.tsv \
+  --marker-set-size 111 \
+  --output qc_per_bin.tsv
+```
+
+### 7. QC-guided auto parameter selection
+
+`--auto` builds the feature graph once, sweeps configs, and keeps the partition
+with the most near-complete bins (by SCG quality) — no ground truth needed.
+Pairs naturally with the cache:
+
+```bash
+rabbitbin bin --fasta contigs.fa --depth depth.tsv --save-cache run.cache -o tmp
+rabbitbin bin --load-cache run.cache --auto --markers contigs.markers.tsv -o out_auto
+```
+
+### 8. Consensus over several binners (fast DAS Tool)
+
+Fuse the bins from independent tools into a non-redundant, higher-quality set by
+iteratively keeping the best SCG-scored bins (completeness − contamination):
+
+```bash
+rabbitbin refine \
+  --markers contigs.markers.tsv \
+  --output consensus \
+  -i rabbitbin.members.tsv \
+  -i metabat2.binning \
+  -i maxbin2.binning
+# writes consensus.members.tsv + consensus.qc.tsv
+```
+
+On CAMI3 (RabbitBin + MetaBAT2) this lifts SCG high-quality MAGs from 120/136
+(inputs) to 154 (consensus) in ~0.04 s. Note `refine` optimises the SCG/CheckM
+metric (what you see without a gold standard), not gold-genome recovery.
+
 ## Outputs (`bin`)
 
 | File | Description |
@@ -118,6 +168,8 @@ rabbitbin amber \
 | `--sketch-k` / `--sketch-m` | 8 / 500 | Sketch k-mer size / ProbMinHash registers |
 | `--percent-identity` | 97 | Min read identity when reading BAMs |
 | `--save-cache` / `--load-cache` | — | Write / re-bin from a feature-graph cache |
+| `--auto` | off | Sweep configs, auto-select best by SCG quality (needs `--markers`) |
+| `--markers` | — | Contig→marker map for `--auto` (from `rabbitbin_markers.sh`) |
 | `--bin-fasta` | off | Also write per-bin FASTA files |
 | `--unbinned` | off | Write unbinned contigs to FASTA |
 
@@ -144,6 +196,29 @@ Run `rabbitbin <command> --help` for the full option list.
 | `-o, --output` | — | Per-bin metrics TSV (optional) |
 | `--min-length` | 0 | Ignore GS contigs shorter than this |
 | `-q, --quiet` | off | Print only the summary |
+
+## Key options (`qc`)
+
+| Option | Default | Meaning |
+|--------|---------|---------|
+| `-i, --binning` / `--members` | — | Binning to score (bioboxes/2-col, or members.tsv) |
+| `-k, --markers` | — | Contig→marker map from `rabbitbin_markers.sh` |
+| `--marker-set-size` | auto | Total markers G (auto: header comment or distinct seen) |
+| `-o, --output` | — | Per-bin completeness/contamination TSV |
+| `--hq-completeness` / `--hq-contamination` | 90 / 5 | MIMAG high-quality thresholds (%) |
+| `--mq-completeness` / `--mq-contamination` | 50 / 10 | MIMAG medium-quality thresholds (%) |
+
+## Key options (`refine`)
+
+| Option | Default | Meaning |
+|--------|---------|---------|
+| `-i, --binning` | — | Input binning(s); repeat for each tool (bioboxes/2-col/members) |
+| `-k, --markers` | — | Contig→marker map from `rabbitbin_markers.sh` |
+| `-o, --output` | — | Output prefix (`.members.tsv` + `.qc.tsv`) |
+| `--min-completeness` | 50 | Keep consensus bins with completeness ≥ this (%) |
+| `--max-contamination` | 10 | Keep consensus bins with contamination ≤ this (%) |
+| `--contamination-weight` | 5 | Ranking score = completeness − weight·contamination |
+| `--marker-set-size` | auto | Total markers G |
 
 ## Environment variables (advanced tuning)
 
