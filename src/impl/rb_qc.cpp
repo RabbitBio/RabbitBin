@@ -223,6 +223,217 @@ void rb_qc_ensemble(const std::vector<std::vector<size_t>> &mems_all,
                   cands.size(), M, accepted);
 }
 
+// ── Output-time marker/taxonomy loading + per-bin metrics (features #1/#7/#8) ─
+// Build a name -> unified-contig-index map (large: i; small: j+nobs), exactly as
+// the membership/output stages index contigs.
+static void rb_build_name2idx(phmap::flat_hash_map<std::string, size_t> &m) {
+  m.reserve((nobs + nobs1) * 2);
+  auto add = [&](const std::string &raw, size_t idx) {
+    std::string nm = raw;
+    size_t sp = nm.find_first_of(" \t");
+    if (sp != std::string::npos) nm.resize(sp);
+    m.emplace(std::move(nm), idx);
+  };
+  for (size_t i = 0; i < nobs; ++i)  add(contig_names[i], i);
+  for (size_t j = 0; j < nobs1; ++j) add(small_contig_names[j], j + nobs);
+}
+
+bool rb_load_markers_unified() {
+  using namespace rb_amber;
+  if (g_markers_file.empty()) return false;
+  g_allcontig_markers.assign(nobs + nobs1, {});
+  phmap::flat_hash_map<std::string, size_t> name2idx;
+  rb_build_name2idx(name2idx);
+
+  Mapped km;
+  if (!map_file(g_markers_file, km)) {
+    cerr << "[Error!] cannot open --markers file: " << g_markers_file << "\n";
+    return false;
+  }
+  Interner markers;
+  long hdr = 0; size_t hits = 0, matched = 0;
+  const char *p = km.data, *end = km.data + km.len;
+  const char *fb[64], *fe[64];
+  while (p < end) {
+    const char *nl = (const char *)memchr(p, '\n', (size_t)(end - p));
+    const char *le = nl ? nl : end;
+    if (le > p) {
+      if (p[0] == '#') {
+        static const char *kw = "marker_set_size"; const size_t kl = strlen(kw);
+        for (const char *q = p; q + kl < le; ++q)
+          if (strncmp(q, kw, kl) == 0) {
+            const char *eq = (const char *)memchr(q + kl, '=', (size_t)(le - (q + kl)));
+            if (eq) hdr = (long)parse_uint(eq + 1, le);
+            break;
+          }
+      } else {
+        int n = split_tabs(p, le, fb, fe, 64);
+        if (n >= 2) {
+          std::string contig(fb[0], (size_t)(fe[0] - fb[0]));
+          auto it = name2idx.find(contig);
+          if (it != name2idx.end()) {
+            auto &vec = g_allcontig_markers[it->second];
+            for (int c = 1; c < n; ++c)
+              if (fe[c] > fb[c]) { vec.push_back(markers.intern(fb[c], fe[c])); ++hits; }
+            ++matched;
+          } else {
+            for (int c = 1; c < n; ++c)
+              if (fe[c] > fb[c]) markers.intern(fb[c], fe[c]);
+          }
+        }
+      }
+    }
+    if (!nl) break;
+    p = nl + 1;
+  }
+  g_marker_set_size = hdr > 0 ? hdr : (long)markers.names.size();
+  verbose_message("QC markers: %zu hits on %zu contigs, G=%ld%s\n",
+                  hits, matched, g_marker_set_size, hdr > 0 ? " (header)" : "");
+  return g_marker_set_size > 0 && hits > 0;
+}
+
+bool rb_load_taxonomy_unified() {
+  using namespace rb_amber;
+  if (g_taxonomy_file.empty()) return false;
+  g_contig_taxon.assign(nobs + nobs1, -1);
+  g_taxon_names.clear();
+  phmap::flat_hash_map<std::string, size_t> name2idx;
+  rb_build_name2idx(name2idx);
+  phmap::flat_hash_map<std::string, int> taxid;
+
+  Mapped tm;
+  if (!map_file(g_taxonomy_file, tm)) {
+    cerr << "[Error!] cannot open --taxonomy file: " << g_taxonomy_file << "\n";
+    return false;
+  }
+  size_t matched = 0;
+  const char *p = tm.data, *end = tm.data + tm.len;
+  const char *fb[4], *fe[4];
+  while (p < end) {
+    const char *nl = (const char *)memchr(p, '\n', (size_t)(end - p));
+    const char *le = nl ? nl : end;
+    if (le > p && p[0] != '#') {
+      int n = split_tabs(p, le, fb, fe, 2);
+      if (n >= 2 && fe[1] > fb[1]) {
+        std::string contig(fb[0], (size_t)(fe[0] - fb[0]));
+        auto it = name2idx.find(contig);
+        if (it != name2idx.end()) {
+          std::string lin(fb[1], (size_t)(fe[1] - fb[1]));
+          auto r = taxid.try_emplace(lin, (int)g_taxon_names.size());
+          if (r.second) g_taxon_names.push_back(lin);
+          g_contig_taxon[it->second] = r.first->second;
+          ++matched;
+        }
+      }
+    }
+    if (!nl) break;
+    p = nl + 1;
+  }
+  verbose_message("Taxonomy: %zu contigs labelled, %zu distinct lineages\n",
+                  matched, g_taxon_names.size());
+  return matched > 0;
+}
+
+void rb_bin_qc(const ContigVector &contigs, double &comp, double &cont) {
+  comp = cont = 0.0;
+  if (g_marker_set_size <= 0 || g_allcontig_markers.empty()) return;
+  phmap::flat_hash_map<int, int> cnt;
+  for (size_t c : contigs)
+    if (c < g_allcontig_markers.size())
+      for (int m : g_allcontig_markers[c]) cnt[m] += 1;
+  long pres = 0, extra = 0;
+  for (auto &mp : cnt) { if (mp.second >= 1) ++pres; if (mp.second > 1) extra += mp.second - 1; }
+  const double invG = 100.0 / (double)g_marker_set_size;
+  comp = (double)pres * invG;
+  cont = (double)extra * invG;
+}
+
+int rb_bin_taxon(const ContigVector &contigs) {
+  if (g_contig_taxon.empty()) return -1;
+  phmap::flat_hash_map<int, size_t> votes;   // taxon id -> summed bp
+  for (size_t c : contigs) {
+    if (c >= g_contig_taxon.size()) continue;
+    int t = g_contig_taxon[c];
+    if (t < 0) continue;
+    size_t len = (c < nobs) ? seq_lens[c] : small_seq_lens[c - nobs];
+    votes[t] += len;
+  }
+  int best = -1; size_t best_bp = 0;
+  for (auto &kv : votes)
+    if (kv.second > best_bp || (kv.second == best_bp && (best < 0 || kv.first < best))) {
+      best_bp = kv.second; best = kv.first;
+    }
+  return best;
+}
+
+void rb_purify_bins(BinMap &cls) {
+  if (g_marker_set_size <= 0 || g_allcontig_markers.empty() || num_depth_samples < 1) {
+    verbose_message("Purify: needs --markers and depth — skipped\n");
+    return;
+  }
+  auto depth_at = [&](size_t c, size_t i) -> double {
+    if (c < nobs) {
+      if (!g_large_means.empty() && c * (size_t)num_depth_samples + i < g_large_means.size())
+        return (double)g_large_means[c * num_depth_samples + i];
+      return (double)depth_matrix(c, i);
+    }
+    size_t s = c - nobs;
+    if (!g_small_means.empty() && s * (size_t)num_depth_samples + i < g_small_means.size())
+      return (double)g_small_means[s * num_depth_samples + i];
+    return (double)small_depth_matrix(s, i);
+  };
+  size_t n_removed = 0, n_bins_touched = 0;
+  for (auto &kv : cls) {
+    ContigVector &cs = kv.second;
+    if (cs.size() < 3) continue;
+    // duplicated single-copy markers in this bin?
+    phmap::flat_hash_map<int, int> cnt;
+    for (size_t c : cs)
+      if (c < g_allcontig_markers.size())
+        for (int m : g_allcontig_markers[c]) cnt[m] += 1;
+    phmap::flat_hash_set<int> dup;
+    for (auto &mp : cnt) if (mp.second > 1) dup.insert(mp.first);
+    if (dup.empty()) continue;
+
+    // Per-sample median log-depth centroid + MAD over the bin.
+    const size_t S = num_depth_samples;
+    std::vector<std::vector<double>> ld(cs.size(), std::vector<double>(S));
+    for (size_t r = 0; r < cs.size(); ++r)
+      for (size_t i = 0; i < S; ++i) ld[r][i] = std::log(depth_at(cs[r], i) + 1.0);
+    std::vector<double> med(S), mad(S);
+    std::vector<double> col(cs.size());
+    for (size_t i = 0; i < S; ++i) {
+      for (size_t r = 0; r < cs.size(); ++r) col[r] = ld[r][i];
+      std::nth_element(col.begin(), col.begin() + col.size() / 2, col.end());
+      med[i] = col[col.size() / 2];
+      for (size_t r = 0; r < cs.size(); ++r) col[r] = std::fabs(ld[r][i] - med[i]);
+      std::nth_element(col.begin(), col.begin() + col.size() / 2, col.end());
+      mad[i] = col[col.size() / 2] * 1.4826 + 1e-9;
+    }
+    // A contig is a contaminant if it carries a duplicated marker AND is a
+    // robust depth outlier (max |z| over samples > 3).
+    ContigVector keep;
+    keep.reserve(cs.size());
+    bool touched = false;
+    for (size_t r = 0; r < cs.size(); ++r) {
+      bool has_dup = false;
+      size_t c = cs[r];
+      if (c < g_allcontig_markers.size())
+        for (int m : g_allcontig_markers[c]) if (dup.count(m)) { has_dup = true; break; }
+      double zmax = 0.0;
+      for (size_t i = 0; i < S; ++i) {
+        double z = std::fabs(ld[r][i] - med[i]) / mad[i];
+        if (z > zmax) zmax = z;
+      }
+      if (has_dup && zmax > 3.0) { ++n_removed; touched = true; continue; }
+      keep.push_back(c);
+    }
+    if (touched) { cs.swap(keep); ++n_bins_touched; }
+  }
+  verbose_message("Purify: removed %zu contaminant contig(s) from %zu bin(s)\n",
+                  n_removed, n_bins_touched);
+}
+
 static int rb_cmd_qc(int ac, char *av[]) {
   using namespace rb_amber;
 

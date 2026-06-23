@@ -772,6 +772,133 @@ std::string compute_depth_tsv_inmem(const StringVector &bamFilePaths,
   return tsv;
 }
 
+// ── Generic depth (BAM or CRAM), reference-aware ────────────────────────────
+// The fast in-mem path above reads raw BGZF records and is BAM-only. CRAM needs
+// the htslib codec + a reference, so this path uses the standard sam_open /
+// sam_read1 loop (per file, parallel across files). Slower than the sharded BAM
+// path but correct for CRAM and reference-validated BAM. Produces the same
+// MetaBAT/JGI depth table format.
+std::string compute_depth_tsv_generic(const StringVector &bamFilePaths,
+                                      float percentIdentity, int minContigLength,
+                                      float minContigDepth, int maxEdgeBases,
+                                      bool includeEdgeBases,
+                                      bool intraDepthVariance, int numThreads,
+                                      const std::string &referenceFasta) {
+  const int num_bams = (int)bamFilePaths.size();
+  if (num_bams < 1)
+    throw std::runtime_error("compute_depth_tsv_generic: no input files");
+  CheckRead::_edgeBases() = maxEdgeBases;
+  omp_set_dynamic(0);
+  const int minMapQual = 0;
+
+  auto open_with_ref = [&](const std::string &path) -> htsFile * {
+    htsFile *fp = sam_open(path.c_str(), "r");
+    if (fp && !referenceFasta.empty())
+      hts_set_fai_filename(fp, referenceFasta.c_str());
+    return fp;
+  };
+
+  // Consolidated header from the first file.
+  htsFile *hf0 = open_with_ref(bamFilePaths[0]);
+  if (!hf0) throw std::runtime_error("compute_depth_tsv_generic: cannot open " + bamFilePaths[0]);
+  bam_hdr_t *H = sam_hdr_read(hf0);
+  if (!H) { hts_close(hf0); throw std::runtime_error("compute_depth_tsv_generic: cannot read header"); }
+  const int32_t n_targets = H->n_targets;
+
+  BoolVector contigLengthPass(n_targets, false), contigDepthPass(n_targets, true);
+  for (int32_t i = 0; i < n_targets; i++)
+    contigLengthPass[i] = ((int)H->target_len[i] >= minContigLength);
+
+  CountTypeMatrix bamContigDepths(num_bams);
+  VarianceTypeMatrix bamContigVariances(num_bams);
+  std::vector<int> averageReadSize(num_bams, 0);
+  for (int bi = 0; bi < num_bams; bi++) {
+    bamContigDepths[bi].reset(new CountType[n_targets]());
+    if (intraDepthVariance) bamContigVariances[bi].assign(n_targets, VarianceType());
+  }
+
+  omp_set_num_threads(std::min(numThreads, num_bams));
+#pragma omp parallel for schedule(dynamic, 1)
+  for (int bi = 0; bi < num_bams; bi++) {
+    // Pass 1: sample average read length.
+    int avgRead = 0;
+    {
+      htsFile *fp = open_with_ref(bamFilePaths[bi]);
+      if (fp) {
+        bam_hdr_t *h = sam_hdr_read(fp);
+        if (h) {
+          bam1_t *b = bam_init1();
+          int64_t srs = 0, src = 0; const int kSample = 4000;
+          while (src < kSample && sam_read1(fp, h, b) >= 0)
+            if ((b->core.flag & BAM_FUNMAP) == 0) { srs += b->core.l_qseq; ++src; }
+          bam_destroy1(b);
+          avgRead = src ? (int)(srs / src) : 0;
+          bam_hdr_destroy(h);
+        }
+        hts_close(fp);
+      }
+    }
+    averageReadSize[bi] = avgRead;
+    const int edge = includeEdgeBases ? 0 : std::min(maxEdgeBases, avgRead / 3);
+
+    // Pass 2: accumulate per-contig depth.
+    htsFile *fp = open_with_ref(bamFilePaths[bi]);
+    if (!fp) continue;
+    bam_hdr_t *h = sam_hdr_read(fp);
+    if (!h) { hts_close(fp); continue; }
+    CountType *cd = bamContigDepths[bi].get();
+    DepthCounts none{};
+    bam1_t *b = bam_init1();
+    while (sam_read1(fp, h, b) >= 0) {
+      int32_t tid = b->core.tid;
+      if (tid < 0 || tid >= n_targets) continue;
+      if ((b->core.flag & BAM_FUNMAP) == 0 && b->core.pos < 0) continue;
+      if ((b->core.flag & (BAM_FPAIRED | BAM_FMUNMAP)) == BAM_FPAIRED &&
+          (b->core.mtid < 0 || b->core.mtid >= n_targets)) continue;
+      if (BamNameTrackingChooser::unsupportedRead(b)) continue;
+      if ((b->core.flag & BAM_FUNMAP) == BAM_FUNMAP || b->core.qual < minMapQual) continue;
+      if (!CheckRead::checkEnd(b, h)) {
+        b = CheckRead::fixEndClip(b, h);
+        if (!CheckRead::checkEnd(b, h)) continue;
+      }
+      ReadStatistics rs;
+      CountType ov = caldepth(b, none, h->target_len[tid], NULL, edge, &rs);
+      if (rs.isValid() && rs.getPctId() >= percentIdentity) cd[tid] += ov;
+    }
+    bam_destroy1(b);
+    bam_hdr_destroy(h);
+    hts_close(fp);
+  }
+
+  int minAvgRead = INT_MAX;
+  for (int bi = 0; bi < num_bams; bi++)
+    if (averageReadSize[bi] && minAvgRead > averageReadSize[bi]) minAvgRead = averageReadSize[bi];
+  if (minAvgRead == INT_MAX) minAvgRead = 0;
+
+  if (intraDepthVariance) {
+    for (int bi = 0; bi < num_bams; bi++) {
+      const int edge = includeEdgeBases ? 0 : std::min(maxEdgeBases, averageReadSize[bi] / 3);
+      const CountType *cd = bamContigDepths[bi].get();
+      auto &vars = bamContigVariances[bi];
+      for (int32_t t = 0; t < n_targets; t++) {
+        int32_t cl = H->target_len[t];
+        int32_t adj = (cl > 2 * edge + 1) ? (cl - 2 * edge) : cl;
+        vars[t].mean = (adj > 2) ? (float)((double)cd[t] / adj) : 0.0f;
+        vars[t].variance = 0.0f;
+      }
+    }
+  }
+
+  std::ostringstream out;
+  printDepthTable(out, bamFilePaths, intraDepthVariance, bamContigDepths,
+                  averageReadSize, percentIdentity, bamContigVariances,
+                  H, contigLengthPass, contigDepthPass, minContigDepth,
+                  includeEdgeBases, std::min(maxEdgeBases, minAvgRead / 3));
+  bam_hdr_destroy(H);
+  hts_close(hf0);
+  return out.str();
+}
+
 #ifndef RABBIT_DEPTH_NO_MAIN
 int main(int argc, char *argv[]) {
 

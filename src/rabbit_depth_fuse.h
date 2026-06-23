@@ -12,3 +12,12 @@ std::string compute_depth_tsv_inmem(const std::vector<std::string> &bamFilePaths
                                     float minContigDepth, int maxEdgeBases,
                                     bool includeEdgeBases,
                                     bool intraDepthVariance, int numThreads);
+
+// Generic BAM/CRAM, reference-aware depth (used for CRAM input or when a
+// reference is supplied). Same output format as compute_depth_tsv_inmem.
+std::string compute_depth_tsv_generic(const std::vector<std::string> &bamFilePaths,
+                                      float percentIdentity, int minContigLength,
+                                      float minContigDepth, int maxEdgeBases,
+                                      bool includeEdgeBases,
+                                      bool intraDepthVariance, int numThreads,
+                                      const std::string &referenceFasta);

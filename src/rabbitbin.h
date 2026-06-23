@@ -432,6 +432,36 @@ void rb_qc_score_membership(const std::vector<size_t> &mem,
 // membership (accepted bins share an id; leftovers get unique ids).
 void rb_qc_ensemble(const std::vector<std::vector<size_t>> &mems_all,
                     const Graph &g, std::vector<size_t> &out_membership);
+
+// ── Output-time annotation / purification / taxonomy / presets ─────────────
+static bool g_qc_annotate = false;         // --qc: completeness/contamination in bins.tsv
+static bool g_keep_hq_only = false;        // --keep-hq-only: drop sub-HQ bins
+static bool g_write_bioboxes = false;      // --bioboxes: also write <prefix>.binning
+static bool g_purify = false;              // --purify: SCG contamination removal
+static bool g_autotune = false;            // --autotune: SCG-driven multi-param search
+static double g_autotune_best_sil = 0.70;  // best split-silhouette found by --autotune
+static std::string g_taxonomy_file;        // --taxonomy: contig->lineage map
+static bool g_long_read = false;           // --long-read: long-read coverage preset
+static std::string g_reference_file;       // --reference: CRAM reference FASTA
+static std::string g_resolutions;          // --resolutions: e.g. "strict,relaxed"
+static double g_hq_comp = 90.0, g_hq_cont = 5.0;   // MIMAG HQ thresholds (%)
+static double g_mq_comp = 50.0, g_mq_cont = 10.0;  // MIMAG MQ thresholds (%)
+
+// Unified (large+small) per-contig marker map for output-time QC/purify; index
+// space matches BinMap entries (large: i<nobs; small: j+nobs).
+static std::vector<std::vector<int>> g_allcontig_markers;
+static std::vector<int> g_contig_taxon;            // unified index -> taxon id (-1=none)
+static std::vector<std::string> g_taxon_names;
+
+bool rb_load_markers_unified();            // fill g_allcontig_markers + g_marker_set_size
+bool rb_load_taxonomy_unified();           // fill g_contig_taxon + g_taxon_names
+// Per-bin SCG completeness/contamination (%) from g_allcontig_markers.
+void rb_bin_qc(const ContigVector &contigs, double &comp, double &cont);
+// Per-bin length-weighted majority lineage id (-1 if unknown).
+int  rb_bin_taxon(const ContigVector &contigs);
+// SCG-contamination-aware purification: drop depth-outlier contigs that carry
+// duplicated single-copy markers. Operates on cls in place.
+void rb_purify_bins(BinMap &cls);
 size_t calibrate_sim_cutoff(Distance coverage = 1., bool full = false);
 double cal_depth_corr(size_t r1, size_t r2, bool second_is_small = false,
                     bool first_is_centroid = false);
