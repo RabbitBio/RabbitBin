@@ -124,6 +124,30 @@ static bool        g_split_keep_coherent = true;
 // bins' coherences.  Lower = keep more partial-genome bins.  Default 10: "at
 // least as internally coherent as the bottom decile of confidently-sized bins".
 static double      g_split_coh_pct  = 10.0;
+// Conservative split guard (RABBIT_SPLIT_GUARD, default ON).  A large, internally
+// coherent bin is usually ONE near-complete genome.  The plain silhouette split
+// will happily cut it into two equally-coherent halves (silhouette only measures
+// separability, not whether the pieces are different GENOMES), dropping both
+// halves below the HQ completeness bar — a net loss of a near-complete MAG.  The
+// guard vetoes a proposed split of a >= g_split_guard_bp bin UNLESS the split
+// genuinely IMPROVES coherence: min(child_coh) >= parent_coh + g_split_guard_margin.
+// Separating two co-binned genomes makes the children tighter than the mixed
+// parent (passes); cutting one genome in half leaves children ~= parent (vetoed).
+// Data-agnostic: the bar is the bin's OWN coherence, not a per-dataset constant;
+// g_split_guard_bp is a genome-scale prior (bacterial genomes are Mb-scale).
+//
+// DEFAULT OFF.  Empirically (CAMI3 toy, 20 samples) the default abundance split
+// is already strongly net-beneficial (no-split 221 HQ → split 233 HQ), and this
+// guard HURTS (228 HQ): depth coherence cannot tell a beneficial STRAIN split
+// from a harmful genome halving — co-binned strains share near-identical depth
+// profiles, so the parent stays coherent and the (correct) strain split is
+// wrongly vetoed.  The "shattered large genomes" that motivated this were a
+// min-bin-size=42 artifact; in the default 50k config those genomes are already
+// recovered.  Kept as an opt-in knob (RABBIT_SPLIT_GUARD=1) for experimentation;
+// a useful version would need a COMPOSITION (k-mer) criterion, not depth.
+static bool        g_split_guard       = false;
+static size_t      g_split_guard_bp    = 1000000;  // only guard bins >= 1 Mb
+static double      g_split_guard_margin = 0.05;     // required coherence gain
 // Raw per-sample mean depths of small contigs, snapshotted BEFORE small_depth_matrix is
 // rank-transformed in place during recruitment, so marker_guided_split sees the
 // same coverage values as the large-contig depth_matrix (means, not ranks).
@@ -169,6 +193,17 @@ static std::vector<double> g_depth_colnorm;        // num_depth_samples (empty =
 // single length-S FMA dot product instead of the per-pair Welford (3 divisions /
 // sample + 2 sqrt / pair).  Built once after depth_matrix is rank-transformed.
 static std::vector<float>  g_depth_unit;           // nobs × num_depth_samples (unit ranks)
+
+// ── Cache-mode staging (Priority 2) ────────────────────────────────────────
+// rb_load_cache() populates these graph arrays (the Graph object is not yet
+// constructed at load time); the do-block in main() moves them into Graph g.
+// g_cache_seed / g_cache_has_depth carry the build-time seed + depth flag so a
+// --load-cache run reproduces the cached run unless the user overrides --seed.
+static std::vector<size_t>         g_cache_from;
+static std::vector<size_t>         g_cache_to;
+static std::vector<StoredDistance> g_cache_scomp;
+static unsigned long long          g_cache_seed = 0;
+static bool                        g_cache_has_depth = false;
 
 // Minimum similarity floor (×1000) used during auto-calibration.
 // Sketch Jaccard on short metagenomic contigs typically spans 0–0.3.
@@ -302,6 +337,21 @@ static double rb_env_split_coh_pct() {
   if (!e) return 10.0;
   double v = std::atof(e);
   return v < 0.0 ? 0.0 : (v > 100.0 ? 100.0 : v);
+}
+static bool rb_env_split_guard() {
+  const char *e = rb_getenv("RABBIT_SPLIT_GUARD");
+  return e && e[0] != '0';            // default OFF; opt-in via RABBIT_SPLIT_GUARD=1
+}
+static size_t rb_env_split_guard_bp() {
+  const char *e = rb_getenv("RABBIT_SPLIT_GUARD_BP");
+  if (!e) return 1000000;
+  long v = std::atol(e);
+  return v < 0 ? 0 : (size_t)v;
+}
+static double rb_env_split_guard_margin() {
+  const char *e = rb_getenv("RABBIT_SPLIT_GUARD_MARGIN");
+  if (!e) return 0.05;
+  return std::atof(e);
 }
 static bool rb_env_depth_prefilter_on() {
   const char *e = rb_getenv("RABBIT_DEPTH_PREFILTER");
@@ -2348,6 +2398,9 @@ static std::vector<int> rb_kmeans(const std::vector<std::vector<float>> &X,
 // ── split helpers (before main) ──────────────────────────────────────────
 #include "impl/rb_split.cpp"
 
+// ── cache I/O (before main; used by both the save hook and the load path) ──
+#include "impl/rb_cache.cpp"
+
 // main
 // ═══════════════════════════════════════════════════════════════════════════
 int main(int ac, char *av[]) {
@@ -2357,6 +2410,8 @@ int main(int ac, char *av[]) {
       ("assembly,a", po::value<std::string>(&inFile), "Contig FASTA assembly (gzip ok) [required]")
       ("output,o", po::value<std::string>(&outFile), "Output path prefix [required]")
       ("depth,d", po::value<std::string>(&depth_file), "Coverage depth TSV")
+      ("save-cache", po::value<std::string>(&cache_save_file), "Write a re-binning cache after the similarity graph is built, then continue normally")
+      ("load-cache", po::value<std::string>(&cache_load_file), "Re-bin from a cache (skips parse/sketch/depth/graph); only cheap params (min-bin-size, split-silhouette, min-edge-score, ...) take effect")
       ("min-contig,m", po::value<size_t>(&minContig)->default_value(2500), "Minimum contig length (>=1500)")
       ("min-small-contig", po::value<size_t>(&min_small_contig)->default_value(1000), "Min length for small-contig recruiting")
       ("max-posterior", po::value<Similarity>(&calib_connected_pct)->default_value(95), "Well-connected contig percent for calibration")
@@ -2418,19 +2473,46 @@ int main(int ac, char *av[]) {
 #endif
   po::notify(vm);
 
+  // Whether the user explicitly passed --seed (vs the default 0). In cache-load
+  // mode this decides whether to reproduce the cached run's seed or honour an
+  // override supplied on the rebin command line.
+  const bool user_set_seed = vm.count("seed") && !vm["seed"].defaulted();
+
   // Per-bin FASTA is off by default; --bin-fasta re-enables it (and so keeps
   // sequences resident for the output stage).
   if (binFastaWanted) noBinOut = false;
 
-  if (vm.count("help") || inFile.empty() || outFile.empty()) {
+  // In --load-cache mode the assembly is not re-read; only the output prefix is
+  // required (contig names/lengths/depth/graph all come from the cache).
+  const bool need_assembly = cache_load_file.empty();
+  if (vm.count("help") || (need_assembly && inFile.empty()) || outFile.empty()) {
     cerr << "\nRabbitBin: sketch-based metagenome binning "
             "(version " << version << "; " << DATE << ")\n\n";
     cerr << desc << "\n\n";
     if (!vm.count("help")) {
-      if (inFile.empty())  cerr << "[Error!] --assembly is required\n";
+      if (need_assembly && inFile.empty())
+        cerr << "[Error!] --assembly is required\n";
       if (outFile.empty()) cerr << "[Error!] --output is required\n";
     }
     return vm.count("help") ? 0 : 1;
+  }
+
+  // ── Cache-mode mutual exclusions ──────────────────────────────────────────
+  if (!cache_load_file.empty()) {
+    if (!cache_save_file.empty()) {
+      cerr << "[Error!] --load-cache and --save-cache are mutually exclusive\n";
+      return 1;
+    }
+    if (!depth_file.empty()) {
+      cerr << "[Error!] --load-cache and --depth are mutually exclusive\n";
+      return 1;
+    }
+#ifdef RABBITBIN_FUSE
+    if (!fuse_bams.empty()) {
+      cerr << "[Error!] --load-cache and --bam are mutually exclusive\n";
+      return 1;
+    }
+#endif
   }
 
   if (quiet && verbose)  verbose = false;
@@ -2542,10 +2624,30 @@ int main(int ac, char *av[]) {
   }
 #endif
 
+  // ── Cache-mode dispatch ───────────────────────────────────────────────────
+  // from_cache: skip the entire expensive feature-construction region below
+  // (parse / depth / sketch / similarity graph) and restore that state from the
+  // cache instead, then fall through to the cheap re-binning tail.
+  const bool from_cache = !cache_load_file.empty();
+  if (from_cache) {
+    verbose_message("Loading cache %s [%.1fGb / %.1fGb]\n", cache_load_file.c_str(),
+                    getUsedPhysMem(), getTotalPhysMem() / 1024 / 1024);
+    if (!rb_load_cache(cache_load_file)) return 1;
+    has_depth = g_cache_has_depth;
+    if (!user_set_seed) seed = g_cache_seed;  // reproduce cached run by default
+    srand(seed);
+    g_inv_one_minus_b0 = (g_pmh_baseline > 0.0 && g_pmh_baseline < 1.0)
+                             ? (1.0 / (1.0 - g_pmh_baseline)) : 1.0;
+    verbose_message("Cache loaded: nobs=%zu nobs1=%zu samples=%zu edges=%zu "
+                    "seed=%llu [%.1fGb / %.1fGb]\n",
+                    nobs, nobs1, num_depth_samples, g_cache_from.size(), seed,
+                    getUsedPhysMem(), getTotalPhysMem() / 1024 / 1024);
+  } else
   // ── Validate FASTA / depth files ─────────────────────────────────────────
   // depth_future: async pre-parse of the depth_matrix file into a name→values map.
   // Launched immediately after the header scan so it runs in parallel with
   // the FASTA decompression (the main bottleneck).
+  {
   using DepthMap = phmap::flat_hash_map<std::string, RawDepthEntry>;
   std::future<DepthMap> depth_future;
   {
@@ -3248,6 +3350,7 @@ int main(int ac, char *av[]) {
       small_depth_matrix.resize(nobs1, 1, false);
     }
   }
+  }  // end else (non-cache feature construction)
 
   verbose_message("Number of target contigs: %d of large (>= %d) and %d of "
                   "small ones (>=%d & <%d). \n",
@@ -3264,7 +3367,7 @@ int main(int ac, char *av[]) {
   // insert each sketch's (bucket, min-value) keys directly into a per-thread
   // phmap accumulator here, so the index is fully populated by the time sketch
   // building finishes.  This eliminates the separate N × m skKeys array.
-  const bool build_index = []() -> bool {
+  const bool build_index = !from_cache && []() -> bool {
     const char *e = rb_getenv("RABBIT_GRAPH_INDEX");
     return e && e[0] == '1';
   }();
@@ -3285,6 +3388,9 @@ int main(int ac, char *av[]) {
   g_depth_wjac_gate = rb_env_depth_wjac_gate();
   g_split_keep_coherent = rb_env_split_keep_coherent();
   g_split_coh_pct = rb_env_split_coh_pct();
+  g_split_guard = rb_env_split_guard();
+  g_split_guard_bp = rb_env_split_guard_bp();
+  g_split_guard_margin = rb_env_split_guard_margin();
   g_mutual_knn  = rb_env_mutual_knn_on();
   g_neg_depth_thr = rb_env_neg_depth_thr();
   g_edge_power  = [] { const char *e = rb_getenv("RABBIT_EDGE_POWER"); double v = e ? std::atof(e) : 1.0;
@@ -3297,8 +3403,8 @@ int main(int ac, char *av[]) {
   // end of the sketch section).  Building it costs the full 64-bit winner array
   // + ~m hash-map insertions per contig, all immediately discarded, so it is
   // OFF unless RABBIT_PMH_INDEX is set.
-  const bool pmh_index_on = g_pmh_mode && (getenv("RABBIT_PMH_INDEX") != nullptr);
-  if (g_pmh_mode) {
+  const bool pmh_index_on = g_pmh_mode && !from_cache && (getenv("RABBIT_PMH_INDEX") != nullptr);
+  if (g_pmh_mode && !from_cache) {
     g_pmh_m    = sketch_size;
     g_inv_pmh_m = (g_pmh_m > 0) ? (1.0 / (double)g_pmh_m) : 0.0;
     g_pmh_seed = 42;
@@ -3364,6 +3470,11 @@ int main(int ac, char *av[]) {
 
   // Snapshot raw per-sample mean depths BEFORE the loop below rank-transforms
   // depth_matrix in place (Fusion E / Spearman). marker_guided_split needs raw means.
+  // The whole block below (snapshots + per-contig sketch/rank loop) is the
+  // expensive feature construction; in --load-cache mode it is restored from the
+  // cache (g_large_means/g_depth_raw cached, depth_matrix already ranked) so it
+  // is skipped entirely.
+  if (!from_cache) {
   if ((!marker_seed_file.empty() || g_split_abundance) && num_depth_samples >= 1) {
     g_large_means.assign((size_t)nobs * num_depth_samples, 0.0f);
     for (size_t r = 0; r < nobs; ++r)
@@ -3459,6 +3570,7 @@ int main(int ac, char *av[]) {
       }
     }
   }
+  }  // end if (!from_cache): snapshots + sketch/rank loop
 
   // Finalise the index (merge thread maps, remove singletons, CSR flatten).
   if (build_index) {
@@ -3488,7 +3600,7 @@ int main(int ac, char *av[]) {
   if (num_depth_samples > 1) verbose_message("Calculated spearman for large contigs\n");
 
   rb_phase("parse+sketch done");
-  rb_seq_integrity_check("post-parse");
+  if (!from_cache) rb_seq_integrity_check("post-parse");
 
   // Precompute per-contig abundance non-zero flags so is_nz() in the O(N²)
   // graph loop reduces to two byte loads instead of an num_depth_samples matrix scan.
@@ -3521,7 +3633,9 @@ int main(int ac, char *av[]) {
 
   // Estimate the winner-match baseline b0 before calibration so that both the
   // pSim auto-calibration and the graph edge weights see the stretched scale.
-  if (g_pmh_mode && g_pmh_base_on) {
+  // In --load-cache mode b0 (and g_inv_one_minus_b0) were restored from the
+  // cache, and the winner array is gone, so skip re-estimation.
+  if (g_pmh_mode && g_pmh_base_on && !from_cache) {
     g_pmh_baseline = estimate_pmh_baseline(nobs);
     g_inv_one_minus_b0 = (g_pmh_baseline < 1.0)
                          ? (1.0 / (1.0 - g_pmh_baseline)) : 1.0;
@@ -3565,7 +3679,16 @@ int main(int ac, char *av[]) {
       // simultaneously accumulates calibration maxsim[] and per-contig
       // neighbor heaps, then calibrates, then emits edges.
       // Replaces 771M (calib) + 475M (graph) = 1,246M pair-sims with 475M.
-      if (simCutoff < 1. && g_pmh_mode && nobs > 25000) {
+      if (from_cache) {
+        // Topology (from/to/sComp) was loaded from the cache; calibration is
+        // already baked into simCutoff/g_pmh_baseline. Skip the O(N^2) build.
+        g.from  = std::move(g_cache_from);
+        g.to    = std::move(g_cache_to);
+        g.sComp = std::move(g_cache_scomp);
+        verbose_message("Reusing cached similarity graph: %zu edges "
+                        "[%.1fGb / %.1fGb]\n", g.getEdgeCount(),
+                        getUsedPhysMem(), getTotalPhysMem() / 1024 / 1024);
+      } else if (simCutoff < 1. && g_pmh_mode && nobs > 25000) {
         simCutoff = gen_fused_calib_graph(g, calib_connected_pct);
       } else {
         // ── Original sequential path (non-PMH, manual simCutoff, or small N) ──
@@ -3584,6 +3707,18 @@ int main(int ac, char *av[]) {
             "[%.1fGb / %.1fGb]                                            \n",
             simCutoff / 10., getUsedPhysMem(), getTotalPhysMem() / 1024 / 1024);
         build_similarity_graph(g, simCutoff / 1000.);
+      }
+
+      // ── Save hook: persist the post-graph state, then continue normally so
+      // the same invocation also emits its bins. ───────────────────────────
+      if (!cache_save_file.empty()) {
+        verbose_message("Writing re-binning cache to %s [%.1fGb / %.1fGb]\n",
+                        cache_save_file.c_str(), getUsedPhysMem(),
+                        getTotalPhysMem() / 1024 / 1024);
+        if (rb_write_cache(cache_save_file, g, has_depth))
+          verbose_message("Cache written (%zu edges).\n", g.getEdgeCount());
+        else
+          cerr << "[Warn] failed to write cache: " << cache_save_file << "\n";
       }
 
       // ── --no_gold: label-free multi-resolution auto-selection ─────────────

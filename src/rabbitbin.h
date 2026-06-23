@@ -119,6 +119,14 @@ static size_t min_bin_bp = 50000;
 static size_t minContig = 2500; // minimum contig size for binning
 static std::string inFile;
 static std::string depth_file;
+// Cache mode (Priority 2): --save-cache writes the post-graph state to disk
+// after the expensive feature construction (parse/sketch/depth/graph) and then
+// continues normally; --load-cache skips all of that and re-runs only the cheap
+// tail (edgeScore -> incidence -> label propagation -> recruit -> split ->
+// output) so parameter sweeps (min-bin-size, split-silhouette, min-edge-score,
+// etc.) cost seconds instead of a full rebuild.
+static std::string cache_save_file;
+static std::string cache_load_file;
 #ifdef RABBITBIN_FUSE
 // Fused build only: compute depth in-process from sorted BAMs (no temp file) so
 // BAM decompression overlaps the FASTA/sketch pass. These mirror the
@@ -397,6 +405,10 @@ struct CompareEdge {
 
 void promote_singleton_bins(BinMap &cls);
 void output_bins(BinMap &cls);
+// Cache mode I/O (impl/rb_cache.cpp). rb_write_cache snapshots the post-graph
+// state; rb_load_cache restores it into the globals + the graph staging arrays.
+bool rb_write_cache(const std::string &path, const Graph &g, bool has_depth);
+bool rb_load_cache(const std::string &path);
 size_t calibrate_sim_cutoff(Distance coverage = 1., bool full = false);
 double cal_depth_corr(size_t r1, size_t r2, bool second_is_small = false,
                     bool first_is_centroid = false);
