@@ -192,7 +192,7 @@ rabbitbin bin --fasta contigs.fa --depth depth.tsv \
 | `--bam` / `--bam-list` | — | Sorted BAM input (compute depth in-process) |
 | `-t, --threads` | 0 (all) | Worker threads |
 | `-m, --min-contig` | 2500 | Minimum contig length (≥1500) |
-| `-s, --min-bin-size` | 50000 | Minimum output bin size (bp) — *cheap, cache-friendly* |
+| `-s, --min-bin-size` | 200000 | Minimum output bin size (bp) — *cheap, cache-friendly* |
 | `--min-edge-score` | 60 | Minimum graph edge weight (1–99) — *cheap, cache-friendly* |
 | `--split-silhouette` | env | Abundance-split silhouette threshold — *cheap, cache-friendly* |
 | `--no-split` | off | Disable abundance bin splitting |
