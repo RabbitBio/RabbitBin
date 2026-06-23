@@ -280,7 +280,29 @@ static void abundance_guided_split(BinMap &cls) {
       continue;
     }
     std::vector<ContigVector> sub;
-    if (split_bin(contigs, bi, sub)) {
+    bool do_split = split_bin(contigs, bi, sub);
+    // ── Conservative split guard for large, internally-coherent bins ─────────
+    // A >= g_split_guard_bp bin is usually one near-complete genome.  Veto the
+    // proposed split unless it IMPROVES coherence (min child coherence exceeds
+    // the parent's by g_split_guard_margin) — i.e. it separated two co-binned
+    // genomes rather than cutting one genome in half.  Needs the same multi-
+    // sample coherence machinery as the retention gate; otherwise behaviour is
+    // unchanged.  Cost: a few bin_coherence calls on the rare large split
+    // candidates only (O(64^2 * S) each), so no measurable runtime impact.
+    if (do_split && g_split_guard && coh_gate &&
+        bin_bp(contigs) >= g_split_guard_bp) {
+      double pc = bin_coherence(contigs);
+      if (pc > -1.5) {                                // parent coherence usable
+        double min_child = 2.0;
+        for (auto &s : sub) {
+          if (s.empty()) continue;
+          double cc = bin_coherence(s);              // -2 (unscoreable) → veto
+          if (cc < min_child) min_child = cc;
+        }
+        if (!(min_child >= pc + g_split_guard_margin)) do_split = false;
+      }
+    }
+    if (do_split) {
       for (auto &s : sub) {
         if (s.empty()) continue;
         if (bin_bp(s) < min_bin_bp) continue;        // legacy sub-product drop
