@@ -32,12 +32,58 @@ message("Boost libraries:" ${Boost_LIBRARIES})
 message("Boost lib ver:" ${Boost_LIB_VERSION})
 message("Boost lib dir:" ${Boost_LIBRARY_DIRS})
 
-# RabbitBin: sketch-based metagenome binning
-add_executable(rabbitbin rabbitbin.cpp probmh.cpp)
+# ── Vendored RabbitBAM parallel BAM reader ──────────────────────────────────
+# The minimal read path of RabbitBAM (BamReader + its block pipeline) under
+# src/rabbitbam/ parallelises BGZF block decompression within a single BAM.
+# Used by both rabbit_depth (standalone) and rabbitbin (in-process BAM→depth).
+# Disable with -DRABBITBIN_USE_VENDORED_BAM=OFF.
+option(RABBITBIN_USE_VENDORED_BAM "Use the vendored RabbitBAM parallel reader" ON)
+find_library(DEFLATE_LIB NAMES deflate)
+if(RABBITBIN_USE_VENDORED_BAM AND DEFLATE_LIB)
+  file(GLOB RABBITBAM_SRC ${CMAKE_CURRENT_SOURCE_DIR}/rabbitbam/*.cpp)
+endif()
+
+# RabbitBin: sketch-based metagenome binning.
+# Inputs may be a depth TSV (--depth) OR sorted BAM(s) (positional / --bam): when
+# BAMs are given, rabbitbin computes coverage depth in-process (rabbit_depth.cpp
+# linked in with its main() dropped via RABBIT_DEPTH_NO_MAIN — the only symbol
+# the two .cpp files share) so BAM decompression overlaps the FASTA/sketch pass
+# and no depth file is written. Falls back to depth-file mode when libdeflate is
+# absent. The standalone rabbit_depth binary is built from the same source
+# without RABBIT_DEPTH_NO_MAIN, so its behavior is unchanged.
+set(RABBITBIN_SRC rabbitbin.cpp probmh.cpp)
+set(RABBITBIN_CAN_FUSE FALSE)
+if(DEFLATE_LIB)
+  list(APPEND RABBITBIN_SRC rabbit_depth.cpp)
+  if(RABBITBIN_USE_VENDORED_BAM)
+    list(APPEND RABBITBIN_SRC ${RABBITBAM_SRC})
+  endif()
+  set(RABBITBIN_CAN_FUSE TRUE)
+endif()
+
+add_executable(rabbitbin ${RABBITBIN_SRC})
 if(NOT "${EXTRA_DEPENDENCIES}" STREQUAL "")
   add_dependencies(rabbitbin ${EXTRA_DEPENDENCIES})
 endif()
 target_link_libraries(rabbitbin ${ZLIB_LIBRARIES} ${Boost_LIBRARIES} ${EXTRALIBS} RabbitBin_VERSION_LIB deflate)
+if(RABBITBIN_CAN_FUSE)
+  # RABBITBIN_FUSE      → rabbitbin.cpp enables the BAM input path
+  # RABBIT_DEPTH_NO_MAIN→ rabbit_depth.cpp drops main() (only shared symbol)
+  # USE_RABBITBAM       → rabbit_depth.cpp/rabbitbam parallel reader
+  # These are TARGET-scoped (not set_source_files_properties, which would leak
+  # onto the standalone rabbit_depth target sharing rabbit_depth.cpp). Each .cpp
+  # ignores macros it does not reference.
+  target_compile_definitions(rabbitbin PRIVATE RABBITBIN_FUSE RABBIT_DEPTH_NO_MAIN)
+  target_include_directories(rabbitbin PRIVATE ${HTSlib_INCLUDE_DIRS})
+  target_link_libraries(rabbitbin ${HTSlib_LIBRARIES})
+  if(RABBITBIN_USE_VENDORED_BAM)
+    target_compile_definitions(rabbitbin PRIVATE USE_RABBITBAM)
+    target_include_directories(rabbitbin PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/rabbitbam)
+  endif()
+  message(STATUS "rabbitbin: in-process BAM→depth enabled (BAM input auto-detected)")
+else()
+  message(STATUS "rabbitbin: libdeflate not found; BAM input disabled (depth-file only)")
+endif()
 
 # ── ISA-L (igzip) fast gzip inflate for the streaming large-.gz reader ──────
 # Optional: when libisal + igzip_lib.h are found, the streaming FASTA reader's
@@ -131,19 +177,11 @@ foreach(target ${targets})
    target_link_libraries(${target} ${HTSlib_LIBRARIES} ${ZLIB_LIBRARIES} ${Boost_LIBRARIES} RabbitBin_VERSION_LIB) 
 endforeach()
 
-# ── Vendored RabbitBAM parallel BAM reader (built into rabbit_depth) ────────
-# Only the minimal read path of RabbitBAM (BamReader + its block pipeline) is
-# vendored under src/rabbitbam/ — none of the writer / QC / dedup bloat. It
-# parallelises BGZF block decompression within a single BAM, removing the
-# serial-decompress bottleneck of the depth stage (the old code only
-# parallelised ACROSS bam files, leaving cores idle for single/few-bam runs).
-# BamReader::getBam1_t() yields records in the SAME order as sam_read1, so the
-# emitted depth table is byte-identical. Compiled directly in (no external .so,
-# no RABBITBAM_ROOT). Disable with -DRABBITBIN_USE_VENDORED_BAM=OFF.
-option(RABBITBIN_USE_VENDORED_BAM "Use the vendored RabbitBAM parallel reader in rabbit_depth" ON)
-find_library(DEFLATE_LIB NAMES deflate)
+# ── Vendored RabbitBAM parallel reader for the standalone rabbit_depth ──────
+# Same vendored reader configured above for rabbitbin; here it is added to the
+# standalone rabbit_depth binary. BamReader::getBam1_t() yields records in the
+# SAME order as sam_read1, so the emitted depth table is byte-identical.
 if(RABBITBIN_USE_VENDORED_BAM AND DEFLATE_LIB)
-  file(GLOB RABBITBAM_SRC ${CMAKE_CURRENT_SOURCE_DIR}/rabbitbam/*.cpp)
   message(STATUS "rabbit_depth: vendored RabbitBAM parallel reader enabled")
   target_sources(rabbit_depth PRIVATE ${RABBITBAM_SRC})
   target_compile_definitions(rabbit_depth PRIVATE USE_RABBITBAM)
@@ -158,61 +196,3 @@ endif()
 install(TARGETS ${targets}
         DESTINATION bin/
        )
-
-# ── rabbitbin_fuse: single-process BAM → depth → binning ────────────────────
-# Fuses the depth summarizer (rabbit_depth.cpp, main guarded out via
-# RABBIT_DEPTH_NO_MAIN) into the binning program so BAM decompression overlaps
-# the FASTA/sketch pass and no depth TSV is written to disk. The standalone
-# `rabbitbin` and `rabbit_depth` binaries above are built from the same sources
-# WITHOUT these defines, so their behavior is unchanged. The only shared global
-# symbol between the two .cpp files is main(), which the define removes.
-if(DEFLATE_LIB)
-  add_executable(rabbitbin_fuse rabbitbin.cpp probmh.cpp rabbit_depth.cpp)
-  if(NOT "${EXTRA_DEPENDENCIES}" STREQUAL "")
-    add_dependencies(rabbitbin_fuse ${EXTRA_DEPENDENCIES})
-  endif()
-  # Target-wide defines (NOT set_source_files_properties, which would leak onto
-  # the standalone rabbit_depth/rabbitbin targets that share these sources):
-  #   RABBITBIN_FUSE      → rabbitbin.cpp enables the --bam in-process path
-  #   RABBIT_DEPTH_NO_MAIN→ rabbit_depth.cpp drops its main() (only shared symbol)
-  #   USE_RABBITBAM       → rabbit_depth.cpp/rabbitbam parallel reader
-  # Each .cpp ignores the macros it does not reference, so this is safe.
-  target_compile_definitions(rabbitbin_fuse PRIVATE RABBITBIN_FUSE RABBIT_DEPTH_NO_MAIN)
-  target_include_directories(rabbitbin_fuse PRIVATE
-    ${HTSlib_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/rabbitbam)
-  target_link_libraries(rabbitbin_fuse
-    ${HTSlib_LIBRARIES} ${ZLIB_LIBRARIES} ${Boost_LIBRARIES} ${EXTRALIBS}
-    RabbitBin_VERSION_LIB ${DEFLATE_LIB})
-
-  # Vendored RabbitBAM parallel reader (same as rabbit_depth) for the fast path.
-  if(RABBITBIN_USE_VENDORED_BAM)
-    target_sources(rabbitbin_fuse PRIVATE ${RABBITBAM_SRC})
-    target_compile_definitions(rabbitbin_fuse PRIVATE USE_RABBITBAM)
-  endif()
-
-  # Match rabbitbin codegen so the binning half is identical (AVX-512 / LTO).
-  if(COMPILER_SUPPORTS_MARCH_NATIVE)
-    target_compile_options(rabbitbin_fuse PRIVATE -march=native)
-  elseif(COMPILER_SUPPORTS_AVX2)
-    target_compile_options(rabbitbin_fuse PRIVATE -mavx2)
-  endif()
-  if(COMPILER_SUPPORTS_LTO)
-    target_compile_options(rabbitbin_fuse PRIVATE -flto)
-    target_link_options(rabbitbin_fuse PRIVATE -flto)
-    if(COMPILER_SUPPORTS_MARCH_NATIVE)
-      target_link_options(rabbitbin_fuse PRIVATE -march=native)
-    endif()
-  endif()
-  if(ISAL_LIB AND ISAL_INCLUDE_DIR)
-    target_compile_definitions(rabbitbin_fuse PRIVATE USE_IGZIP)
-    target_include_directories(rabbitbin_fuse PRIVATE ${ISAL_INCLUDE_DIR})
-    target_link_libraries(rabbitbin_fuse ${ISAL_LIB})
-  endif()
-  if(NUMA_LIB AND NUMA_INCLUDE_DIR)
-    target_compile_definitions(rabbitbin_fuse PRIVATE HAVE_LIBNUMA)
-    target_include_directories(rabbitbin_fuse PRIVATE ${NUMA_INCLUDE_DIR})
-    target_link_libraries(rabbitbin_fuse ${NUMA_LIB})
-  endif()
-  install(TARGETS rabbitbin_fuse DESTINATION bin/)
-  message(STATUS "rabbitbin_fuse: fused BAM→depth→binning enabled")
-endif()

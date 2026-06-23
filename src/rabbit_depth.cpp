@@ -615,12 +615,12 @@ static void process_depth_shard(const DepthShard &sh,
   hts_close(fp);
 }
 
-// ── In-memory depth (fused rabbitbin_fuse path) ─────────────────────────────
+// ── In-memory depth (fused rabbitbin BAM-input path) ────────────────────────
 // Produces the EXACT same MetaBAT-format depth TSV that the standalone
 // rabbit_depth plain sharded fast path writes, but returns it as a string with
 // no temp file. Mirrors main()'s fast path step-for-step using the same
 // primitives (openBam header, parse_bai_first_voffs, process_depth_shard,
-// printDepthTable) so the bytes are identical by construction. rabbitbin_fuse
+// printDepthTable) so the bytes are identical by construction. rabbitbin
 // runs this inside a std::async so BAM decompression overlaps the binning
 // FASTA/sketch pass; the result is parsed exactly like a depth file, so binning
 // output is unchanged. Verified byte-identical to the standalone depth file.

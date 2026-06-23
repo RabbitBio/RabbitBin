@@ -2397,10 +2397,11 @@ int main(int ac, char *av[]) {
        "Mutually exclusive with --depth. BAMs may also be given positionally.")
       ("percent-identity", po::value<int>(&fuse_pctid)->default_value(97),
        "[--bam] Min mapped-read percent identity")
-      ("min-contig-length", po::value<int>(&fuse_min_contig_len)->default_value(1000),
-       "[--bam] Min contig length emitted into depth")
-      ("min-contig-depth", po::value<double>(&fuse_min_contig_depth)->default_value(1.0),
-       "[--bam] Min contig depth emitted into depth")
+      ("min-contig-length", po::value<int>(&fuse_min_contig_len)->default_value(1),
+       "[--bam] Min contig length emitted into depth (rabbit_depth default; "
+       "rabbitbin applies its own --min-contig / small-contig filters downstream)")
+      ("min-contig-depth", po::value<double>(&fuse_min_contig_depth)->default_value(0.0),
+       "[--bam] Min contig depth emitted into depth (rabbit_depth default)")
       ("max-edge-bases", po::value<int>(&fuse_max_edge)->default_value(75),
        "[--bam] Max edge bases trimmed per contig end")
 #endif
@@ -2408,7 +2409,7 @@ int main(int ac, char *av[]) {
 
   po::variables_map vm;
 #ifdef RABBITBIN_FUSE
-  // Allow `rabbitbin_fuse -a asm -o out bam1 bam2 ...` (BAMs positional).
+  // Allow `rabbitbin -a asm -o out bam1 bam2 ...` (BAMs positional → fuse path).
   po::positional_options_description pos;
   pos.add("bam", -1);
   po::store(po::command_line_parser(ac, av).options(desc).positional(pos).run(), vm);
