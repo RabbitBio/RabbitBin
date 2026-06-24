@@ -61,6 +61,42 @@ if(DEFLATE_LIB)
   set(RABBITBIN_CAN_FUSE TRUE)
 endif()
 
+# ── Vendored strobealign alignment engine (MIT, Kristoffer Sahlin) ──────────
+# src/align/strobe/ holds the strobealign 0.17.0 alignment engine (randstrobe
+# seeding + collinear chaining + SSW extension), used as the rabbitbin `map`
+# backend (far faster AND higher binning quality than the legacy minimizer
+# seed-and-extend). Only the ENGINE is vendored; FASTQ/SAM IO, the CLI and the
+# producer-consumer pipeline are rabbitbin's own. Built as a separate static lib
+# (no LTO, own -march=native) and linked into rabbitbin. Disable with
+# -DRABBITBIN_ENABLE_STROBE=OFF.
+option(RABBITBIN_ENABLE_STROBE "Build the vendored strobealign map engine" ON)
+include(CheckCXXCompilerFlag)
+set(RABBITBIN_STROBE_OK FALSE)
+if(RABBITBIN_ENABLE_STROBE AND HTSlib_FOUND)
+  # Engine only: exclude the file-IO modules (iowrap/fastq need ISA-L; rabbitbin
+  # supplies its own FASTQ reader). refs.cpp (zstr .gz FASTA + to_uppercase) and
+  # io.cpp (binary index r/w) are light and kept.
+  file(GLOB STROBE_SRC ${CMAKE_CURRENT_SOURCE_DIR}/align/strobe/*.cpp)
+  list(FILTER STROBE_SRC EXCLUDE REGEX "/(iowrap|fastq)\\.cpp$")
+  add_library(strobe_engine STATIC
+    ${STROBE_SRC}
+    ${CMAKE_CURRENT_SOURCE_DIR}/align/strobe/ext/ssw/ssw.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/align/strobe/ext/ssw/ssw_cpp.cpp)
+  target_include_directories(strobe_engine PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/align/strobe
+    ${CMAKE_CURRENT_SOURCE_DIR}/align/strobe/ext
+    ${CMAKE_CURRENT_SOURCE_DIR}/align/strobe/ext/zstr/src)
+  target_compile_features(strobe_engine PUBLIC cxx_std_17)
+  find_package(Threads REQUIRED)
+  target_link_libraries(strobe_engine PUBLIC Threads::Threads ${ZLIB_LIBRARIES})
+  check_cxx_compiler_flag("-march=native" STROBE_MARCH_NATIVE)
+  if(STROBE_MARCH_NATIVE)
+    target_compile_options(strobe_engine PRIVATE -march=native)
+  endif()
+  set(RABBITBIN_STROBE_OK TRUE)
+  message(STATUS "rabbitbin: vendored strobealign map engine enabled")
+endif()
+
 # ── align / sort / index subcommands (rabbitbin map / bwa / sortbam / bai) ──
 # Self-contained CPU aligner (src/align), coordinate sort (src/bamsort), and
 # BAI index (src/bamindex), fused by src/rb_map.cpp. Needs htslib (BAM/BGZF
@@ -73,6 +109,9 @@ if(RABBITBIN_ENABLE_MAP AND HTSlib_FOUND)
     align/rb_align.cpp align/sa_index.cpp align/sa_map.cpp
     bamsort/rb_sort.cpp
     bamindex/rb_index.cpp)
+  if(RABBITBIN_STROBE_OK)
+    list(APPEND RABBITBIN_SRC align/rb_strobe.cpp)
+  endif()
   set(RABBITBIN_MAP_OK TRUE)
 endif()
 
@@ -88,6 +127,14 @@ if(RABBITBIN_MAP_OK)
     ${CMAKE_CURRENT_SOURCE_DIR}/align
     ${CMAKE_CURRENT_SOURCE_DIR}/bamsort)
   target_link_libraries(rabbitbin ${HTSlib_LIBRARIES} ${ZLIB_LIBRARIES})
+  if(RABBITBIN_STROBE_OK)
+    target_compile_definitions(rabbitbin PRIVATE RABBITBIN_ENABLE_STROBE)
+    target_include_directories(rabbitbin PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/align/strobe
+      ${CMAKE_CURRENT_SOURCE_DIR}/align/strobe/ext
+      ${CMAKE_CURRENT_SOURCE_DIR}/align/strobe/ext/zstr/src)
+    target_link_libraries(rabbitbin strobe_engine)
+  endif()
   message(STATUS "rabbitbin: align/sort/index subcommands enabled (map/bwa/sortbam/bai)")
 else()
   message(STATUS "rabbitbin: align/sort/index subcommands disabled (need htslib)")
