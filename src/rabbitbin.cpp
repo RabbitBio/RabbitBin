@@ -49,6 +49,9 @@
 
 #include "rabbitbin.h"
 #include <iomanip>
+#ifdef RABBITBIN_ENABLE_MAP
+#include "rb_map_cli.h"
+#endif
 
 // Migrate a large read-mostly buffer to MPOL_INTERLEAVE across all NUMA nodes
 // so a multi-socket all-pairs scan spreads DRAM traffic over every memory
@@ -4907,6 +4910,12 @@ int main(int ac, char *av[]) {
     if (sub == "amber") return rb_cmd_amber(ac - 1, av + 1);
     if (sub == "qc")    return rb_cmd_qc(ac - 1, av + 1);
     if (sub == "refine") return rb_cmd_refine(ac - 1, av + 1);
+#ifdef RABBITBIN_ENABLE_MAP
+    if (sub == "bwa")     return rb_cmd_bwa(ac - 1, av + 1);
+    if (sub == "sortbam") return rb_cmd_sortbam(ac - 1, av + 1);
+    if (sub == "bai")     return rb_cmd_bai(ac - 1, av + 1);
+    if (sub == "map")     return rb_cmd_map(ac - 1, av + 1);
+#endif
     if (sub == "--help" || sub == "-h") {
       cerr << "RabbitBin " << version << " (" << DATE << ")\n\n"
            << "Sketch-based metagenome binning pipeline. One binary covers binning,\n"
@@ -4922,7 +4931,14 @@ int main(int ac, char *av[]) {
            << "  depth   BAM/CRAM -> MetaBAT/JGI depth TSV (supports --long-read, --reference)\n"
            << "  qc      Score a binning by SCG completeness/contamination (no gold standard)\n"
            << "  refine  DAS Tool-style SCG consensus over multiple independent binnings\n"
-           << "  amber   Fast AMBER-compatible genome-binning evaluation (HQ/MQ/LQ)\n\n"
+           << "  amber   Fast AMBER-compatible genome-binning evaluation (HQ/MQ/LQ)\n"
+#ifdef RABBITBIN_ENABLE_MAP
+           << "  map     reads -> sorted+indexed BAM in one pass (align|sort|index fused)\n"
+           << "  bwa     Align reads to a reference (CPU seed-and-extend) -> SAM/BAM\n"
+           << "  sortbam Coordinate-sort a BAM (parallel BGZF write)\n"
+           << "  bai     Build a .bai index for a coordinate-sorted BAM\n"
+#endif
+           << "\n"
            << "Typical workflow:\n"
            << "  scripts/rabbitbin_markers.sh contigs.fa contigs.markers.tsv   # once per assembly\n"
            << "  rabbitbin depth --bam-list bams.txt -o depth.tsv\n"
