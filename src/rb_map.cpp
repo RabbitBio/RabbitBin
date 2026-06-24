@@ -5,14 +5,21 @@
 // write the BAM with an on-the-fly .bai. No intermediate SAM text and no temp
 // BAM on disk -- the main waste in a `bwa mem | samtools sort` pipeline.
 
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <fstream>
 #include <getopt.h>
+#include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <unistd.h>
+
+#include <omp.h>
 
 #include <htslib/sam.h>
 
@@ -31,18 +38,31 @@ void collect_sink(void *ctx, bam1_t *b) {
   c->recs->push_back(b);  // takes ownership; freed after writing
 }
 
+// One sample spec parsed from a --samples manifest (or built from -1/-2/-p/-o).
+struct Sample {
+  std::string out;          // output sorted BAM path
+  std::string r1;           // reads (mate1, interleaved, or single-end)
+  std::string r2;           // mate2 (empty if interleaved/single)
+  bool interleaved = false; // r1 holds interleaved pairs
+};
+
 void map_usage() {
   fprintf(stderr,
       "\nrabbitbin map: reads -> sorted+indexed BAM (align|sort|index fused)\n\n"
       "Usage:\n"
       "  rabbitbin map -r ref.fa -1 r1.fq -2 r2.fq -o out.sorted.bam\n"
-      "  rabbitbin map -r ref.fa -p interleaved.fq -o out.sorted.bam\n\n"
+      "  rabbitbin map -r ref.fa -p interleaved.fq -o out.sorted.bam\n"
+      "  rabbitbin map -r ref.fa --samples samples.tsv   # many samples, ONE index build\n\n"
       "Options:\n"
       "  -r, --ref FILE     Reference FASTA (required)\n"
       "  -1 FILE            Read 1 FASTQ(.gz)\n"
       "  -2 FILE            Read 2 FASTQ(.gz)\n"
       "  -p, --interleaved FILE   Interleaved paired FASTQ(.gz)\n"
-      "  -o, --out FILE     Output sorted BAM (required)\n"
+      "  -o, --out FILE     Output sorted BAM (single-sample mode)\n"
+      "      --samples FILE Manifest of samples to map against ONE shared index.\n"
+      "                     Each non-empty/non-# line is TAB-separated:\n"
+      "                       <out.bam> <reads1> [<reads2>]\n"
+      "                     2 cols => reads1 is interleaved (-p); 3 cols => -1/-2.\n"
       "  -t, --threads N    Threads (default: all online CPUs)\n"
       "  -l, --level N      Output compression level 0-9 (default 6)\n"
       "  -k INT             Minimizer k (default 15)\n"
@@ -52,18 +72,95 @@ void map_usage() {
       "  -h, --help         Show this help\n");
 }
 
+// Align one sample's reads with the already-built (shared) index and coordinate
+// -sort the records in memory; returns a heap-owned vector (caller writes then
+// frees it) or nullptr on error. Writing is kept separate so a sample's BAM
+// write can overlap the NEXT sample's alignment (see rb_cmd_map).
+std::vector<bam1_t *> *align_sort_sample(const SaIndex &idx, const SaOpt &opt,
+                                         sam_hdr_t *hdr, const Sample &s,
+                                         int threads) {
+  auto *recs = new std::vector<bam1_t *>();
+  recs->reserve(1u << 22);
+  CollectCtx ctx{recs};
+  fprintf(stderr, "[rabbitbin map] %s: aligning -> in-memory records\n",
+          s.out.c_str());
+  int rc = rb_align_run(idx, opt, s.r1, s.r2, s.interleaved, threads,
+                        /*out=*/nullptr, hdr, collect_sink, &ctx);
+  if (rc != 0) {
+    for (auto *b : *recs) bam_destroy1(b);
+    delete recs;
+    return nullptr;
+  }
+  fprintf(stderr, "[rabbitbin map] %s: sorting %zu records\n", s.out.c_str(),
+          recs->size());
+  rb_stable_coord_sort(*recs);
+  return recs;
+}
+
+// Parse a --samples manifest into a list of Sample specs. Returns false on a
+// malformed line (and prints the offending line number).
+bool parse_samples_manifest(const std::string &path,
+                            std::vector<Sample> &out) {
+  std::ifstream in(path);
+  if (!in) {
+    fprintf(stderr, "[Error!] cannot open --samples manifest: %s\n",
+            path.c_str());
+    return false;
+  }
+  std::string line;
+  int lineno = 0;
+  while (std::getline(in, line)) {
+    ++lineno;
+    // strip trailing CR (tolerate CRLF manifests)
+    if (!line.empty() && line.back() == '\r') line.pop_back();
+    // skip blank lines and comments
+    size_t first = line.find_first_not_of(" \t");
+    if (first == std::string::npos || line[first] == '#') continue;
+
+    std::vector<std::string> cols;
+    std::stringstream ss(line);
+    std::string field;
+    while (std::getline(ss, field, '\t')) cols.push_back(field);
+    if (cols.size() < 2 || cols.size() > 3 || cols[0].empty() ||
+        cols[1].empty()) {
+      fprintf(stderr,
+              "[Error!] --samples line %d malformed (need "
+              "<out.bam>\\t<reads1>[\\t<reads2>]): %s\n",
+              lineno, line.c_str());
+      return false;
+    }
+    Sample s;
+    s.out = cols[0];
+    s.r1 = cols[1];
+    if (cols.size() == 3 && !cols[2].empty()) {
+      s.r2 = cols[2];
+      s.interleaved = false;
+    } else {
+      s.interleaved = true;  // single reads column => interleaved pairs
+    }
+    out.push_back(std::move(s));
+  }
+  if (out.empty()) {
+    fprintf(stderr, "[Error!] --samples manifest %s has no samples\n",
+            path.c_str());
+    return false;
+  }
+  return true;
+}
+
 }  // namespace
 
 int rb_cmd_map(int ac, char *av[]) {
-  std::string ref, r1, r2, interleaved_path, out_path;
+  std::string ref, r1, r2, interleaved_path, out_path, samples_path;
   int threads = 0, level = 6, k = 15, w = 10, band = 31;
   bool no_index = false;
 
-  enum { OPT_BAND = 1000, OPT_NOINDEX = 1001 };
+  enum { OPT_BAND = 1000, OPT_NOINDEX = 1001, OPT_SAMPLES = 1002 };
   static const struct option longopts[] = {
       {"ref", required_argument, 0, 'r'},
       {"interleaved", required_argument, 0, 'p'},
       {"out", required_argument, 0, 'o'},
+      {"samples", required_argument, 0, OPT_SAMPLES},
       {"threads", required_argument, 0, 't'},
       {"level", required_argument, 0, 'l'},
       {"band", required_argument, 0, OPT_BAND},
@@ -80,6 +177,7 @@ int rb_cmd_map(int ac, char *av[]) {
       case '2': r2 = optarg; break;
       case 'p': interleaved_path = optarg; break;
       case 'o': out_path = optarg; break;
+      case OPT_SAMPLES: samples_path = optarg; break;
       case 't': threads = atoi(optarg); break;
       case 'l': level = atoi(optarg); break;
       case OPT_BAND: band = atoi(optarg); break;
@@ -88,47 +186,107 @@ int rb_cmd_map(int ac, char *av[]) {
       default: map_usage(); return 1;
     }
   }
-  bool interleaved = !interleaved_path.empty();
-  if (interleaved) r1 = interleaved_path;
-  if (r1.empty() && optind < ac) r1 = av[optind];
 
-  if (ref.empty() || r1.empty() || out_path.empty()) {
+  // Assemble the sample list: either a --samples manifest (many samples, one
+  // shared index build) or a single sample from -1/-2/-p/-o (legacy path).
+  std::vector<Sample> samples;
+  if (!samples_path.empty()) {
+    if (!r1.empty() || !r2.empty() || !interleaved_path.empty() ||
+        !out_path.empty()) {
+      fprintf(stderr,
+              "[Error!] --samples is mutually exclusive with -1/-2/-p/-o\n");
+      return 1;
+    }
+    if (!parse_samples_manifest(samples_path, samples)) return 1;
+  } else {
+    bool interleaved = !interleaved_path.empty();
+    if (interleaved) r1 = interleaved_path;
+    if (r1.empty() && optind < ac) r1 = av[optind];
+    if (ref.empty() || r1.empty() || out_path.empty()) {
+      map_usage();
+      fprintf(stderr,
+              "[Error!] --ref, reads, and --out (or --samples) are required\n");
+      return 1;
+    }
+    Sample s;
+    s.out = out_path;
+    s.r1 = r1;
+    s.r2 = r2;
+    s.interleaved = interleaved;
+    samples.push_back(std::move(s));
+  }
+  if (ref.empty()) {
     map_usage();
-    fprintf(stderr, "[Error!] --ref, reads, and --out are required\n");
+    fprintf(stderr, "[Error!] --ref is required\n");
     return 1;
   }
+
   long onln = sysconf(_SC_NPROCESSORS_ONLN);
   if (threads <= 0) threads = (onln > 0) ? (int)onln : 1;
+  // Make OpenMP-backed parallel algorithms (e.g. the parallel stable sort in
+  // rb_stable_coord_sort, __gnu_parallel) honour the requested thread count.
+  omp_set_num_threads(threads);
 
+  // Build the index ONCE and reuse it (and the header) for every sample.
   SaIndex idx;
   if (!idx.build(ref, k, w, threads)) return 1;
   SaOpt opt;
   opt.band = band;
-
   sam_hdr_t *hdr = rb_align_make_header(idx);
 
-  // Align, collecting records in memory.
-  std::vector<bam1_t *> recs;
-  recs.reserve(1u << 22);
-  CollectCtx ctx{&recs};
-  fprintf(stderr, "[rabbitbin map] aligning -> in-memory records\n");
-  int rc = rb_align_run(idx, opt, r1, r2, interleaved, threads,
-                        /*out=*/nullptr, hdr, collect_sink, &ctx);
-  if (rc != 0) {
-    for (auto *b : recs) bam_destroy1(b);
-    sam_hdr_destroy(hdr);
-    return rc;
+  // Per sample: align + sort (uses all cores via the aligner pipeline) on the
+  // main thread, then hand the sorted records to a SINGLE background writer so
+  // the parallel BGZF write overlaps the NEXT sample's alignment. At most one
+  // write is in flight, so the shared header is never touched concurrently
+  // (alignment in `map` mode never uses it). The .bai is built on the MAIN
+  // thread right after the write joins (htslib's index thread pool does not
+  // engage from a worker thread, where it would fall back to a slow serial
+  // re-read). Each sample's output is content-identical to a serial run.
+  int rc = 0;
+  std::thread writer;
+  std::atomic<int> write_rc{0};
+  std::string pending_bai;  // out path whose .bai is owed once `writer` joins
+  for (size_t i = 0; i < samples.size(); ++i) {
+    if (samples.size() > 1)
+      fprintf(stderr, "[rabbitbin map] === sample %zu/%zu: %s ===\n", i + 1,
+              samples.size(), samples[i].out.c_str());
+    std::vector<bam1_t *> *recs =
+        align_sort_sample(idx, opt, hdr, samples[i], threads);
+    if (!recs) {
+      rc = 1;
+      fprintf(stderr, "[Error!] sample %s failed; aborting\n",
+              samples[i].out.c_str());
+      break;
+    }
+    // Finish the previous sample's write, then index it on the main thread.
+    if (writer.joinable()) writer.join();
+    if (write_rc.load() != 0) {
+      rc = write_rc.load();
+      for (auto *b : *recs) bam_destroy1(b);
+      delete recs;
+      break;
+    }
+    if (!pending_bai.empty()) {
+      rb_index_bam(pending_bai, threads);
+      pending_bai.clear();
+    }
+    Sample s = samples[i];
+    fprintf(stderr, "[rabbitbin map] %s: writing (background)\n", s.out.c_str());
+    writer = std::thread([&, recs, s]() {
+      int r = rb_write_sorted_bam(hdr, *recs, s.out, threads, level,
+                                  /*write_index=*/false);
+      rb_free_records(*recs, threads);
+      delete recs;
+      if (r != 0) write_rc.store(r);
+    });
+    if (!no_index) pending_bai = s.out;
   }
+  if (writer.joinable()) writer.join();
+  if (rc == 0 && write_rc.load() != 0) rc = write_rc.load();
+  if (rc == 0 && !pending_bai.empty()) rb_index_bam(pending_bai, threads);
 
-  fprintf(stderr, "[rabbitbin map] sorting %zu records\n", recs.size());
-  rb_stable_coord_sort(recs);
-
-  fprintf(stderr, "[rabbitbin map] writing %s%s\n", out_path.c_str(),
-          no_index ? "" : " (+ .bai)");
-  rc = rb_write_sorted_bam(hdr, recs, out_path, threads, level, !no_index);
-
-  for (auto *b : recs) bam_destroy1(b);
   sam_hdr_destroy(hdr);
-  if (rc == 0) fprintf(stderr, "[rabbitbin map] done\n");
+  if (rc == 0) fprintf(stderr, "[rabbitbin map] done (%zu sample(s))\n",
+                       samples.size());
   return rc;
 }

@@ -35,6 +35,16 @@ struct SaIndex {
   std::vector<uint64_t> mm_hash;
   std::vector<uint32_t> mm_pos;
 
+  // Prefix-bucket directory over the top `mm_pbits` bits of the hash: an exact
+  // acceleration structure (no effect on results) that bounds the binary search
+  // in query() to a tiny contiguous slice of mm_hash instead of probing the
+  // whole multi-GB table -- the dominant cache-miss cost when mapping against a
+  // large reference. mm_bucket[b] = index of the first entry whose top bits >= b
+  // so all entries with prefix b live in [mm_bucket[b], mm_bucket[b+1]).
+  std::vector<uint32_t> mm_bucket;  // size (1<<mm_pbits)+1
+  int mm_pbits = 0;
+  int mm_shift = 64;
+
   // Build from a FASTA file. Returns false on error.
   bool build(const std::string &fasta, int k_, int w_, int threads);
 

@@ -40,7 +40,10 @@ static void read_minimizers(const std::vector<uint8_t> &codes, int k, int w,
   int n = (int)codes.size();
   if (n < k) return;
   const uint64_t kmask = (k < 32) ? ((1ULL << (2 * k)) - 1) : ~0ULL;
-  std::vector<std::pair<uint64_t, uint32_t>> win(w);
+  // Reused across reads (window size w is fixed for the run): avoid a per-call
+  // allocation. Indexed modulo w, so any extra capacity is harmless.
+  static thread_local std::vector<std::pair<uint64_t, uint32_t>> win;
+  if ((int)win.size() < w) win.resize(w);
   uint64_t kmer = 0;
   int valid = 0, wfill = 0;
   uint32_t last = UINT32_MAX;
@@ -97,12 +100,32 @@ static BandResult banded_align(const uint8_t *qry, int qn, const uint8_t *ref,
   // as: first row free (ref start), last query row picks best ref end.
   const int band = opt.band;
   const int NEG = -1000000000;
-  // Use (qn+1) rows; each row covers ref columns [lo..hi].
-  // For simplicity allocate full (qn+1) x (rn+1) only if small; else band.
-  // Here qn ~ read length (<=300), rn ~ qn + 2*band, so full matrix is fine.
-  std::vector<int> H((size_t)(qn + 1) * (rn + 1), NEG);
-  std::vector<uint8_t> TB((size_t)(qn + 1) * (rn + 1), 0);  // 0=diag 1=up(del) 2=left(ins)
-  auto Hidx = [&](int i, int j) { return (size_t)i * (rn + 1) + j; };
+  // Banded semi-global DP. The matrix is logically (qn+1) x (rn+1) but only a
+  // diagonal band of half-width `band` is ever consulted (qn ~ read length,
+  // rn ~ qn + 2*band). We therefore (a) reuse thread-local buffers across reads
+  // instead of allocating per call, and (b) write ONLY the cells the recurrence
+  // and traceback actually read: row 0, the per-row band [lo..hi], and the two
+  // just-outside-band border cells that the recurrence reads as NEG sentinels.
+  //
+  // This is bit-identical to a full NEG-initialised matrix: every cell read by
+  // the recurrence is either inside a computed band, on row 0 (all 0), or one of
+  // the explicit NEG borders below; out-of-band cells are never read and never
+  // win a max, so their stale contents (from a prior read) cannot affect H, TB,
+  // the chosen best_j, or the traceback.
+  const int rowstride = rn + 1;
+  static thread_local std::vector<int> Hbuf;
+  static thread_local std::vector<uint8_t> TBbuf;  // 0=diag 1=up(del) 2=left(ins)
+  const size_t need = (size_t)(qn + 1) * rowstride;
+  if (Hbuf.size() < need) Hbuf.resize(need);
+  if (TBbuf.size() < need) TBbuf.resize(need);
+  int *H = Hbuf.data();
+  uint8_t *TB = TBbuf.data();
+  auto Hidx = [&](int i, int j) { return (size_t)i * rowstride + j; };
+
+  // Loop-invariant penalties / scores hoisted out of the inner cell loop.
+  const int gap = opt.gap_open + opt.gap_ext;
+  const int match = opt.match;
+  const int mismatch = opt.mismatch;
 
   // First query row: aligning 0 query bases; any ref prefix is free (score 0).
   for (int j = 0; j <= rn; ++j) {
@@ -112,25 +135,34 @@ static BandResult banded_align(const uint8_t *qry, int qn, const uint8_t *ref,
   for (int i = 1; i <= qn; ++i) {
     int lo = std::max(0, i - band);
     int hi = std::min(rn, i + band);
+    // Query base for this row is constant across the inner j loop; `qc <= 3`
+    // implies the original `ref==qc` check already covers `ref <= 3`.
+    const uint8_t qc = qry[i - 1];
+    const bool qok = qc <= 3;
+    const int *Hprev = H + (size_t)(i - 1) * rowstride;
+    int *Hcur = H + (size_t)i * rowstride;
+    uint8_t *TBcur = TB + (size_t)i * rowstride;
+    // Cell just below the band (read as `left` at j==lo when lo>=1): sentinel.
+    if (lo >= 1) Hcur[lo - 1] = NEG;
     // column 0 (no ref consumed) for this query row: must insert i query bases
     if (lo == 0) {
-      H[Hidx(i, 0)] = -(opt.gap_open + opt.gap_ext * i);
-      TB[Hidx(i, 0)] = 2;  // ins (query base unaligned to ref)
+      Hcur[0] = -(opt.gap_open + opt.gap_ext * i);
+      TBcur[0] = 2;  // ins (query base unaligned to ref)
     }
     for (int j = std::max(1, lo); j <= hi; ++j) {
-      int sc = (qry[i - 1] <= 3 && ref[j - 1] <= 3 && qry[i - 1] == ref[j - 1])
-                   ? opt.match
-                   : -opt.mismatch;
-      int diag = H[Hidx(i - 1, j - 1)] + sc;
-      int up = H[Hidx(i - 1, j)] - (opt.gap_open + opt.gap_ext);   // del? (query consumes, ref not) -> insertion in query
-      int left = H[Hidx(i, j - 1)] - (opt.gap_open + opt.gap_ext); // ref consumes, query not -> deletion
+      int sc = (qok && ref[j - 1] == qc) ? match : -mismatch;
+      int diag = Hprev[j - 1] + sc;
+      int up = Hprev[j] - gap;       // query base, no ref => I
+      int left = Hcur[j - 1] - gap;  // ref base, no query => D
       int best = diag;
       uint8_t tb = 0;
-      if (up > best) { best = up; tb = 2; }   // query base, no ref => I
-      if (left > best) { best = left; tb = 1; }  // ref base, no query => D
-      H[Hidx(i, j)] = best;
-      TB[Hidx(i, j)] = tb;
+      if (up > best) { best = up; tb = 2; }
+      if (left > best) { best = left; tb = 1; }
+      Hcur[j] = best;
+      TBcur[j] = tb;
     }
+    // Cell just above the band (read as `up` by row i+1 at j==hi+1): sentinel.
+    if (hi + 1 <= rn) Hcur[hi + 1] = NEG;
   }
   // Find best ref end on the last query row.
   int best_j = -1, best_score = NEG;
@@ -197,14 +229,19 @@ static SaAln align_one_strand(const SaIndex &idx, const SaOpt &opt,
                               const std::vector<uint8_t> &codes, bool rev,
                               int &out_best_diag_votes) {
   SaAln a;
-  std::vector<std::pair<uint64_t, uint32_t>> mm;
+  // Reused scratch (cleared on use): avoids per-read allocations. The diagonal
+  // vote maps below are intentionally left as fresh per-call unordered_maps:
+  // their iteration order decides the winning bin on vote ties (which sets the
+  // alignment window), so reusing/reserving them could change results.
+  static thread_local std::vector<std::pair<uint64_t, uint32_t>> mm;
   read_minimizers(codes, idx.k, idx.w, mm);
   if (mm.empty()) return a;
 
   // Collect (diag, ref_pos, read_pos). diag = ref_pos - read_pos.
   std::unordered_map<int64_t, int> diag_votes;
   std::unordered_map<int64_t, uint32_t> diag_minref;
-  std::vector<uint32_t> hits;
+  static thread_local std::vector<uint32_t> hits;
+  const int64_t binw = opt.band > 0 ? opt.band : 1;  // hoisted bucket divisor
   for (auto &s : mm) {
     hits.clear();
     idx.query(s.first, hits);
@@ -212,7 +249,7 @@ static SaAln align_one_strand(const SaIndex &idx, const SaOpt &opt,
     for (uint32_t rp : hits) {
       int64_t diag = (int64_t)rp - (int64_t)s.second;
       // bucket diagonals into bins of width (band) to tolerate small indels
-      int64_t bin = diag / (opt.band > 0 ? opt.band : 1);
+      int64_t bin = diag / binw;
       diag_votes[bin]++;
       auto it = diag_minref.find(bin);
       if (it == diag_minref.end() || rp < it->second) diag_minref[bin] = rp;
@@ -278,7 +315,7 @@ static SaAln align_one_strand(const SaIndex &idx, const SaOpt &opt,
 
 SaAln sa_align_read(const SaIndex &idx, const SaOpt &opt, const char *seq,
                     int len) {
-  std::vector<uint8_t> fwd, rev;
+  static thread_local std::vector<uint8_t> fwd, rev;
   encode_read(seq, len, fwd);
   revcomp_codes(fwd, rev);
 

@@ -11,16 +11,25 @@
 // (-1/-2 or interleaved -p) sets mate fields and the proper-pair flag.
 
 #include <algorithm>
+#include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <getopt.h>
+#include <map>
+#include <mutex>
+#include <queue>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <omp.h>
 #include <zlib.h>
+#if defined(USE_IGZIP)
+#include <igzip_lib.h>
+#endif
 
 #include <htslib/sam.h>
 #include <htslib/hts.h>
@@ -31,9 +40,132 @@
 #include "sa_map.h"
 #include "rb_align_api.h"
 
-KSEQ_INIT(gzFile, gzread)
-
 namespace {
+
+// FASTQ byte source for kseq: PLAIN (fread), ZLIB (gzread), or ISA-L igzip when
+// built with USE_IGZIP. igzip decompresses a single gzip stream ~2-4x faster
+// than zlib (a DEFLATE stream's inflate is inherently sequential, so it runs on
+// the pipeline's single reader thread). The decoded bytes are identical to
+// zlib, so parsing -- and therefore alignment output -- is unchanged. The .gz
+// vs plain choice is made from the file's magic bytes. Mirrors the FASTA reader
+// facade in rabbitbin.cpp.
+struct FqReader {
+  enum Mode { PLAIN, ZLIB
+#if defined(USE_IGZIP)
+            , IGZIP
+#endif
+  };
+  Mode mode = PLAIN;
+  FILE *fp = nullptr;
+  gzFile gz = nullptr;
+  bool eof_ = false;
+#if defined(USE_IGZIP)
+  static const size_t IN_SZ = 1u << 22;     // 4 MB compressed read granularity
+  static const uint32_t HDR_REQ = 1u << 16; // bytes to (re)read a gz header
+  unsigned char *inbuf = nullptr;
+  struct inflate_state st;
+  struct isal_gzip_header hdr;
+#endif
+
+  bool open(const char *path) {
+    FILE *probe = fopen(path, "rb");
+    if (!probe) return false;
+    unsigned char m[2] = {0, 0};
+    size_t n = fread(m, 1, 2, probe);
+    fclose(probe);
+    bool is_gz = (n == 2 && m[0] == 0x1f && m[1] == 0x8b);
+    if (!is_gz) {
+      mode = PLAIN;
+      fp = fopen(path, "rb");
+      return fp != nullptr;
+    }
+#if defined(USE_IGZIP)
+    mode = IGZIP;
+    fp = fopen(path, "rb");
+    if (!fp) return false;
+    inbuf = (unsigned char *)malloc(IN_SZ);
+    if (!inbuf) { fclose(fp); fp = nullptr; return false; }
+    isal_gzip_header_init(&hdr);
+    isal_inflate_init(&st);
+    st.crc_flag = ISAL_GZIP_NO_HDR_VER;
+    st.next_in = inbuf;
+    st.avail_in = (uint32_t)fread(inbuf, 1, IN_SZ, fp);
+    if (isal_read_gzip_header(&st, &hdr) != ISAL_DECOMP_OK) return false;
+    return true;
+#else
+    mode = ZLIB;
+    gz = gzopen(path, "r");
+    if (!gz) return false;
+    gzbuffer(gz, 4u << 20);
+    return true;
+#endif
+  }
+
+  int read(void *outv, int size) {
+    char *out = (char *)outv;
+    if (mode == PLAIN) return (int)fread(out, 1, (size_t)size, fp);
+#if defined(USE_IGZIP)
+    if (mode == IGZIP) {
+      if (eof_) return 0;
+      unsigned char *o = (unsigned char *)out;
+      uint64_t off = 0;
+      while (off < (uint64_t)size) {
+        if (st.avail_in == 0) {
+          if (feof(fp)) { eof_ = true; break; }
+          st.next_in = inbuf;
+          st.avail_in = (uint32_t)fread(inbuf, 1, IN_SZ, fp);
+          if (st.avail_in == 0) { eof_ = true; break; }
+        }
+        st.next_out = o + off;
+        st.avail_out = (uint32_t)((uint64_t)size - off);
+        int r = isal_inflate(&st);
+        off = (uint64_t)(st.next_out - o);
+        if (r != ISAL_DECOMP_OK) { eof_ = true; break; }
+        if (st.block_state == ISAL_BLOCK_FINISH) {
+          if (feof(fp) && st.avail_in == 0) { eof_ = true; break; }
+          if (st.avail_in == 0) {
+            isal_inflate_reset(&st);
+            st.next_in = inbuf;
+            st.avail_in = (uint32_t)fread(inbuf, 1, IN_SZ, fp);
+            if (st.avail_in == 0) { eof_ = true; break; }
+          } else if (st.avail_in >= HDR_REQ) {
+            unsigned char *oni = st.next_in;
+            uint32_t oai = st.avail_in;
+            isal_inflate_reset(&st);
+            st.next_in = oni;
+            st.avail_in = oai;
+          } else {
+            uint32_t oai = st.avail_in;
+            memmove(inbuf, st.next_in, oai);
+            size_t rd = feof(fp) ? 0 : fread(inbuf + oai, 1, IN_SZ - oai, fp);
+            isal_inflate_reset(&st);
+            st.next_in = inbuf;
+            st.avail_in = oai + (uint32_t)rd;
+          }
+          if (isal_read_gzip_header(&st, &hdr) != ISAL_DECOMP_OK) {
+            eof_ = true;
+            break;
+          }
+        }
+      }
+      return (int)off;
+    }
+#endif
+    return gzread(gz, out, (unsigned)size);  // ZLIB
+  }
+
+  void close() {
+    if (gz) { gzclose(gz); gz = nullptr; }
+    if (fp) { fclose(fp); fp = nullptr; }
+#if defined(USE_IGZIP)
+    if (inbuf) { free(inbuf); inbuf = nullptr; }
+#endif
+  }
+};
+
+static int fq_read(FqReader *r, void *buf, int len) { return r->read(buf, len); }
+
+KSEQ_INIT(FqReader *, fq_read)
 
 struct ReadRec {
   std::string name, seq, qual;
@@ -158,27 +290,25 @@ int rb_align_run(const SaIndex &idx, const SaOpt &opt, const std::string &r1,
                  samFile *out, sam_hdr_t *hdr, RbAlignSink sink,
                  void *sink_ctx) {
   bool paired = interleaved || !r2.empty();
-  gzFile f1 = gzopen(r1.c_str(), "rb");
-  if (!f1) {
+  FqReader f1;
+  if (!f1.open(r1.c_str())) {
     fprintf(stderr, "[Error!] cannot open reads: %s\n", r1.c_str());
     return 1;
   }
-  gzFile f2 = nullptr;
+  FqReader f2;
+  bool have_f2 = false;
   if (!r2.empty()) {
-    f2 = gzopen(r2.c_str(), "rb");
-    if (!f2) {
+    if (!f2.open(r2.c_str())) {
       fprintf(stderr, "[Error!] cannot open reads: %s\n", r2.c_str());
-      gzclose(f1);
+      f1.close();
       return 1;
     }
+    have_f2 = true;
   }
-  kseq_t *k1 = kseq_init(f1);
-  kseq_t *k2 = f2 ? kseq_init(f2) : nullptr;
+  kseq_t *k1 = kseq_init(&f1);
+  kseq_t *k2 = have_f2 ? kseq_init(&f2) : nullptr;
 
-  const int BATCH = 1 << 16;  // read pairs (or singles) per batch
-  std::vector<ReadRec> A, B;  // mate1, mate2 (B empty if single)
-  A.reserve(BATCH);
-  B.reserve(BATCH);
+  const int BATCH = 8192;  // reads/pairs per batch (fine grain => load balance)
 
   auto load_one = [](kseq_t *ks, ReadRec &out) -> bool {
     int r = kseq_read(ks);
@@ -192,9 +322,9 @@ int rb_align_run(const SaIndex &idx, const SaOpt &opt, const std::string &r1,
     return true;
   };
 
-  int64_t total = 0, mapped = 0;
-  int rc = 0;
-  for (;;) {
+  // Fill one batch from the kseq stream(s); returns the number of reads/pairs.
+  auto load_batch = [&](std::vector<ReadRec> &A,
+                        std::vector<ReadRec> &B) -> int {
     A.clear();
     B.clear();
     int got = 0;
@@ -203,11 +333,7 @@ int rb_align_run(const SaIndex &idx, const SaOpt &opt, const std::string &r1,
       if (!load_one(k1, a)) break;
       if (paired) {
         ReadRec b;
-        bool ok;
-        if (interleaved)
-          ok = load_one(k1, b);
-        else
-          ok = load_one(k2, b);
+        bool ok = interleaved ? load_one(k1, b) : load_one(k2, b);
         if (!ok) {
           fprintf(stderr, "[Warn] odd number of paired reads; dropping last\n");
           break;
@@ -219,26 +345,74 @@ int rb_align_run(const SaIndex &idx, const SaOpt &opt, const std::string &r1,
       }
       ++got;
     }
-    if (got == 0) break;
+    return got;
+  };
 
-    std::vector<SaAln> ra(A.size()), rb(paired ? B.size() : 0);
-#pragma omp parallel for num_threads(threads) schedule(dynamic, 256)
-    for (int i = 0; i < (int)A.size(); ++i) {
-      ra[i] = sa_align_read(idx, opt, A[i].seq.c_str(), (int)A[i].seq.size());
-      if (paired)
-        rb[i] = sa_align_read(idx, opt, B[i].seq.c_str(), (int)B[i].seq.size());
-    }
+  // ── Producer / consumer pipeline ──────────────────────────────────────────
+  // 1 reader thread parses FASTQ batches; `n_workers` threads align + build the
+  // BAM records for a whole batch each; 1 writer thread emits completed batches
+  // IN INPUT ORDER. Reading, alignment, and serialization therefore overlap and
+  // the workers never wait on a per-batch barrier (better core utilisation),
+  // while ordered emission keeps the output byte-identical to a serial run.
+  struct InBatch {
+    uint64_t seq = 0;
+    std::vector<ReadRec> A, B;
+    int got = 0;
+  };
+  struct OutBatch {
+    uint64_t seq = 0;
+    int got = 0;
+    std::vector<bam1_t *> b1, b2;
+    int64_t n_total = 0, n_mapped = 0;
+  };
 
-    // Emit records in input order.
-    for (int i = 0; i < (int)A.size(); ++i) {
-      ++total;
-      if (ra[i].mapped) ++mapped;
+  const int n_workers = threads > 0 ? threads : 1;
+  // Cap batches in flight (reader-created .. writer-freed) to bound memory.
+  const int max_inflight = std::max(4, n_workers * 3);
+
+  std::mutex in_mtx;
+  std::condition_variable in_not_empty, in_not_full;
+  std::queue<InBatch *> in_q;
+  int inflight = 0;
+  bool reading_done = false;   // guarded by in_mtx (workers)
+  bool all_produced = false;   // guarded by out_mtx (writer)
+  uint64_t n_batches = 0;      // guarded by out_mtx (writer)
+
+  std::mutex out_mtx;
+  std::condition_variable out_cv;
+  std::map<uint64_t, OutBatch *> out_ready;
+
+  std::atomic<int> rc{0};
+  std::atomic<bool> aborted{false};
+  int64_t total = 0, mapped = 0;  // only the writer thread touches these
+
+  auto do_abort = [&]() {
+    aborted.store(true);
+    { std::lock_guard<std::mutex> lk(in_mtx); }
+    in_not_empty.notify_all();
+    in_not_full.notify_all();
+    { std::lock_guard<std::mutex> lk(out_mtx); }
+    out_cv.notify_all();
+  };
+
+  // Align one input batch into records (single-threaded; runs on a worker).
+  auto process_batch = [&](InBatch *ib) -> OutBatch * {
+    OutBatch *ob = new OutBatch();
+    ob->seq = ib->seq;
+    ob->got = ib->got;
+    ob->b1.assign(ib->got, nullptr);
+    if (paired) ob->b2.assign(ib->got, nullptr);
+    int64_t nt = 0, nm = 0;
+    for (int i = 0; i < ib->got; ++i) {
+      SaAln a1 =
+          sa_align_read(idx, opt, ib->A[i].seq.c_str(), (int)ib->A[i].seq.size());
+      ++nt;
+      if (a1.mapped) ++nm;
       if (paired) {
-        ++total;
-        if (rb[i].mapped) ++mapped;
-        const SaAln &a1 = ra[i];
-        const SaAln &a2 = rb[i];
-        // mate fields
+        SaAln a2 = sa_align_read(idx, opt, ib->B[i].seq.c_str(),
+                                 (int)ib->B[i].seq.size());
+        ++nt;
+        if (a2.mapped) ++nm;
         int m1tid = a2.mapped ? a2.contig : -1;
         int64_t m1pos = a2.mapped ? a2.pos : -1;
         int m2tid = a1.mapped ? a1.contig : -1;
@@ -249,52 +423,158 @@ int rb_align_run(const SaIndex &idx, const SaOpt &opt, const std::string &r1,
         if (a1.mapped && a2.mapped && a1.contig == a2.contig) {
           int64_t lo = std::min(a1.pos, a2.pos);
           int64_t hi = std::max(a1.pos, a2.pos);
-          // approximate end span using read lengths
-          int64_t span = hi - lo + (int64_t)std::max(A[i].seq.size(), B[i].seq.size());
+          int64_t span =
+              hi - lo + (int64_t)std::max(ib->A[i].seq.size(), ib->B[i].seq.size());
           isize1 = (a1.pos <= a2.pos) ? span : -span;
           isize2 = -isize1;
         }
-        uint16_t f1flag = BAM_FPAIRED | BAM_FREAD1 | (proper ? BAM_FPROPER_PAIR : 0);
-        uint16_t f2flag = BAM_FPAIRED | BAM_FREAD2 | (proper ? BAM_FPROPER_PAIR : 0);
-
+        uint16_t f1flag =
+            BAM_FPAIRED | BAM_FREAD1 | (proper ? BAM_FPROPER_PAIR : 0);
+        uint16_t f2flag =
+            BAM_FPAIRED | BAM_FREAD2 | (proper ? BAM_FPROPER_PAIR : 0);
         bam1_t *b1 = bam_init1();
         bam1_t *b2 = bam_init1();
-        fill_bam(b1, A[i], a1, f1flag, m1tid, m1pos, isize1, a2.rev,
+        fill_bam(b1, ib->A[i], a1, f1flag, m1tid, m1pos, isize1, a2.rev,
                  !a2.mapped);
-        fill_bam(b2, B[i], a2, f2flag, m2tid, m2pos, isize2, a1.rev,
+        fill_bam(b2, ib->B[i], a2, f2flag, m2tid, m2pos, isize2, a1.rev,
                  !a1.mapped);
-        if (sink) {
-          sink(sink_ctx, b1);
-          sink(sink_ctx, b2);
-          // sink takes ownership; do not destroy here
-        } else {
-          if (sam_write1(out, hdr, b1) < 0 || sam_write1(out, hdr, b2) < 0)
-            rc = 1;
-          bam_destroy1(b1);
-          bam_destroy1(b2);
-        }
+        ob->b1[i] = b1;
+        ob->b2[i] = b2;
       } else {
         bam1_t *b = bam_init1();
-        fill_bam(b, A[i], ra[i], 0, -1, -1, 0, false, false);
-        if (sink) {
-          sink(sink_ctx, b);
-        } else {
-          if (sam_write1(out, hdr, b) < 0) rc = 1;
-          bam_destroy1(b);
-        }
+        fill_bam(b, ib->A[i], a1, 0, -1, -1, 0, false, false);
+        ob->b1[i] = b;
       }
     }
-    if (rc) break;
+    ob->n_total = nt;
+    ob->n_mapped = nm;
+    return ob;
+  };
+
+  std::thread reader([&]() {
+    uint64_t seq = 0;
+    for (;;) {
+      if (aborted.load()) break;
+      InBatch *ib = new InBatch();
+      ib->seq = seq;
+      ib->got = load_batch(ib->A, ib->B);
+      if (ib->got == 0) {
+        delete ib;
+        break;
+      }
+      {
+        std::unique_lock<std::mutex> lk(in_mtx);
+        in_not_full.wait(
+            lk, [&] { return inflight < max_inflight || aborted.load(); });
+        if (aborted.load()) {
+          delete ib;
+          break;
+        }
+        ++inflight;
+        in_q.push(ib);
+      }
+      in_not_empty.notify_one();
+      ++seq;
+    }
+    { std::lock_guard<std::mutex> lk(in_mtx); reading_done = true; }
+    in_not_empty.notify_all();
+    { std::lock_guard<std::mutex> lk(out_mtx); all_produced = true; n_batches = seq; }
+    out_cv.notify_all();
+  });
+
+  auto worker_fn = [&]() {
+    for (;;) {
+      InBatch *ib = nullptr;
+      {
+        std::unique_lock<std::mutex> lk(in_mtx);
+        in_not_empty.wait(lk, [&] {
+          return !in_q.empty() || reading_done || aborted.load();
+        });
+        if (in_q.empty()) {
+          if (reading_done || aborted.load()) break;
+          continue;
+        }
+        ib = in_q.front();
+        in_q.pop();
+      }
+      if (aborted.load()) { delete ib; break; }
+      OutBatch *ob = process_batch(ib);
+      delete ib;  // input reads no longer needed
+      {
+        std::lock_guard<std::mutex> lk(out_mtx);
+        out_ready[ob->seq] = ob;
+      }
+      out_cv.notify_one();
+    }
+  };
+
+  std::vector<std::thread> workers;
+  workers.reserve(n_workers);
+  for (int t = 0; t < n_workers; ++t) workers.emplace_back(worker_fn);
+
+  std::thread writer([&]() {
+    uint64_t expected = 0;
+    for (;;) {
+      OutBatch *ob = nullptr;
+      {
+        std::unique_lock<std::mutex> lk(out_mtx);
+        out_cv.wait(lk, [&] {
+          return out_ready.count(expected) || aborted.load() ||
+                 (all_produced && expected >= n_batches);
+        });
+        auto it = out_ready.find(expected);
+        if (it == out_ready.end()) {
+          if (aborted.load() || (all_produced && expected >= n_batches)) break;
+          continue;
+        }
+        ob = it->second;
+        out_ready.erase(it);
+      }
+      for (int i = 0; i < ob->got; ++i) {
+        if (sink) {
+          sink(sink_ctx, ob->b1[i]);
+          if (paired) sink(sink_ctx, ob->b2[i]);
+        } else {
+          if (sam_write1(out, hdr, ob->b1[i]) < 0) rc.store(1);
+          bam_destroy1(ob->b1[i]);
+          if (paired) {
+            if (sam_write1(out, hdr, ob->b2[i]) < 0) rc.store(1);
+            bam_destroy1(ob->b2[i]);
+          }
+        }
+      }
+      total += ob->n_total;
+      mapped += ob->n_mapped;
+      delete ob;
+      ++expected;
+      { std::lock_guard<std::mutex> lk(in_mtx); --inflight; }
+      in_not_full.notify_one();
+      if (rc.load()) { do_abort(); break; }
+    }
+  });
+
+  reader.join();
+  for (auto &t : workers) t.join();
+  writer.join();
+
+  // Free any batches left over after an abort (normal completion leaves none).
+  while (!in_q.empty()) { delete in_q.front(); in_q.pop(); }
+  for (auto &kv : out_ready) {
+    if (!sink) {
+      for (auto *b : kv.second->b1) if (b) bam_destroy1(b);
+      for (auto *b : kv.second->b2) if (b) bam_destroy1(b);
+    }
+    delete kv.second;
   }
 
   kseq_destroy(k1);
   if (k2) kseq_destroy(k2);
-  gzclose(f1);
-  if (f2) gzclose(f2);
+  f1.close();
+  if (have_f2) f2.close();
   fprintf(stderr, "[rabbitbin bwa] %lld reads, %lld mapped (%.2f%%)\n",
           (long long)total, (long long)mapped,
           total ? 100.0 * mapped / total : 0.0);
-  return rc;
+  return rc.load();
 }
 
 int rb_cmd_bwa(int ac, char *av[]) {

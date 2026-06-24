@@ -31,7 +31,7 @@ struct SaOpt {
   int mismatch = 4;
   int gap_open = 6;
   int gap_ext = 1;
-  int band = 31;          // banded DP half-width
+  int band = 31;          // banded DP half-width (indels up to +-band)
   int max_seed_occ = 500; // ignore minimizers occurring more than this
   int min_score_frac = 0; // (reserved)
 };
