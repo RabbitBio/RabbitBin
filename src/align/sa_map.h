@@ -41,4 +41,16 @@ struct SaOpt {
 SaAln sa_align_read(const SaIndex &idx, const SaOpt &opt, const char *seq,
                     int len);
 
+// Batched alignment of `n` independent reads (seqs[i]/lens[i] -> out[i]).
+// Equivalent to calling sa_align_read() per read, but processed in a three-
+// phase, latency-hiding pipeline over sub-batches: (1) seed + diagonal-vote all
+// reads in the sub-batch and compute each one's reference window, prefetching
+// those windows; (2) banded-extend all reads once the windows have arrived in
+// cache. This hides the per-read random DRAM access to the multi-GB reference
+// (the binding cost of extension on a large reference) by keeping hundreds of
+// window fetches in flight at once. Results are identical to per-read calls.
+void sa_align_reads_batch(const SaIndex &idx, const SaOpt &opt,
+                          const char *const *seqs, const int *lens, int n,
+                          SaAln *out);
+
 #endif  // RB_SA_MAP_H_

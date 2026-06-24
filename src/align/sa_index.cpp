@@ -12,22 +12,21 @@
 
 #include <zlib.h>
 
-// 64-bit integer hash (SplitMix64 finaliser) for k-mer hashing.
-static inline uint64_t sa_hash64(uint64_t x) {
-  x ^= x >> 30;
-  x *= 0xbf58476d1ce4e5b9ULL;
-  x ^= x >> 27;
-  x *= 0x94d049bb133111ebULL;
-  x ^= x >> 31;
-  return x;
-}
+// sa_hash64 + syncmer/randstrobe extraction come from sa_seed.h (via sa_index.h)
+// so the reference build and the per-read query share byte-identical seeding.
 
 bool SaIndex::build(const std::string &fasta, int k_, int w_, int threads) {
   if (threads < 1) threads = 1;
   k = k_;
   w = w_;
+  rs.k = k;  // strobe k mirrors the index k
   if (k < 8 || k > 31) {
     fprintf(stderr, "[Error!] aligner k must be in [8,31] (got %d)\n", k);
+    return false;
+  }
+  if (use_randstrobe && (rs.s < 1 || rs.s >= k)) {
+    fprintf(stderr, "[Error!] randstrobe s must be in [1,k-1] (got %d, k=%d)\n",
+            rs.s, k);
     return false;
   }
 
@@ -142,93 +141,156 @@ bool SaIndex::build(const std::string &fasta, int k_, int w_, int threads) {
           "[rabbitbin align] reference: %zu contigs, %llu bp (k=%d w=%d)\n",
           contigs.size(), (unsigned long long)total_len, k, w);
 
-  // Collect open minimizers over the forward strand (a seed is emitted whenever
-  // the minimum-hash k-mer in the sliding window of w consecutive k-mers
-  // changes). This is parallelised by partitioning the base axis into chunks
-  // that each emit the window events for the positions they OWN, while scanning
-  // a `kMargin`-base warm-up prefix so the rolling k-mer / window / dedup state
-  // converges to exactly what a single sequential pass would hold on entry to
-  // the owned range. Emission is keyed on the window-evaluation position `i`
-  // (each `i` belongs to exactly one chunk), and the per-cell logic is byte-for-
-  // byte the sequential recurrence below, so the resulting multiset of seeds is
-  // identical to the serial scan (order is irrelevant: the table is sorted).
-  const uint64_t kmask = (k < 32) ? ((1ULL << (2 * k)) - 1) : ~0ULL;
-
   std::vector<std::pair<uint64_t, uint32_t>> seeds;
-  if (total_len >= (uint64_t)k) {
-    // Warm-up length: enough to refill kmer (k) + window (w) several times over
-    // so the dedup `last_emitted` state is identical on entry to the owned span.
-    const uint64_t kMargin = 4096;
-    int nchunks = threads * 8;
-    if (nchunks < 1) nchunks = 1;
-    uint64_t chunk = (total_len + nchunks - 1) / (uint64_t)nchunks;
-    if (chunk < 1) chunk = 1;
-    nchunks = (int)((total_len + chunk - 1) / chunk);
-
-    std::vector<std::vector<std::pair<uint64_t, uint32_t>>> locals(nchunks);
+  if (use_randstrobe) {
+    // ----- Randstrobe seeding (strobealign-style) -----------------------
+    // Two parallel passes over the forward reference:
+    //   (1) extract open syncmers into a position-sorted array (chunked with a
+    //       warm-up margin so each syncmer is emitted exactly once, identical to
+    //       a serial scan);
+    //   (2) link each syncmer to a second strobe in its window -> randstrobe
+    //       {hash, strobe1_pos}. Pass 2 is a pure function of the syncmer array
+    //       (embarrassingly parallel by index), so no warm-up is needed.
+    // The anchor stored is strobe1's k-mer start, so diagonal voting at query
+    // time is identical to the minimizer path.
+    std::vector<std::pair<uint64_t, uint32_t>> sync;
+    if (total_len >= (uint64_t)k) {
+      const uint64_t kMargin = 4096;  // converges syncmer rolling state
+      int nchunks = threads * 8;
+      if (nchunks < 1) nchunks = 1;
+      uint64_t chunk = (total_len + nchunks - 1) / (uint64_t)nchunks;
+      if (chunk < 1) chunk = 1;
+      nchunks = (int)((total_len + chunk - 1) / chunk);
+      std::vector<std::vector<std::pair<uint64_t, uint32_t>>> locals(nchunks);
 
 #pragma omp parallel for num_threads(threads) schedule(dynamic, 1)
-    for (int c = 0; c < nchunks; ++c) {
-      uint64_t own_lo = (uint64_t)c * chunk;
-      uint64_t own_hi = own_lo + chunk;
-      if (own_hi > total_len) own_hi = total_len;
-      uint64_t scan_lo = (own_lo > kMargin) ? (own_lo - kMargin) : 0;
-
-      auto &out = locals[c];
-      out.reserve((own_hi - own_lo) / (w > 0 ? w : 1) + 16);
-
-      std::vector<std::pair<uint64_t, uint32_t>> win(w);
-      uint64_t kmer = 0;
-      int valid = 0;   // consecutive valid (non-N) bases
-      int wfill = 0;   // how many k-mers are in the window ring
-      uint32_t last_emitted = UINT32_MAX;
-
-      for (uint64_t i = scan_lo; i < own_hi; ++i) {
-        uint8_t b = seq[i];
-        if (b > 3) {  // N resets the rolling k-mer (last_emitted persists)
-          valid = 0;
-          wfill = 0;
-          kmer = 0;
-          continue;
-        }
-        kmer = ((kmer << 2) | b) & kmask;
-        if (++valid < k) continue;
-        uint32_t kpos = (uint32_t)(i - k + 1);  // k-mer start
-        uint64_t h = sa_hash64(kmer);
-        int slot = wfill % w;
-        win[slot] = {h, kpos};
-        ++wfill;
-        if (wfill < w) continue;
-        uint64_t best_h = UINT64_MAX;
-        uint32_t best_p = 0;
-        int start = wfill - w;
-        for (int j = 0; j < w; ++j) {
-          auto &e = win[(start + j) % w];
-          if (e.first < best_h) {
-            best_h = e.first;
-            best_p = e.second;
-          }
-        }
-        if (best_p != last_emitted) {
-          // Warm-up positions (i < own_lo) only advance dedup state; the owned
-          // span records, so each event is emitted by exactly one chunk.
-          if (i >= own_lo) out.emplace_back(best_h, best_p);
-          last_emitted = best_p;
-        }
+      for (int c = 0; c < nchunks; ++c) {
+        uint64_t own_lo = (uint64_t)c * chunk;
+        uint64_t own_hi = own_lo + chunk;
+        if (own_hi > total_len) own_hi = total_len;
+        uint64_t scan_lo = (own_lo > kMargin) ? (own_lo - kMargin) : 0;
+        std::vector<uint64_t> ring;
+        sa_collect_syncmers(seq.data(), scan_lo, own_lo, own_hi, rs.k, rs.s,
+                            locals[c], ring);
+      }
+      // Concatenate in chunk (= position) order -> sorted by position.
+      size_t nsync = 0;
+      for (auto &v : locals) nsync += v.size();
+      sync.reserve(nsync);
+      for (auto &v : locals) {
+        sync.insert(sync.end(), v.begin(), v.end());
+        std::vector<std::pair<uint64_t, uint32_t>>().swap(v);
       }
     }
+    fprintf(stderr, "[rabbitbin align] %zu syncmers; linking randstrobes\n",
+            sync.size());
 
-    size_t total_seeds = 0;
-    for (auto &v : locals) total_seeds += v.size();
-    seeds.reserve(total_seeds);
-    for (auto &v : locals) {
-      seeds.insert(seeds.end(), v.begin(), v.end());
-      std::vector<std::pair<uint64_t, uint32_t>>().swap(v);  // free early
+    // Pass 2: link randstrobes (parallel by syncmer index range).
+    if (!sync.empty()) {
+      int nchunks = threads * 8;
+      if (nchunks < 1) nchunks = 1;
+      size_t chunk = (sync.size() + nchunks - 1) / (size_t)nchunks;
+      if (chunk < 1) chunk = 1;
+      nchunks = (int)((sync.size() + chunk - 1) / chunk);
+      std::vector<std::vector<std::pair<uint64_t, uint32_t>>> locals(nchunks);
+#pragma omp parallel for num_threads(threads) schedule(dynamic, 1)
+      for (int c = 0; c < nchunks; ++c) {
+        size_t lo = (size_t)c * chunk;
+        size_t hi = lo + chunk;
+        if (hi > sync.size()) hi = sync.size();
+        locals[c].reserve(hi - lo);
+        sa_link_randstrobes(sync.data(), sync.size(), lo, hi, rs, locals[c]);
+      }
+      size_t total_seeds = 0;
+      for (auto &v : locals) total_seeds += v.size();
+      seeds.reserve(total_seeds);
+      for (auto &v : locals) {
+        seeds.insert(seeds.end(), v.begin(), v.end());
+        std::vector<std::pair<uint64_t, uint32_t>>().swap(v);
+      }
     }
-  }
+    std::vector<std::pair<uint64_t, uint32_t>>().swap(sync);  // free syncmers
+    fprintf(stderr, "[rabbitbin align] %zu randstrobe seeds; sorting\n",
+            seeds.size());
+  } else {
+    // ----- Open minimizer seeding (legacy) ------------------------------
+    // A seed is emitted whenever the minimum-hash k-mer in the sliding window
+    // of w consecutive k-mers changes. Parallelised by partitioning the base
+    // axis into chunks that each emit window events for the positions they OWN,
+    // while scanning a `kMargin`-base warm-up prefix so the rolling k-mer /
+    // window / dedup state converges to exactly what a single sequential pass
+    // would hold on entry to the owned range. Bit-identical to a serial scan.
+    const uint64_t kmask = (k < 32) ? ((1ULL << (2 * k)) - 1) : ~0ULL;
+    if (total_len >= (uint64_t)k) {
+      const uint64_t kMargin = 4096;
+      int nchunks = threads * 8;
+      if (nchunks < 1) nchunks = 1;
+      uint64_t chunk = (total_len + nchunks - 1) / (uint64_t)nchunks;
+      if (chunk < 1) chunk = 1;
+      nchunks = (int)((total_len + chunk - 1) / chunk);
 
-  fprintf(stderr, "[rabbitbin align] %zu minimizer seeds; sorting\n",
-          seeds.size());
+      std::vector<std::vector<std::pair<uint64_t, uint32_t>>> locals(nchunks);
+
+#pragma omp parallel for num_threads(threads) schedule(dynamic, 1)
+      for (int c = 0; c < nchunks; ++c) {
+        uint64_t own_lo = (uint64_t)c * chunk;
+        uint64_t own_hi = own_lo + chunk;
+        if (own_hi > total_len) own_hi = total_len;
+        uint64_t scan_lo = (own_lo > kMargin) ? (own_lo - kMargin) : 0;
+
+        auto &out = locals[c];
+        out.reserve((own_hi - own_lo) / (w > 0 ? w : 1) + 16);
+
+        std::vector<std::pair<uint64_t, uint32_t>> win(w);
+        uint64_t kmer = 0;
+        int valid = 0;   // consecutive valid (non-N) bases
+        int wfill = 0;   // how many k-mers are in the window ring
+        uint32_t last_emitted = UINT32_MAX;
+
+        for (uint64_t i = scan_lo; i < own_hi; ++i) {
+          uint8_t b = seq[i];
+          if (b > 3) {  // N resets the rolling k-mer (last_emitted persists)
+            valid = 0;
+            wfill = 0;
+            kmer = 0;
+            continue;
+          }
+          kmer = ((kmer << 2) | b) & kmask;
+          if (++valid < k) continue;
+          uint32_t kpos = (uint32_t)(i - k + 1);  // k-mer start
+          uint64_t h = sa_hash64(kmer);
+          int slot = wfill % w;
+          win[slot] = {h, kpos};
+          ++wfill;
+          if (wfill < w) continue;
+          uint64_t best_h = UINT64_MAX;
+          uint32_t best_p = 0;
+          int start = wfill - w;
+          for (int j = 0; j < w; ++j) {
+            auto &e = win[(start + j) % w];
+            if (e.first < best_h) {
+              best_h = e.first;
+              best_p = e.second;
+            }
+          }
+          if (best_p != last_emitted) {
+            if (i >= own_lo) out.emplace_back(best_h, best_p);
+            last_emitted = best_p;
+          }
+        }
+      }
+
+      size_t total_seeds = 0;
+      for (auto &v : locals) total_seeds += v.size();
+      seeds.reserve(total_seeds);
+      for (auto &v : locals) {
+        seeds.insert(seeds.end(), v.begin(), v.end());
+        std::vector<std::pair<uint64_t, uint32_t>>().swap(v);  // free early
+      }
+    }
+    fprintf(stderr, "[rabbitbin align] %zu minimizer seeds; sorting\n",
+            seeds.size());
+  }
   omp_set_num_threads(threads);
   __gnu_parallel::sort(seeds.begin(), seeds.end());
 
@@ -290,4 +352,51 @@ void SaIndex::query(uint64_t hash, std::vector<uint32_t> &out) const {
               mm_hash.begin();
   for (size_t i = lo; i < bh && mm_hash[i] == hash; ++i)
     out.push_back(mm_pos[i]);
+}
+
+void SaIndex::query_ranges_batch(const uint64_t *h, int n, uint32_t *out_lo,
+                                 uint32_t *out_hi) const {
+  if (n <= 0) return;
+  if (mm_bucket.empty()) {  // empty index: all ranges empty
+    for (int i = 0; i < n; ++i) out_lo[i] = out_hi[i] = 0;
+    return;
+  }
+  // Per-seed bucket bounds, carried between phases (reused per thread).
+  static thread_local std::vector<uint32_t> bl, bh;
+  if ((int)bl.size() < n) { bl.resize(n); bh.resize(n); }
+
+  const uint32_t *bucket = mm_bucket.data();
+  const uint64_t *hash = mm_hash.data();
+  const uint32_t *pos = mm_pos.data();
+
+  // Phase 1: prefetch every seed's bucket-directory entry. All n misses are
+  // issued before any is consumed, so they overlap in the memory system.
+  for (int i = 0; i < n; ++i)
+    __builtin_prefetch(&bucket[h[i] >> mm_shift]);
+
+  // Phase 2: read bucket bounds (now warm) and prefetch each hash slice.
+  for (int i = 0; i < n; ++i) {
+    uint64_t b = h[i] >> mm_shift;
+    uint32_t lo = bucket[b], hi = bucket[b + 1];
+    bl[i] = lo;
+    bh[i] = hi;
+    if (lo < hi) __builtin_prefetch(&hash[lo]);
+  }
+
+  // Phase 3: search each (warm) slice for the equal range; prefetch positions.
+  for (int i = 0; i < n; ++i) {
+    uint32_t lo = bl[i], hi = bh[i];
+    uint64_t key = h[i];
+    // lower_bound over the tiny prefix-bucket slice (usually ~1 cache line).
+    while (lo < hi) {
+      uint32_t mid = lo + ((hi - lo) >> 1);
+      if (hash[mid] < key) lo = mid + 1; else hi = mid;
+    }
+    uint32_t e = lo;
+    uint32_t top = bh[i];
+    while (e < top && hash[e] == key) ++e;
+    out_lo[i] = lo;
+    out_hi[i] = e;
+    if (lo < e) __builtin_prefetch(&pos[lo]);
+  }
 }

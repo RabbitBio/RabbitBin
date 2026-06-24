@@ -16,6 +16,8 @@
 #include <string>
 #include <vector>
 
+#include "sa_seed.h"  // SaRsParams, sa_hash64, syncmer/randstrobe extraction
+
 struct SaContig {
   std::string name;
   uint64_t offset;  // start of this contig in the concatenated base array
@@ -23,8 +25,16 @@ struct SaContig {
 };
 
 struct SaIndex {
-  int k = 15;  // k-mer length for minimizers
-  int w = 10;  // minimizer window
+  int k = 19;  // k-mer length (minimizers; also strobe k when use_randstrobe)
+  int w = 19;  // minimizer window (unused when use_randstrobe)
+
+  // Seeding mode. When true, the table is built from randstrobes (strobealign-
+  // style) instead of open minimizers; query-time seeding switches to match.
+  // The (hash -> ref_pos) table layout, query(), diagonal voting and banded DP
+  // are identical either way -- only what fills the table / what a read emits
+  // changes. randstrobe parameters live in `rs` (k mirrors the field above).
+  bool use_randstrobe = false;
+  SaRsParams rs;
 
   std::vector<uint8_t> seq;       // concatenated bases: 0=A 1=C 2=G 3=T 4=N
   std::vector<SaContig> contigs;  // contig directory (sorted by offset)
@@ -53,6 +63,18 @@ struct SaIndex {
 
   // Look up all reference positions for a minimizer hash; appends to `out`.
   void query(uint64_t hash, std::vector<uint32_t> &out) const;
+
+  // Batched, software-pipelined lookup (latency hiding via prefetch, the
+  // minibwa technique). For each of the `n` query hashes, computes the equal
+  // range [lo[i], hi[i]) into mm_pos so that mm_hash[lo[i]..hi[i]) == h[i]; the
+  // caller reads positions directly from mm_pos[lo[i]..hi[i]). Issuing all the
+  // bucket / hash-slice / position prefetches a phase ahead keeps many random
+  // memory requests in flight at once, which hides DRAM latency on the multi-GB
+  // seed table (the dominant cost of seeding on a large reference). The ranges
+  // are identical to calling query() per hash, so downstream voting/results are
+  // unchanged. lo/hi must each have room for `n` entries.
+  void query_ranges_batch(const uint64_t *h, int n, uint32_t *lo,
+                          uint32_t *hi) const;
 };
 
 // 2-bit base encoding helpers.

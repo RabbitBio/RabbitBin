@@ -253,8 +253,13 @@ void align_usage() {
       "  -p, --interleaved FILE   Interleaved paired FASTQ(.gz)\n"
       "  -o, --out FILE     Output (default stdout). .bam => BAM, else SAM\n"
       "  -t, --threads N    Threads (default: all online CPUs)\n"
-      "  -k INT             Minimizer k (default 15)\n"
-      "  -w INT             Minimizer window (default 10)\n"
+      "  -k INT             Seed k-mer (minimizer k / strobe k; default 19)\n"
+      "  -w INT             Minimizer window (default 19; minimizer mode only)\n"
+      "      --seed MODE    minimizer (default) | randstrobe\n"
+      "      --rs-s INT     randstrobe syncmer s-mer (default 16)\n"
+      "      --rs-wmin INT  randstrobe window min (default 5)\n"
+      "      --rs-wmax INT  randstrobe window max (default 11)\n"
+      "      --rs-maxdist INT  randstrobe max strobe gap bp (default 80)\n"
       "      --band INT     Banded-DP half width (default 31)\n"
       "  -h, --help         Show this help\n");
 }
@@ -403,14 +408,33 @@ int rb_align_run(const SaIndex &idx, const SaOpt &opt, const std::string &r1,
     ob->b1.assign(ib->got, nullptr);
     if (paired) ob->b2.assign(ib->got, nullptr);
     int64_t nt = 0, nm = 0;
+
+    // Align the WHOLE batch in one batched, latency-hidden pass before building
+    // records. Reads are laid out [A0,B0,A1,B1,...] (paired) or [A0,A1,...] so
+    // the aligner's sub-batch pipeline keeps many reference-window prefetches in
+    // flight. Per-read results are identical to aligning one at a time.
+    static thread_local std::vector<const char *> seqs;
+    static thread_local std::vector<int> lens;
+    static thread_local std::vector<SaAln> alns;
+    const int m = paired ? 2 * ib->got : ib->got;
+    if ((int)seqs.size() < m) { seqs.resize(m); lens.resize(m); alns.resize(m); }
     for (int i = 0; i < ib->got; ++i) {
-      SaAln a1 =
-          sa_align_read(idx, opt, ib->A[i].seq.c_str(), (int)ib->A[i].seq.size());
+      int ia = paired ? 2 * i : i;
+      seqs[ia] = ib->A[i].seq.c_str();
+      lens[ia] = (int)ib->A[i].seq.size();
+      if (paired) {
+        seqs[2 * i + 1] = ib->B[i].seq.c_str();
+        lens[2 * i + 1] = (int)ib->B[i].seq.size();
+      }
+    }
+    sa_align_reads_batch(idx, opt, seqs.data(), lens.data(), m, alns.data());
+
+    for (int i = 0; i < ib->got; ++i) {
+      SaAln a1 = std::move(alns[paired ? 2 * i : i]);
       ++nt;
       if (a1.mapped) ++nm;
       if (paired) {
-        SaAln a2 = sa_align_read(idx, opt, ib->B[i].seq.c_str(),
-                                 (int)ib->B[i].seq.size());
+        SaAln a2 = std::move(alns[2 * i + 1]);
         ++nt;
         if (a2.mapped) ++nm;
         int m1tid = a2.mapped ? a2.contig : -1;
@@ -579,15 +603,29 @@ int rb_align_run(const SaIndex &idx, const SaOpt &opt, const std::string &r1,
 
 int rb_cmd_bwa(int ac, char *av[]) {
   std::string ref, r1, r2, interleaved_path, out_path;
-  int threads = 0, k = 15, w = 10, band = 31;
+  int threads = 0, k = 19, w = 19, band = 31;
+  bool use_rs = false;  // minimizer seeding by default (faster: smaller index)
+  SaRsParams rs;       // defaults: s=16 wmin=5 wmax=11 maxdist=80 q=255
 
-  enum { OPT_BAND = 1000 };
+  enum {
+    OPT_BAND = 1000,
+    OPT_SEED = 1001,
+    OPT_RS_S = 1002,
+    OPT_RS_WMIN = 1003,
+    OPT_RS_WMAX = 1004,
+    OPT_RS_MAXDIST = 1005
+  };
   static const struct option longopts[] = {
       {"ref", required_argument, 0, 'r'},
       {"interleaved", required_argument, 0, 'p'},
       {"out", required_argument, 0, 'o'},
       {"threads", required_argument, 0, 't'},
       {"band", required_argument, 0, OPT_BAND},
+      {"seed", required_argument, 0, OPT_SEED},
+      {"rs-s", required_argument, 0, OPT_RS_S},
+      {"rs-wmin", required_argument, 0, OPT_RS_WMIN},
+      {"rs-wmax", required_argument, 0, OPT_RS_WMAX},
+      {"rs-maxdist", required_argument, 0, OPT_RS_MAXDIST},
       {"help", no_argument, 0, 'h'},
       {0, 0, 0, 0}};
   optind = 1;
@@ -604,6 +642,13 @@ int rb_cmd_bwa(int ac, char *av[]) {
       case 'k': k = atoi(optarg); break;
       case 'w': w = atoi(optarg); break;
       case OPT_BAND: band = atoi(optarg); break;
+      case OPT_SEED:
+        use_rs = (std::string(optarg) != "minimizer");
+        break;
+      case OPT_RS_S: rs.s = atoi(optarg); break;
+      case OPT_RS_WMIN: rs.w_min = atoi(optarg); break;
+      case OPT_RS_WMAX: rs.w_max = atoi(optarg); break;
+      case OPT_RS_MAXDIST: rs.max_dist = atoi(optarg); break;
       case 'h': align_usage(); return 0;
       default: align_usage(); return 1;
     }
@@ -622,6 +667,8 @@ int rb_cmd_bwa(int ac, char *av[]) {
   if (threads <= 0) threads = (onln > 0) ? (int)onln : 1;
 
   SaIndex idx;
+  idx.use_randstrobe = use_rs;
+  idx.rs = rs;
   if (!idx.build(ref, k, w, threads)) return 1;
 
   SaOpt opt;

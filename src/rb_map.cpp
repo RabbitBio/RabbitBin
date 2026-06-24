@@ -26,6 +26,9 @@
 #include "rb_map_cli.h"
 #include "align/rb_align_api.h"
 #include "bamsort/rb_bam_sort.h"
+#ifdef RABBITBIN_ENABLE_STROBE
+#include "align/rb_strobe.h"
+#endif
 
 namespace {
 
@@ -65,8 +68,8 @@ void map_usage() {
       "                     2 cols => reads1 is interleaved (-p); 3 cols => -1/-2.\n"
       "  -t, --threads N    Threads (default: all online CPUs)\n"
       "  -l, --level N      Output compression level 0-9 (default 6)\n"
-      "  -k INT             Minimizer k (default 15)\n"
-      "  -w INT             Minimizer window (default 10)\n"
+      "  -k INT             Minimizer k (default 19)\n"
+      "  -w INT             Minimizer window (default 19)\n"
       "      --band INT     Banded-DP half width (default 31)\n"
       "      --no-index     Do not write the .bai\n"
       "  -h, --help         Show this help\n");
@@ -96,6 +99,30 @@ std::vector<bam1_t *> *align_sort_sample(const SaIndex &idx, const SaOpt &opt,
   rb_stable_coord_sort(*recs);
   return recs;
 }
+
+#ifdef RABBITBIN_ENABLE_STROBE
+// Same as align_sort_sample but using the strobealign engine (shared mapper).
+std::vector<bam1_t *> *align_sort_sample_strobe(StrobeMapper *sm,
+                                                sam_hdr_t *hdr, const Sample &s,
+                                                int threads) {
+  auto *recs = new std::vector<bam1_t *>();
+  recs->reserve(1u << 22);
+  CollectCtx ctx{recs};
+  fprintf(stderr, "[rabbitbin map] %s: aligning (strobe) -> in-memory records\n",
+          s.out.c_str());
+  int rc = rb_strobe_run(sm, s.r1, s.r2, s.interleaved, threads,
+                         /*out=*/nullptr, hdr, collect_sink, &ctx);
+  if (rc != 0) {
+    for (auto *b : *recs) bam_destroy1(b);
+    delete recs;
+    return nullptr;
+  }
+  fprintf(stderr, "[rabbitbin map] %s: sorting %zu records\n", s.out.c_str(),
+          recs->size());
+  rb_stable_coord_sort(*recs);
+  return recs;
+}
+#endif
 
 // Parse a --samples manifest into a list of Sample specs. Returns false on a
 // malformed line (and prints the offending line number).
@@ -152,10 +179,29 @@ bool parse_samples_manifest(const std::string &path,
 
 int rb_cmd_map(int ac, char *av[]) {
   std::string ref, r1, r2, interleaved_path, out_path, samples_path;
-  int threads = 0, level = 6, k = 15, w = 10, band = 31;
+  int threads = 0, level = 6, k = 19, w = 19, band = 31;
   bool no_index = false;
+  bool use_rs = false;  // minimizer seeding by default (faster: smaller index)
+  int read_len = 150;   // strobe engine: read-length parameter profile
+#ifdef RABBITBIN_ENABLE_STROBE
+  bool use_strobe = true;  // strobealign engine: faster + better binning
+#else
+  bool use_strobe = false;
+#endif
+  SaRsParams rs;       // defaults: s=16 wmin=5 wmax=11 maxdist=80 q=255
 
-  enum { OPT_BAND = 1000, OPT_NOINDEX = 1001, OPT_SAMPLES = 1002 };
+  enum {
+    OPT_BAND = 1000,
+    OPT_NOINDEX = 1001,
+    OPT_SAMPLES = 1002,
+    OPT_SEED = 1003,
+    OPT_RS_S = 1004,
+    OPT_RS_WMIN = 1005,
+    OPT_RS_WMAX = 1006,
+    OPT_RS_MAXDIST = 1007,
+    OPT_ENGINE = 1008,
+    OPT_READLEN = 1009
+  };
   static const struct option longopts[] = {
       {"ref", required_argument, 0, 'r'},
       {"interleaved", required_argument, 0, 'p'},
@@ -164,6 +210,13 @@ int rb_cmd_map(int ac, char *av[]) {
       {"threads", required_argument, 0, 't'},
       {"level", required_argument, 0, 'l'},
       {"band", required_argument, 0, OPT_BAND},
+      {"seed", required_argument, 0, OPT_SEED},
+      {"engine", required_argument, 0, OPT_ENGINE},
+      {"read-len", required_argument, 0, OPT_READLEN},
+      {"rs-s", required_argument, 0, OPT_RS_S},
+      {"rs-wmin", required_argument, 0, OPT_RS_WMIN},
+      {"rs-wmax", required_argument, 0, OPT_RS_WMAX},
+      {"rs-maxdist", required_argument, 0, OPT_RS_MAXDIST},
       {"no-index", no_argument, 0, OPT_NOINDEX},
       {"help", no_argument, 0, 'h'},
       {0, 0, 0, 0}};
@@ -180,7 +233,20 @@ int rb_cmd_map(int ac, char *av[]) {
       case OPT_SAMPLES: samples_path = optarg; break;
       case 't': threads = atoi(optarg); break;
       case 'l': level = atoi(optarg); break;
+      case 'k': k = atoi(optarg); break;
+      case 'w': w = atoi(optarg); break;
       case OPT_BAND: band = atoi(optarg); break;
+      case OPT_ENGINE:
+        use_strobe = (std::string(optarg) == "strobe");
+        break;
+      case OPT_READLEN: read_len = atoi(optarg); break;
+      case OPT_SEED:
+        use_rs = (std::string(optarg) != "minimizer");
+        break;
+      case OPT_RS_S: rs.s = atoi(optarg); break;
+      case OPT_RS_WMIN: rs.w_min = atoi(optarg); break;
+      case OPT_RS_WMAX: rs.w_max = atoi(optarg); break;
+      case OPT_RS_MAXDIST: rs.max_dist = atoi(optarg); break;
       case OPT_NOINDEX: no_index = true; break;
       case 'h': map_usage(); return 0;
       default: map_usage(); return 1;
@@ -228,11 +294,26 @@ int rb_cmd_map(int ac, char *av[]) {
   omp_set_num_threads(threads);
 
   // Build the index ONCE and reuse it (and the header) for every sample.
+  // Two engines: the vendored strobealign (default; faster + better binning)
+  // or the legacy minimizer seed-and-extend (--engine minimizer).
   SaIndex idx;
-  if (!idx.build(ref, k, w, threads)) return 1;
   SaOpt opt;
-  opt.band = band;
-  sam_hdr_t *hdr = rb_align_make_header(idx);
+  sam_hdr_t *hdr = nullptr;
+#ifdef RABBITBIN_ENABLE_STROBE
+  StrobeMapper *sm = nullptr;
+  if (use_strobe) {
+    sm = rb_strobe_build(ref, read_len, threads);
+    if (!sm) return 1;
+    hdr = rb_strobe_make_header(sm);
+  } else
+#endif
+  {
+    idx.use_randstrobe = use_rs;
+    idx.rs = rs;
+    if (!idx.build(ref, k, w, threads)) return 1;
+    opt.band = band;
+    hdr = rb_align_make_header(idx);
+  }
 
   // Per sample: align + sort (uses all cores via the aligner pipeline) on the
   // main thread, then hand the sorted records to a SINGLE background writer so
@@ -250,8 +331,13 @@ int rb_cmd_map(int ac, char *av[]) {
     if (samples.size() > 1)
       fprintf(stderr, "[rabbitbin map] === sample %zu/%zu: %s ===\n", i + 1,
               samples.size(), samples[i].out.c_str());
-    std::vector<bam1_t *> *recs =
-        align_sort_sample(idx, opt, hdr, samples[i], threads);
+    std::vector<bam1_t *> *recs = nullptr;
+#ifdef RABBITBIN_ENABLE_STROBE
+    if (use_strobe)
+      recs = align_sort_sample_strobe(sm, hdr, samples[i], threads);
+    else
+#endif
+      recs = align_sort_sample(idx, opt, hdr, samples[i], threads);
     if (!recs) {
       rc = 1;
       fprintf(stderr, "[Error!] sample %s failed; aborting\n",
@@ -286,6 +372,9 @@ int rb_cmd_map(int ac, char *av[]) {
   if (rc == 0 && !pending_bai.empty()) rb_index_bam(pending_bai, threads);
 
   sam_hdr_destroy(hdr);
+#ifdef RABBITBIN_ENABLE_STROBE
+  if (sm) rb_strobe_free(sm);
+#endif
   if (rc == 0) fprintf(stderr, "[rabbitbin map] done (%zu sample(s))\n",
                        samples.size());
   return rc;
