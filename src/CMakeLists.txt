@@ -61,9 +61,36 @@ if(DEFLATE_LIB)
   set(RABBITBIN_CAN_FUSE TRUE)
 endif()
 
+# ── align / sort / index subcommands (rabbitbin map / bwa / sortbam / bai) ──
+# Self-contained CPU aligner (src/align), coordinate sort (src/bamsort), and
+# BAI index (src/bamindex), fused by src/rb_map.cpp. Needs htslib (BAM/BGZF
+# read+write+index) and zlib (FASTQ.gz). Disable with -DRABBITBIN_ENABLE_MAP=OFF.
+option(RABBITBIN_ENABLE_MAP "Build align/sort/index subcommands (map/bwa/sortbam/bai)" ON)
+set(RABBITBIN_MAP_OK FALSE)
+if(RABBITBIN_ENABLE_MAP AND HTSlib_FOUND)
+  list(APPEND RABBITBIN_SRC
+    rb_map.cpp
+    align/rb_align.cpp align/sa_index.cpp align/sa_map.cpp
+    bamsort/rb_sort.cpp
+    bamindex/rb_index.cpp)
+  set(RABBITBIN_MAP_OK TRUE)
+endif()
+
 add_executable(rabbitbin ${RABBITBIN_SRC})
 if(NOT "${EXTRA_DEPENDENCIES}" STREQUAL "")
   add_dependencies(rabbitbin ${EXTRA_DEPENDENCIES})
+endif()
+if(RABBITBIN_MAP_OK)
+  target_compile_definitions(rabbitbin PRIVATE RABBITBIN_ENABLE_MAP)
+  target_include_directories(rabbitbin PRIVATE
+    ${HTSlib_INCLUDE_DIRS}
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/align
+    ${CMAKE_CURRENT_SOURCE_DIR}/bamsort)
+  target_link_libraries(rabbitbin ${HTSlib_LIBRARIES} ${ZLIB_LIBRARIES})
+  message(STATUS "rabbitbin: align/sort/index subcommands enabled (map/bwa/sortbam/bai)")
+else()
+  message(STATUS "rabbitbin: align/sort/index subcommands disabled (need htslib)")
 endif()
 target_link_libraries(rabbitbin ${ZLIB_LIBRARIES} ${Boost_LIBRARIES} ${EXTRALIBS} RabbitBin_VERSION_LIB deflate)
 if(RABBITBIN_CAN_FUSE)
