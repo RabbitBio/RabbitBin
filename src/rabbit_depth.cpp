@@ -11,6 +11,7 @@
 #include <stdexcept>
 
 #include "rabbit_depth.h"
+#include "rabbit_depth_fuse.h"
 #include "version.h"
 
 #include "IOThreadBuffer.h"
@@ -770,6 +771,133 @@ std::string compute_depth_tsv_inmem(const StringVector &bamFilePaths,
     f << tsv;
   }
   return tsv;
+}
+
+// ── Fused depth from in-memory records (rabbitbin map --fused-depth) ─────────
+// `map` produces each sample's coordinate-sorted bam1_t records in memory; we
+// accumulate that sample's per-contig depth column directly (no BAM written,
+// no re-read), free the records, and at the end format the same MetaBAT depth
+// TSV as the BAM path. The per-record filter/overlap logic mirrors
+// process_depth_shard EXACTLY (caldepth + pctid + edge), so the output is
+// byte-identical to writing the BAM and running depth on it. Accumulation is
+// commutative, so processing in sorted order matches the sharded path.
+
+// Accumulate one sample's column. Returns the depth array + sampled avg read.
+DepthColumn depth_accumulate_sample(const std::vector<bam1_t *> &recs,
+                                    bam_header_t *header, float percentIdentity,
+                                    int maxEdgeBases, bool includeEdgeBases,
+                                    int minMapQual) {
+  CheckRead::_edgeBases() = maxEdgeBases;
+  const int32_t n_targets = header->n_targets;
+  DepthColumn col;
+  col.depth.reset(new CountType[n_targets]());
+  // Average read length from the first ~4000 mapped reads (matches the BAM path
+  // which samples the first records after the first record voff; both are in
+  // coordinate-sorted order).
+  int64_t srs = 0, src = 0;
+  for (auto *b : recs) {
+    if (src >= 4000) break;
+    if ((b->core.flag & BAM_FUNMAP) == 0) { srs += b->core.l_qseq; ++src; }
+  }
+  col.avgRead = src ? (int)(srs / src) : 0;
+
+  const int edge =
+      includeEdgeBases ? 0 : std::min(maxEdgeBases, col.avgRead / 3);
+  CountType *contigDepths = col.depth.get();
+
+  // Parallelise over CONTIGUOUS record ranges snapped to tid boundaries: the
+  // records are coordinate-sorted, so each range owns a disjoint set of tids and
+  // writes to disjoint contigDepths[] entries -- no locks, no per-thread copies.
+  const size_t N = recs.size();
+  int T = omp_get_max_threads();
+  if (T < 1) T = 1;
+  std::vector<size_t> bounds;
+  bounds.push_back(0);
+  for (int s = 1; s < T && N > 0; ++s) {
+    size_t tgt = (size_t)((double)s / T * N);
+    if (tgt <= bounds.back()) continue;
+    int32_t tg = recs[tgt]->core.tid;
+    while (tgt < N && recs[tgt]->core.tid == tg) ++tgt;  // next tid start
+    if (tgt < N && tgt > bounds.back()) bounds.push_back(tgt);
+  }
+  bounds.push_back(N);
+  const int nshard = (int)bounds.size() - 1;
+
+#pragma omp parallel for schedule(dynamic, 1)
+  for (int si = 0; si < nshard; ++si) {
+    size_t lo = bounds[si], hi = bounds[si + 1];
+    DepthCounts none{};
+    for (size_t r = lo; r < hi; ++r) {
+      bam1_t *b = recs[r];
+      int32_t tid = b->core.tid;
+      int32_t pos = b->core.pos;
+      if ((b->core.flag & BAM_FUNMAP) == 0 && (tid >= n_targets || pos < 0))
+        continue;
+      if ((b->core.flag & (BAM_FPAIRED | BAM_FMUNMAP)) == BAM_FPAIRED &&
+          (b->core.mtid < 0 || b->core.mtid >= n_targets))
+        continue;
+      if (BamNameTrackingChooser::unsupportedRead(b)) continue;
+      if ((b->core.flag & BAM_FUNMAP) == BAM_FUNMAP || b->core.qual < minMapQual)
+        continue;
+      bam1_t *bb = b;
+      if (!CheckRead::checkEnd(bb, header)) {
+        bb = CheckRead::fixEndClip(bb, header);
+        if (!CheckRead::checkEnd(bb, header)) continue;
+      }
+      ReadStatistics rs;
+      CountType ov =
+          caldepth(bb, none, header->target_len[tid], NULL, edge, &rs);
+      if (rs.isValid() && rs.getPctId() >= percentIdentity)
+        contigDepths[tid] += ov;  // disjoint tid per shard => race-free
+    }
+  }
+  return col;
+}
+
+// Format the MetaBAT depth TSV from per-sample columns (after all samples done).
+std::string depth_format_table(const std::vector<DepthColumn> &cols,
+                               const std::vector<std::string> &sampleNames,
+                               bam_header_t *header, float percentIdentity,
+                               int minContigLength, float minContigDepth,
+                               int maxEdgeBases, bool includeEdgeBases,
+                               bool intraDepthVariance) {
+  const int num_bams = (int)cols.size();
+  const int32_t n_targets = header->n_targets;
+  BoolVector contigLengthPass(n_targets, false), contigDepthPass(n_targets, true);
+  for (int32_t i = 0; i < n_targets; i++)
+    contigLengthPass[i] = ((int)header->target_len[i] >= minContigLength);
+
+  CountTypeMatrix bamContigDepths(num_bams);
+  VarianceTypeMatrix bamContigVariances(num_bams);
+  std::vector<int> averageReadSize(num_bams, 0);
+  int minAvgRead = INT_MAX;
+  for (int bi = 0; bi < num_bams; bi++) {
+    bamContigDepths[bi] = cols[bi].depth;
+    averageReadSize[bi] = cols[bi].avgRead;
+    if (minAvgRead > averageReadSize[bi]) minAvgRead = averageReadSize[bi];
+    if (intraDepthVariance)
+      bamContigVariances[bi].assign(n_targets, VarianceType());
+  }
+  if (intraDepthVariance) {
+    for (int bi = 0; bi < num_bams; bi++) {
+      const int edge =
+          includeEdgeBases ? 0 : std::min(maxEdgeBases, averageReadSize[bi] / 3);
+      const CountType *cd = bamContigDepths[bi].get();
+      auto &vars = bamContigVariances[bi];
+      for (int32_t t = 0; t < n_targets; t++) {
+        int32_t cl = header->target_len[t];
+        int32_t adj = (cl > 2 * edge + 1) ? (cl - 2 * edge) : cl;
+        vars[t].mean = (adj > 2) ? (float)((double)cd[t] / adj) : 0.0f;
+        vars[t].variance = 0.0f;
+      }
+    }
+  }
+  std::ostringstream out;
+  printDepthTable(out, sampleNames, intraDepthVariance, bamContigDepths,
+                  averageReadSize, percentIdentity, bamContigVariances, header,
+                  contigLengthPass, contigDepthPass, minContigDepth,
+                  includeEdgeBases, std::min(maxEdgeBases, minAvgRead / 3));
+  return out.str();
 }
 
 // ── Generic depth (BAM or CRAM), reference-aware ────────────────────────────
