@@ -29,6 +29,9 @@
 #ifdef RABBITBIN_ENABLE_STROBE
 #include "align/rb_strobe.h"
 #endif
+#ifdef RABBITBIN_FUSE
+#include "rabbit_depth_fuse.h"  // fused map->depth (--fused-depth)
+#endif
 
 namespace {
 
@@ -188,6 +191,12 @@ int rb_cmd_map(int ac, char *av[]) {
 #else
   bool use_strobe = false;
 #endif
+  // --fused-depth: compute the MetaBAT depth TSV directly from each sample's
+  // in-memory records (no BAM written/reread). Output is byte-identical to
+  // `depth` on the written BAMs. Depth params mirror the `depth` defaults.
+  std::string fused_depth_out;
+  int fd_pctid = 97, fd_min_len = 1000;
+  double fd_min_depth = 1.0;
   SaRsParams rs;       // defaults: s=16 wmin=5 wmax=11 maxdist=80 q=255
 
   enum {
@@ -200,7 +209,11 @@ int rb_cmd_map(int ac, char *av[]) {
     OPT_RS_WMAX = 1006,
     OPT_RS_MAXDIST = 1007,
     OPT_ENGINE = 1008,
-    OPT_READLEN = 1009
+    OPT_READLEN = 1009,
+    OPT_FUSED_DEPTH = 1010,
+    OPT_FD_PCTID = 1011,
+    OPT_FD_MINLEN = 1012,
+    OPT_FD_MINDEPTH = 1013
   };
   static const struct option longopts[] = {
       {"ref", required_argument, 0, 'r'},
@@ -213,6 +226,10 @@ int rb_cmd_map(int ac, char *av[]) {
       {"seed", required_argument, 0, OPT_SEED},
       {"engine", required_argument, 0, OPT_ENGINE},
       {"read-len", required_argument, 0, OPT_READLEN},
+      {"fused-depth", required_argument, 0, OPT_FUSED_DEPTH},
+      {"percent-identity", required_argument, 0, OPT_FD_PCTID},
+      {"min-contig-length", required_argument, 0, OPT_FD_MINLEN},
+      {"min-contig-depth", required_argument, 0, OPT_FD_MINDEPTH},
       {"rs-s", required_argument, 0, OPT_RS_S},
       {"rs-wmin", required_argument, 0, OPT_RS_WMIN},
       {"rs-wmax", required_argument, 0, OPT_RS_WMAX},
@@ -240,6 +257,10 @@ int rb_cmd_map(int ac, char *av[]) {
         use_strobe = (std::string(optarg) == "strobe");
         break;
       case OPT_READLEN: read_len = atoi(optarg); break;
+      case OPT_FUSED_DEPTH: fused_depth_out = optarg; break;
+      case OPT_FD_PCTID: fd_pctid = atoi(optarg); break;
+      case OPT_FD_MINLEN: fd_min_len = atoi(optarg); break;
+      case OPT_FD_MINDEPTH: fd_min_depth = atof(optarg); break;
       case OPT_SEED:
         use_rs = (std::string(optarg) != "minimizer");
         break;
@@ -327,6 +348,13 @@ int rb_cmd_map(int ac, char *av[]) {
   std::thread writer;
   std::atomic<int> write_rc{0};
   std::string pending_bai;  // out path whose .bai is owed once `writer` joins
+#ifdef RABBITBIN_FUSE
+  std::vector<DepthColumn> fd_cols;   // fused: one depth column per sample
+  std::vector<std::string> fd_names;  // fused: column labels (= sample out path)
+  const bool fused = !fused_depth_out.empty();
+#else
+  const bool fused = false;
+#endif
   for (size_t i = 0; i < samples.size(); ++i) {
     if (samples.size() > 1)
       fprintf(stderr, "[rabbitbin map] === sample %zu/%zu: %s ===\n", i + 1,
@@ -344,6 +372,23 @@ int rb_cmd_map(int ac, char *av[]) {
               samples[i].out.c_str());
       break;
     }
+#ifdef RABBITBIN_FUSE
+    if (fused) {
+      // No BAM written: accumulate this sample's depth column from the sorted
+      // in-memory records, then free them. Byte-identical to writing the BAM
+      // and running `depth` (same records, same per-read filter/overlap).
+      fprintf(stderr, "[rabbitbin map] %s: accumulating depth (fused)\n",
+              samples[i].out.c_str());
+      DepthColumn col = depth_accumulate_sample(
+          *recs, hdr, (float)fd_pctid / 100.0f, /*maxEdgeBases=*/75,
+          /*includeEdgeBases=*/false, /*minMapQual=*/0);
+      fd_cols.push_back(std::move(col));
+      fd_names.push_back(samples[i].out);
+      for (auto *b : *recs) bam_destroy1(b);
+      delete recs;
+      continue;
+    }
+#endif
     // Finish the previous sample's write, then index it on the main thread.
     if (writer.joinable()) writer.join();
     if (write_rc.load() != 0) {
@@ -370,6 +415,26 @@ int rb_cmd_map(int ac, char *av[]) {
   if (writer.joinable()) writer.join();
   if (rc == 0 && write_rc.load() != 0) rc = write_rc.load();
   if (rc == 0 && !pending_bai.empty()) rb_index_bam(pending_bai, threads);
+
+#ifdef RABBITBIN_FUSE
+  if (rc == 0 && fused) {
+    std::string tsv = depth_format_table(
+        fd_cols, fd_names, hdr, (float)fd_pctid / 100.0f, fd_min_len,
+        (float)fd_min_depth, /*maxEdgeBases=*/75, /*includeEdgeBases=*/false,
+        /*intraDepthVariance=*/true);
+    FILE *f = fopen(fused_depth_out.c_str(), "wb");
+    if (f) {
+      fwrite(tsv.data(), 1, tsv.size(), f);
+      fclose(f);
+      fprintf(stderr, "[rabbitbin map] fused depth -> %s (%zu bytes)\n",
+              fused_depth_out.c_str(), tsv.size());
+    } else {
+      fprintf(stderr, "[Error!] cannot open --fused-depth output: %s\n",
+              fused_depth_out.c_str());
+      rc = 1;
+    }
+  }
+#endif
 
   sam_hdr_destroy(hdr);
 #ifdef RABBITBIN_ENABLE_STROBE

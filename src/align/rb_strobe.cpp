@@ -20,6 +20,7 @@
 
 #include <cstring>
 #include <string_view>
+#include <omp.h>
 #include <zlib.h>
 #include <htslib/sam.h>
 
@@ -55,10 +56,89 @@ struct StrobeMapper {
         map_param(mp) {}
 };
 
+// Parallel FASTA loader: build strobealign's References from a (.gz ok) FASTA
+// using all cores. The single-threaded References::from_fasta does line-by-line
+// getline over millions of contigs (~20s on the 6.1M-contig CAMI3 reference);
+// here the file is read once, contig-start offsets located, and each contig
+// parsed in parallel. Contig ORDER is preserved (ref_id == BAM tid == @SQ order),
+// and sequences are uppercased exactly as from_fasta does.
+static References build_references_parallel(const std::string &fasta,
+                                            int threads) {
+  // Read the whole file (gzread is transparent for uncompressed input too).
+  std::string raw;
+  {
+    gzFile fp = gzopen(fasta.c_str(), "rb");
+    if (!fp) throw std::runtime_error("cannot open reference FASTA: " + fasta);
+    const size_t CH = 32u << 20;
+    size_t used = 0;
+    for (;;) {
+      raw.resize(used + CH);
+      int n = gzread(fp, &raw[used], (unsigned)CH);
+      if (n <= 0) break;
+      used += (size_t)n;
+    }
+    gzclose(fp);
+    raw.resize(used);
+  }
+  if (raw.empty() || raw[0] != '>')
+    throw std::runtime_error("FASTA must begin with '>'");
+
+  // Locate contig starts: offset 0 and every '\n' immediately followed by '>'.
+  std::vector<size_t> starts;
+  starts.push_back(0);
+  {
+    const char *base = raw.data();
+    const char *p = base;
+    const char *end = base + raw.size();
+    while (p < end) {
+      const char *nl = (const char *)memchr(p, '\n', end - p);
+      if (!nl) break;
+      size_t j = (size_t)(nl - base) + 1;
+      if (j < raw.size() && base[j] == '>') starts.push_back(j);
+      p = nl + 1;
+    }
+  }
+  const size_t n = starts.size();
+  std::vector<std::string> names(n), seqs(n);
+
+#pragma omp parallel for num_threads(threads < 1 ? 1 : threads) schedule(dynamic, 256)
+  for (long long ci = 0; ci < (long long)n; ++ci) {
+    size_t s = starts[ci];
+    size_t e = (ci + 1 < (long long)n) ? starts[ci + 1] : raw.size();
+    const char *p = raw.data() + s;
+    const char *cend = raw.data() + e;
+    // Header line (after '>'), name = up to first whitespace.
+    const char *hnl = (const char *)memchr(p, '\n', cend - p);
+    const char *hend = hnl ? hnl : cend;
+    const char *np = p + 1;  // skip '>'
+    const char *ne = np;
+    while (ne < hend && *ne != ' ' && *ne != '\t' && *ne != '\r' && *ne != '\v' &&
+           *ne != '\f')
+      ++ne;
+    names[ci].assign(np, ne - np);
+    // Sequence: concatenate the remaining lines, uppercased, newlines stripped.
+    std::string &seq = seqs[ci];
+    seq.reserve((size_t)(cend - (hnl ? hnl + 1 : cend)));
+    const char *q = hnl ? hnl + 1 : cend;
+    while (q < cend) {
+      const char *nl = (const char *)memchr(q, '\n', cend - q);
+      const char *le = nl ? nl : cend;
+      for (const char *t = q; t < le; ++t) {
+        char c = *t;
+        if (c == '\r') continue;
+        seq.push_back((char)(c & ~32));  // uppercase (matches to_uppercase)
+      }
+      if (!nl) break;
+      q = nl + 1;
+    }
+  }
+  return References(std::move(seqs), std::move(names));
+}
+
 StrobeMapper *rb_strobe_build(const std::string &ref_fasta, int read_len,
                               int threads) {
   try {
-    References refs = References::from_fasta(ref_fasta);
+    References refs = build_references_parallel(ref_fasta, threads);
     fprintf(stderr,
             "[rabbitbin strobe] reference: %zu contigs, %zu bp (r=%d)\n",
             refs.size(), refs.total_length(), read_len);
