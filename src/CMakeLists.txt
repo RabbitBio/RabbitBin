@@ -85,10 +85,11 @@ if(RABBITBIN_ENABLE_STROBE AND HTSlib_FOUND)
   target_include_directories(strobe_engine PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/align/strobe
     ${CMAKE_CURRENT_SOURCE_DIR}/align/strobe/ext
-    ${CMAKE_CURRENT_SOURCE_DIR}/align/strobe/ext/zstr/src)
+    ${CMAKE_CURRENT_SOURCE_DIR}/align/strobe/ext/zstr/src
+    ${HTSlib_INCLUDE_DIRS})
   target_compile_features(strobe_engine PUBLIC cxx_std_17)
   find_package(Threads REQUIRED)
-  target_link_libraries(strobe_engine PUBLIC Threads::Threads ${ZLIB_LIBRARIES})
+  target_link_libraries(strobe_engine PUBLIC Threads::Threads ${ZLIB_LIBRARIES} ${HTSlib_LIBRARIES})
   check_cxx_compiler_flag("-march=native" STROBE_MARCH_NATIVE)
   if(STROBE_MARCH_NATIVE)
     target_compile_options(strobe_engine PRIVATE -march=native)

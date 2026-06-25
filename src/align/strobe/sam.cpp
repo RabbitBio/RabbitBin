@@ -3,11 +3,66 @@
 #include <ostream>
 #include <sstream>
 #include <iostream>
+#include <vector>
 
 #define SAM_UNMAPPED_MAPQ 0
 #define SAM_UNMAPPED_MAPQ_STRING "0"
 
 using namespace klibpp;
+
+std::string strip_suffix(const std::string& name);  // defined below
+
+// RabbitBin: build one bam1_t directly from alignment fields (no SAM text).
+// tid == Alignment::ref_id (BAM header @SQ order matches References order), so
+// no RNAME->tid lookup is needed. seq/qual are oriented per the REVERSE flag;
+// qual is converted from FASTQ ASCII (+33) to raw phred for BAM.
+void Sam::emit_bam(
+    const std::string& query_name, uint16_t flags, int tid, int32_t pos,
+    uint8_t mapq, const Cigar& cigar, int mtid, int32_t mate_pos,
+    int32_t template_len, const std::string& query_sequence,
+    const std::string& query_sequence_rc, const std::string& qual, int ed,
+    int aln_score, bool unmapped
+) {
+    std::string qname = strip_suffix(query_name);
+
+    // CIGAR (htslib-packed). Use M or =/X per cigar_ops, matching the text path.
+    static thread_local std::vector<uint32_t> cig;
+    cig.clear();
+    if (!unmapped && !cigar.empty()) {
+        const Cigar& c = (cigar_ops == CigarOps::EQX) ? cigar : cigar.to_m();
+        for (auto op : c.m_ops) cig.push_back(op);
+    }
+
+    // Oriented sequence (rc for REVERSE) and phred qual buffer.
+    const bool reverse = flags & REVERSE;
+    const bool secondary = flags & SECONDARY;
+    const std::string& seq =
+        secondary ? std::string() : (reverse ? query_sequence_rc : query_sequence);
+    static thread_local std::vector<char> qbuf;
+    const char* qptr = nullptr;
+    size_t l_seq = seq.size();
+    if (!secondary && !qual.empty() && qual != "*") {
+        qbuf.resize(qual.size());
+        if (reverse)
+            for (size_t i = 0; i < qual.size(); ++i)
+                qbuf[i] = (char)(qual[qual.size() - 1 - i] - 33);
+        else
+            for (size_t i = 0; i < qual.size(); ++i) qbuf[i] = (char)(qual[i] - 33);
+        qptr = qbuf.data();
+        if (l_seq == 0) l_seq = qual.size();
+    }
+
+    bam1_t* b = bam_init1();
+    bam_set1(b, qname.size(), qname.c_str(), flags, tid, unmapped ? (pos) : pos,
+             mapq, cig.size(), cig.empty() ? nullptr : cig.data(), mtid, mate_pos,
+             template_len, seq.size(), seq.empty() ? nullptr : seq.c_str(), qptr,
+             0);
+    if (!unmapped) {
+        bam_aux_append(b, "NM", 'i', 4, (uint8_t*)&ed);
+        bam_aux_append(b, "AS", 'i', 4, (uint8_t*)&aln_score);
+    }
+    bam_sink->push_back(b);
+}
 
 /*
  * SAM columns
@@ -80,6 +135,12 @@ void Sam::add_unmapped(const KSeq& record, uint16_t flags) {
     }
     assert((flags & ~(UNMAP|PAIRED|MUNMAP|READ1|READ2)) == 0);
     assert(flags & UNMAP);
+    if (bam_sink) {
+        emit_bam(record.name, flags, /*tid=*/-1, /*pos=*/-1, 0, Cigar{},
+                 /*mtid=*/-1, /*mate_pos=*/-1, 0, record.seq, record.seq,
+                 record.qual, 0, 0, /*unmapped=*/true);
+        return;
+    }
     sam_string.append(strip_suffix(record.name));
     sam_string.append("\t");
     sam_string.append(std::to_string(flags));
@@ -94,8 +155,15 @@ void Sam::add_unmapped(const KSeq& record, uint16_t flags) {
     sam_string.append("\n");
 }
 
-void Sam::add_unmapped_mate(const KSeq& record, uint16_t flags, const std::string& mate_reference_name, uint32_t mate_pos) {
+void Sam::add_unmapped_mate(const KSeq& record, uint16_t flags, const std::string& mate_reference_name, uint32_t mate_pos, int mate_tid) {
     assert(flags & (UNMAP|PAIRED));
+    if (bam_sink) {
+        // SAM convention: the unmapped read takes its mate's RNAME/POS (tid).
+        emit_bam(record.name, flags, /*tid=*/mate_tid, (int32_t)mate_pos, 0,
+                 Cigar{}, /*mtid=*/mate_tid, (int32_t)mate_pos, 0, record.seq,
+                 record.seq, record.qual, 0, 0, /*unmapped=*/true);
+        return;
+    }
     sam_string.append(strip_suffix(record.name));
     sam_string.append("\t");
     sam_string.append(std::to_string(flags));
@@ -145,7 +213,7 @@ void Sam::add(
         flags |= SECONDARY;
         mapq = 0;
     }
-    add_record(record.name, record.comment, flags, references.names[alignment.ref_id], alignment.ref_start, mapq, alignment.cigar, "*", -1, 0, record.seq, sequence_rc, record.qual, alignment.edit_distance, alignment.score, details);
+    add_record(record.name, record.comment, flags, references.names[alignment.ref_id], alignment.ref_start, mapq, alignment.cigar, "*", -1, 0, record.seq, sequence_rc, record.qual, alignment.edit_distance, alignment.score, details, /*tid=*/alignment.ref_id, /*mtid=*/-1);
 }
 
 // Add one individual record
@@ -165,8 +233,16 @@ void Sam::add_record(
     const std::string& qual,
     int ed,
     int aln_score,
-    const Details& details
+    const Details& details,
+    int tid,
+    int mtid
 ) {
+    if (bam_sink) {
+        emit_bam(query_name, flags, tid, (int32_t)pos, mapq, cigar, mtid,
+                 (int32_t)mate_pos, template_len, query_sequence,
+                 query_sequence_rc, qual, ed, aln_score, /*unmapped=*/false);
+        return;
+    }
     sam_string.append(strip_suffix(query_name));
     sam_string.append("\t");
     sam_string.append(std::to_string(flags));
@@ -317,15 +393,22 @@ void Sam::add_pair(
         }
     }
 
+    // BAM tids (== ref_id). For a mapped read whose mate is unmapped, the mate's
+    // tid/pos are set to this read's (SAM convention), matching the text path.
+    int tid1 = alignment1.is_unaligned ? -1 : alignment1.ref_id;
+    int tid2 = alignment2.is_unaligned ? -1 : alignment2.ref_id;
+    int mtid_for_1 = alignment2.is_unaligned ? tid1 : alignment2.ref_id;
+    int mtid_for_2 = alignment1.is_unaligned ? tid2 : alignment1.ref_id;
+
     if (alignment1.is_unaligned) {
-        add_unmapped_mate(record1, f1, reference_name2, pos2);
+        add_unmapped_mate(record1, f1, reference_name2, pos2, tid2);
     } else {
-        add_record(record1.name, record1.comment, f1, reference_name1, alignment1.ref_start, mapq1, alignment1.cigar, mate_reference_name2, pos2, template_len1, record1.seq, read1_rc, record1.qual, edit_distance1, alignment1.score, details[0]);
+        add_record(record1.name, record1.comment, f1, reference_name1, alignment1.ref_start, mapq1, alignment1.cigar, mate_reference_name2, pos2, template_len1, record1.seq, read1_rc, record1.qual, edit_distance1, alignment1.score, details[0], tid1, mtid_for_1);
     }
     if (alignment2.is_unaligned) {
-        add_unmapped_mate(record2, f2, reference_name1, pos1);
+        add_unmapped_mate(record2, f2, reference_name1, pos1, tid1);
     } else {
-        add_record(record2.name, record2.comment, f2, reference_name2, alignment2.ref_start, mapq2, alignment2.cigar, mate_reference_name1, pos1, -template_len1, record2.seq, read2_rc, record2.qual, edit_distance2, alignment2.score, details[1]);
+        add_record(record2.name, record2.comment, f2, reference_name2, alignment2.ref_start, mapq2, alignment2.cigar, mate_reference_name1, pos1, -template_len1, record2.seq, read2_rc, record2.qual, edit_distance2, alignment2.score, details[1], tid2, mtid_for_2);
     }
 }
 
