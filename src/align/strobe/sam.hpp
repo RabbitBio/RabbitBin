@@ -3,6 +3,8 @@
 
 #include <string>
 #include <array>
+#include <vector>
+#include <htslib/sam.h>
 #include "kseq++/kseq++.hpp"
 #include "refs.hpp"
 #include "cigar.hpp"
@@ -72,15 +74,25 @@ public:
             }
         }
 
+    // RabbitBin: when set, records are emitted directly as bam1_t into *bam_sink
+    // (tid == Alignment::ref_id, since the BAM header @SQ order matches the
+    // References) instead of SAM text -- avoids the SAM-text + sam_parse1 +
+    // RNAME->tid round-trip. Set bam_sink to enable; sam_string is then unused.
+    std::vector<bam1_t*>* bam_sink = nullptr;
+    void set_bam_sink(std::vector<bam1_t*>* v) { bam_sink = v; }
+
     /* Add an alignment */
     void add(const Alignment& alignment, const klibpp::KSeq& record, const std::string& sequence_rc, uint8_t mapq, bool is_primary, const Details& details);
     void add_pair(const Alignment& alignment1, const Alignment& alignment2, const klibpp::KSeq& record1, const klibpp::KSeq& record2, const std::string& read1_rc, const std::string& read2_rc, uint8_t mapq1, uint8_t mapq2, bool is_proper, bool is_primary, const std::array<Details, 2>& details);
     void add_unmapped(const klibpp::KSeq& record, uint16_t flags = UNMAP);
     void add_unmapped_pair(const klibpp::KSeq& r1, const klibpp::KSeq& r2);
-    void add_unmapped_mate(const klibpp::KSeq& record, uint16_t flags, const std::string& mate_reference_name, uint32_t mate_pos);
+    void add_unmapped_mate(const klibpp::KSeq& record, uint16_t flags, const std::string& mate_reference_name, uint32_t mate_pos, int mate_tid = -1);
 
 private:
-    void add_record(const std::string& query_name, const std::string& comment, uint16_t flags, const std::string& reference_name, uint32_t pos, uint8_t mapq, const Cigar& cigar, const std::string& mate_reference_name, uint32_t mate_pos, int32_t template_len, const std::string& query_sequence, const std::string& query_sequence_rc, const std::string& qual, int ed, int aln_score, const Details& details);
+    void add_record(const std::string& query_name, const std::string& comment, uint16_t flags, const std::string& reference_name, uint32_t pos, uint8_t mapq, const Cigar& cigar, const std::string& mate_reference_name, uint32_t mate_pos, int32_t template_len, const std::string& query_sequence, const std::string& query_sequence_rc, const std::string& qual, int ed, int aln_score, const Details& details, int tid = -1, int mtid = -1);
+
+    // RabbitBin: build one bam1_t directly (used when bam_sink is set).
+    void emit_bam(const std::string& query_name, uint16_t flags, int tid, int32_t pos, uint8_t mapq, const Cigar& cigar, int mtid, int32_t mate_pos, int32_t template_len, const std::string& query_sequence, const std::string& query_sequence_rc, const std::string& qual, int ed, int aln_score, bool unmapped);
 
     void append_seq(const std::string& seq) {
         sam_string.append(seq.empty() ? "*" : seq);
