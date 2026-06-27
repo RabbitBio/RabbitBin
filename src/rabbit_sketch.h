@@ -291,9 +291,52 @@ inline double KmerSketch::jaccard(const KmerSketch& other, double min_jaccard) c
     const uint32_t  rem  = m_ & 63;
     const uint64_t  lastmask = (rem == 0) ? ~0ULL : ((1ULL << rem) - 1);
 
+    // A bucket matches iff all b_ bit-planes agree there: AND of XNOR(a,b).
+    // SIMD: 8 × uint64 popcount per step (mirrors rabbitbin.cpp::jaccard_raw
+    // and the BinDash XNOR+VPOPCNT kernel in RabbitSketch).  ternarylogic
+    // imm 0xC3 = ~(A ^ B) (XNOR) computes the per-plane agreement in one op.
     uint64_t matches = 0;
-    // A bucket matches iff all b_ bit-planes agree there: AND of ~(a^b).
-    for (uint32_t w = 0; w < nw; ++w) {
+    uint32_t w = 0;
+#if defined(__AVX512F__) && defined(__AVX512VPOPCNTDQ__)
+    {
+        __m512i vsum = _mm512_setzero_si512();
+        if (np == 1) {
+            for (; w + 8 <= full; w += 8) {
+                __m512i va = _mm512_loadu_si512((const __m512i*)(a + w));
+                __m512i vb = _mm512_loadu_si512((const __m512i*)(b + w));
+                __m512i vm = _mm512_ternarylogic_epi64(va, vb, va, 0xC3);
+                vsum = _mm512_add_epi64(vsum, _mm512_popcnt_epi64(vm));
+            }
+        } else if (np == 2) {
+            const uint64_t* a1 = a + nw;
+            const uint64_t* b1 = b + nw;
+            for (; w + 8 <= full; w += 8) {
+                __m512i va0 = _mm512_loadu_si512((const __m512i*)(a  + w));
+                __m512i vb0 = _mm512_loadu_si512((const __m512i*)(b  + w));
+                __m512i va1 = _mm512_loadu_si512((const __m512i*)(a1 + w));
+                __m512i vb1 = _mm512_loadu_si512((const __m512i*)(b1 + w));
+                __m512i xn0 = _mm512_ternarylogic_epi64(va0, vb0, va0, 0xC3);
+                __m512i xn1 = _mm512_ternarylogic_epi64(va1, vb1, va1, 0xC3);
+                vsum = _mm512_add_epi64(vsum,
+                          _mm512_popcnt_epi64(_mm512_and_si512(xn0, xn1)));
+            }
+        } else {
+            for (; w + 8 <= full; w += 8) {
+                __m512i vm = _mm512_set1_epi64(-1LL);
+                for (uint32_t p = 0; p < np; ++p) {
+                    __m512i va = _mm512_loadu_si512((const __m512i*)(a + (size_t)p*nw + w));
+                    __m512i vb = _mm512_loadu_si512((const __m512i*)(b + (size_t)p*nw + w));
+                    vm = _mm512_and_si512(vm,
+                            _mm512_ternarylogic_epi64(va, vb, va, 0xC3));
+                }
+                vsum = _mm512_add_epi64(vsum, _mm512_popcnt_epi64(vm));
+            }
+        }
+        matches = (uint64_t)_mm512_reduce_add_epi64(vsum);
+    }
+#endif
+    // Scalar tail (remaining full words) + last partial word.
+    for (; w < nw; ++w) {
         uint64_t m = ~0ULL;
         for (uint32_t p = 0; p < np; ++p) {
             const size_t off = (size_t)p * nw + w;

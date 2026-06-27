@@ -286,6 +286,47 @@ static double g_w_comp = 0.5;
 static bool   g_mutual_knn  = true;
 static double g_neg_depth_thr = -0.3;
 static double g_edge_power  = 1.0;     // applied to composite w; 1.0 = no-op
+
+// ── Assembly-graph (GFA) integration (feature #1) ───────────────────────────
+// The assembler already computed which contigs are physically adjacent in the
+// de Bruijn / string graph (GFA `L` links and `P` paths).  That adjacency is a
+// very strong same-genome signal — independent of composition/abundance — yet
+// almost every binner discards it.  We inject each GFA link as a high-weight
+// edge directly into the similarity graph so label propagation can use it to
+// rescue short / low-coverage / compositionally-atypical contigs.
+//
+// Edges are tagged by an out-of-range sComp sentinel (normal composition
+// similarity is in [0,1]); the edge-score stage detects the sentinel and
+// assigns a fixed weight g_gfa_weight, bypassing the depth-correlation gate
+// (adjacent contigs need not co-vary in coverage to belong together).
+static std::string g_gfa_file;                    // --gfa PATH ("" = disabled)
+static double      g_gfa_weight = 0.90;           // --gfa-weight (0,1)
+static constexpr StoredDistance GFA_SENTINEL = 2.0f;  // sComp marker for a GFA edge
+static inline bool edge_is_gfa(StoredDistance sComp_v) { return sComp_v > 1.0f; }
+
+// ── Soft assignment + per-contig confidence (feature #8) ────────────────────
+// When --confidence is set we (a) add a Confidence column to members.tsv and
+// (b) emit <prefix>.confidence.tsv with each large contig's assigned bin, the
+// margin over its best alternative bin (0..1), and that runner-up bin — the
+// uncertainty signal almost no binner exposes.  Indexed by large-contig id;
+// recruited small contigs have no graph node and report NA.
+static bool               g_emit_confidence = false;   // --confidence
+static std::vector<float> g_node_confidence;           // [nobs]; <0 = N/A
+static std::vector<size_t> g_node_second;              // [nobs]; SIZE_MAX = none
+static std::vector<float> g_node_second_score;         // [nobs]
+
+// ── MGE awareness (feature #2): circular / DTR contig detection ──────────────
+// Plasmids, phages and complete small replicons frequently assemble as a single
+// circular contig carrying a Direct Terminal Repeat (the assembler leaves the
+// wrap-around overlap at both ends).  Detecting it (prefix[0:W] == suffix[L-W:L])
+// flags likely complete mobile genetic elements / replicons — a class most
+// binners mis-handle (they bin them into the dominant host bin or drop them).
+// We emit <prefix>.mge.tsv (ContigName, Length, Circular, DTRlen, BinNum); host
+// association can then be read off BinNum.  FASTA-only, O(window) per contig.
+static bool   g_mge_scan    = false;   // --mge-scan
+static size_t g_mge_dtr_min = 21;      // --mge-dtr-min : seed / min DTR length
+static size_t g_mge_dtr_max = 1000;    // --mge-dtr-max : max DTR / search window
+static std::vector<uint32_t> g_mge_dtr; // [nobs]; >0 = circular, value = DTR len
 // GC-content normalization for PMH k-mer weights (RABBIT_GC_NORM=1):
 //   Instead of using raw k-mer frequency as weight, use enrichment ratio:
 //     weight(v) = observed_freq(v) / expected_freq(v | composition)
@@ -972,7 +1013,23 @@ static void build_pmh_winners(const char *seq, size_t len, int k, uint32_t m,
                               uint64_t *out_winners64 = nullptr,
                               std::vector<uint64_t> *out_keys = nullptr,
                               float *out_k4freq = nullptr) {
-  Sketch::ProbMinHash4 pmh(m, k, seed);
+  // Thread-local pooled sketch: reuse one ProbMinHash4 per worker thread across
+  // all contigs instead of constructing/destroying one per contig.  This removes
+  // the per-contig register/winner/permutation malloc+free (and the allocator
+  // contention it causes under OpenMP) on the hot parallel sketch loop — the
+  // thread-local-pool pattern RabbitTClust uses for its sketch buffers.  reset()
+  // restores the exact fresh-construction state, so results are unchanged.
+  static thread_local std::unique_ptr<Sketch::ProbMinHash4> tl_pmh;
+  static thread_local uint32_t tl_m = 0;
+  static thread_local int      tl_k = 0;
+  static thread_local uint64_t tl_seed = 0;
+  if (!tl_pmh || tl_m != m || tl_k != k || tl_seed != seed) {
+    tl_pmh.reset(new Sketch::ProbMinHash4(m, k, seed));
+    tl_m = m; tl_k = k; tl_seed = seed;
+  } else {
+    tl_pmh->reset();
+  }
+  Sketch::ProbMinHash4 &pmh = *tl_pmh;
   if (len >= (size_t)k && k >= 1 && k <= 32) {
     const uint64_t mask = (k >= 32) ? ~0ULL : ((1ULL << (2 * k)) - 1);
     const int hishift = 2 * (k - 1);
@@ -1126,6 +1183,143 @@ static std::unique_ptr<rabbit_invidx::InvertedIndex> g_pmh_idx;
 // matrix scan (run N²/2 times in the hot graph loop) into two byte loads.
 // Empty when not yet built (is_nz then falls back to the scalar scan).
 static std::vector<uint8_t> g_anynz;
+
+// ── GFA assembly-graph edge injection (feature #1) ──────────────────────────
+// Parse an assembler GFA (segments S, links L, paths P) and append each contig
+// adjacency as a high-weight edge to the similarity graph `g`.  Segment names
+// are matched to LARGE-contig indices [0, nobs) via contig_names (links that
+// touch a length-filtered / unknown contig are skipped).  Edges are tagged with
+// the GFA_SENTINEL sComp so the edge-score stage gives them a fixed weight and
+// skips the depth gate.  Streaming line parse, O(links) hash lookups; runs once.
+static size_t inject_gfa_edges(Graph &g) {
+  if (g_gfa_file.empty()) return 0;
+  std::ifstream in(g_gfa_file);
+  if (!in) {
+    cerr << "[Warn] --gfa: cannot open " << g_gfa_file << " (skipping)\n";
+    return 0;
+  }
+  const size_t nlarge = contig_names.size();
+  phmap::flat_hash_map<std::string, uint32_t> name2idx;
+  name2idx.reserve(nlarge * 2);
+  for (size_t i = 0; i < nlarge; ++i) name2idx.emplace(contig_names[i], (uint32_t)i);
+
+  // Collect unique undirected pairs as packed (lo<<32 | hi), lo<hi.
+  std::vector<uint64_t> pairs;
+  pairs.reserve(1u << 16);
+  auto add_pair = [&](uint32_t a, uint32_t b) {
+    if (a == b) return;
+    uint32_t lo = a < b ? a : b, hi = a < b ? b : a;
+    pairs.push_back(((uint64_t)lo << 32) | (uint64_t)hi);
+  };
+  auto lookup = [&](const std::string &nm) -> int64_t {
+    auto it = name2idx.find(nm);
+    return it == name2idx.end() ? -1 : (int64_t)it->second;
+  };
+
+  std::string line;
+  size_t n_link = 0, n_path = 0;
+  while (std::getline(in, line)) {
+    if (line.empty()) continue;
+    const char t = line[0];
+    if (t == 'L') {
+      // L <tab> from <tab> fromOrient <tab> to <tab> toOrient <tab> overlap
+      size_t p0 = line.find('\t');                     if (p0 == std::string::npos) continue;
+      size_t p1 = line.find('\t', p0 + 1);             if (p1 == std::string::npos) continue;
+      size_t p2 = line.find('\t', p1 + 1);             if (p2 == std::string::npos) continue;
+      size_t p3 = line.find('\t', p2 + 1);             if (p3 == std::string::npos) continue;
+      std::string from = line.substr(p0 + 1, p1 - p0 - 1);
+      std::string to   = line.substr(p2 + 1, p3 - p2 - 1);
+      int64_t a = lookup(from), b = lookup(to);
+      if (a >= 0 && b >= 0) { add_pair((uint32_t)a, (uint32_t)b); ++n_link; }
+    } else if (t == 'P') {
+      // P <tab> pathName <tab> seg1±,seg2±,... <tab> overlaps
+      size_t p0 = line.find('\t');                     if (p0 == std::string::npos) continue;
+      size_t p1 = line.find('\t', p0 + 1);             if (p1 == std::string::npos) continue;
+      size_t p2 = line.find('\t', p1 + 1);
+      const size_t seg_end = (p2 == std::string::npos) ? line.size() : p2;
+      // Walk the comma-separated segment list, stripping the trailing orientation.
+      int64_t prev = -1;
+      size_t s = p1 + 1;
+      while (s < seg_end) {
+        size_t comma = line.find(',', s);
+        size_t tok_end = (comma == std::string::npos || comma > seg_end) ? seg_end : comma;
+        size_t name_end = tok_end;
+        if (name_end > s) {
+          char last = line[name_end - 1];
+          if (last == '+' || last == '-') --name_end;   // drop orientation
+        }
+        int64_t cur = lookup(line.substr(s, name_end - s));
+        if (prev >= 0 && cur >= 0) { add_pair((uint32_t)prev, (uint32_t)cur); ++n_path; }
+        if (cur >= 0) prev = cur;
+        if (comma == std::string::npos) break;
+        s = comma + 1;
+      }
+    }
+  }
+
+  std::sort(pairs.begin(), pairs.end());
+  pairs.erase(std::unique(pairs.begin(), pairs.end()), pairs.end());
+
+  for (uint64_t pk : pairs) {
+    g.from.push_back((size_t)(pk >> 32));
+    g.to.push_back((size_t)(pk & 0xFFFFFFFFu));
+    g.sComp.push_back(GFA_SENTINEL);
+  }
+  verbose_message("GFA: injected %zu unique adjacency edges "
+                  "(%zu L-links + %zu P-steps parsed)\n",
+                  pairs.size(), n_link, n_path);
+  return pairs.size();
+}
+
+// ── MGE circular / DTR detection (feature #2) ───────────────────────────────
+// Fill g_mge_dtr[i] with the Direct-Terminal-Repeat length of large contig i
+// (0 = not circular).  A contig is flagged circular when prefix[0:W] == suffix
+// [L-W:L] for some W in [min, max]; we keep the LARGEST such W.  Parallel,
+// O(window·seed) per contig with an early seed test before the full compare.
+static void mge_detect_circular() {
+  const size_t n = seqs.size();
+  g_mge_dtr.assign(n, 0u);
+  const size_t minD = g_mge_dtr_min < 8 ? 8 : g_mge_dtr_min;
+  const size_t maxD = g_mge_dtr_max < minD ? minD : g_mge_dtr_max;
+#pragma omp parallel for schedule(dynamic, 64)
+  for (size_t i = 0; i < n; ++i) {
+    const char *s = seqs[i].data();
+    const size_t L = seqs[i].size();
+    if (L < 2 * minD) continue;
+    const size_t win = std::min(maxD, L / 2);
+    const size_t qstart = L - win;          // largest possible W = win
+    const size_t qend   = L - minD;         // smallest W = minD
+    for (size_t q = qstart; q <= qend; ++q) {
+      // Cheap seed test on the first minD bases before the full comparison.
+      if (std::memcmp(s + q, s, minD) != 0) continue;
+      const size_t W = L - q;
+      if (std::memcmp(s, s + q, W) == 0) { g_mge_dtr[i] = (uint32_t)W; break; }
+    }
+  }
+}
+
+// Write <prefix>.mge.tsv.  clsMap maps large-contig id -> output BinNum (raw
+// label+1 here is fine as a host-bin grouping key) so each circular element is
+// reported alongside the host bin it was placed in (host association).
+static void mge_write_table(const std::vector<size_t> &contig_binnum) {
+  std::string path = std::string(outFile) + ".mge.tsv";
+  std::ofstream os(path.c_str());
+  if (!os) { cerr << "[Warn] cannot write " << path << "\n"; return; }
+  os << "ContigName\tLength\tCircular\tDTRlen\tBinNum\n";
+  size_t ncirc = 0;
+  // Iterate the persisted per-contig arrays (sequences are already freed here).
+  const size_t n = g_mge_dtr.size();
+  for (size_t i = 0; i < n; ++i) {
+    const bool circ = (g_mge_dtr[i] > 0);
+    if (circ) ++ncirc;
+    long bn = (i < contig_binnum.size() && contig_binnum[i] > 0)
+                  ? (long)contig_binnum[i] : -1;
+    os << contig_names[i] << "\t" << seq_lens[i] << "\t" << (circ ? 1 : 0)
+       << "\t" << (circ ? (long)g_mge_dtr[i] : 0L) << "\t" << bn << "\n";
+  }
+  os.flush(); os.close();
+  verbose_message("MGE: %zu circular/DTR contigs flagged -> %s\n", ncirc, path.c_str());
+}
 
 // ── Forward declarations for helpers used by build_similarity_graph ────────────────
 bool is_nz(size_t r1, size_t r2);
@@ -2420,6 +2614,12 @@ static int rb_cmd_bin(int ac, char *av[]) {
       ("min-small-contig", po::value<size_t>(&min_small_contig)->default_value(1000), "Min length for small-contig recruiting")
       ("max-posterior", po::value<Similarity>(&calib_connected_pct)->default_value(95), "Well-connected contig percent for calibration")
       ("min-edge-score", po::value<Similarity>(&min_edge_weight)->default_value(60), "Minimum edge weight (1-99)")
+      ("gfa", po::value<std::string>(&g_gfa_file), "Assembly graph (GFA) whose L-links/P-paths are injected as high-weight same-genome edges")
+      ("gfa-weight", po::value<double>(&g_gfa_weight)->default_value(0.90), "Edge weight assigned to GFA links (0,1)")
+      ("confidence", po::value<bool>(&g_emit_confidence)->zero_tokens(), "Emit per-contig assignment confidence (members.tsv column + <prefix>.confidence.tsv soft assignment)")
+      ("mge-scan", po::value<bool>(&g_mge_scan)->zero_tokens(), "Detect circular/DTR contigs (likely plasmids/phages/replicons) -> <prefix>.mge.tsv")
+      ("mge-dtr-min", po::value<size_t>(&g_mge_dtr_min)->default_value(21), "Min direct-terminal-repeat length for circular detection")
+      ("mge-dtr-max", po::value<size_t>(&g_mge_dtr_max)->default_value(1000), "Max DTR length / terminal search window")
       ("max-edges", po::value<size_t>(&maxEdges)->default_value(200), "Max neighbors per contig")
       ("sim-cutoff", po::value<Similarity>(&simCutoff)->default_value(0), "Composition similarity cutoff x100 (0=auto)")
       ("sketch-k", po::value<int>(&sketch_kmer_size)->default_value(8), "Sketch k-mer size")
@@ -2856,7 +3056,8 @@ static int rb_cmd_bin(int ac, char *av[]) {
         // consumers is active, the bytes are dead weight, so we skip storing them
         // and cut peak RSS by roughly the input size.  Bit-identical results.
         return stream_pmh_mmap && noBinOut && !outUnbinned &&
-               recruitSimFactor <= 0.0 && getenv("RB_SEQHASH") == nullptr;
+               recruitSimFactor <= 0.0 && getenv("RB_SEQHASH") == nullptr &&
+               !g_mge_scan;   // --mge-scan needs sequences resident for DTR detection
       }();
       const int pmh_k_mmap = [&]() -> int {
         const char *e = rb_getenv("RABBIT_PMHK"); return e ? std::atoi(e) : 4;
@@ -3133,7 +3334,8 @@ static int rb_cmd_bin(int ac, char *av[]) {
         // winners are produced during this streaming parse — bit-identical, and
         // removes the dominant (~assembly-sized) memory cost.
         return stream_pmh && noBinOut && !outUnbinned &&
-               recruitSimFactor <= 0.0 && getenv("RB_SEQHASH") == nullptr;
+               recruitSimFactor <= 0.0 && getenv("RB_SEQHASH") == nullptr &&
+               !g_mge_scan;   // --mge-scan needs sequences resident for DTR detection
       }();
       const uint32_t s_pmh_m = sketch_size;
       const int s_pmh_k = [&]() -> int {
@@ -3648,6 +3850,15 @@ static int rb_cmd_bin(int ac, char *av[]) {
   rb_phase("parse+sketch done");
   if (!from_cache) rb_seq_integrity_check("post-parse");
 
+  // MGE circular/DTR detection (feature #2) MUST run here while the contig
+  // sequences are still resident — they are released later to cap peak RSS.
+  // Results (g_mge_dtr) persist and are written at output time alongside the
+  // host bin.
+  if (g_mge_scan) {
+    verbose_message("Scanning for circular / DTR contigs (MGEs)...\n");
+    mge_detect_circular();
+  }
+
   // Precompute per-contig abundance non-zero flags so is_nz() in the O(N²)
   // graph loop reduces to two byte loads instead of an num_depth_samples matrix scan.
   build_anynz_cache();
@@ -3767,6 +3978,12 @@ static int rb_cmd_bin(int ac, char *av[]) {
           cerr << "[Warn] failed to write cache: " << cache_save_file << "\n";
       }
 
+      // ── GFA assembly-graph edges (feature #1) ─────────────────────────────
+      // Append assembler adjacency as high-weight edges BEFORE any edge-count is
+      // captured, so every downstream path (production, --no_gold reuse, recruit)
+      // sees them. Done after cache write so the cache stays GFA-agnostic.
+      if (!g_gfa_file.empty()) inject_gfa_edges(g);
+
       // ── --no_gold: label-free multi-resolution auto-selection ─────────────
       // Build the (expensive) similarity graph ONCE, then run many CHEAP
       // (edgeScore + incidence + label-propagation) passes under different
@@ -3843,6 +4060,10 @@ static int rb_cmd_bin(int ac, char *av[]) {
 #pragma omp parallel for schedule(dynamic, 1)
             for (size_t e = 0; e < E; ++e) {
               size_t i = g.from[e], j = g.to[e];
+              if (edge_is_gfa(g.sComp[e])) {
+                g.edgeScore[e] = (StoredDistance)g_gfa_weight;
+                continue;
+              }
               if (num_depth_samples <= 1) {
                 double w = (double)g.sComp[e];
                 if (g_edge_power != 1.0) w = std::pow(w, g_edge_power);
@@ -3859,7 +4080,10 @@ static int rb_cmd_bin(int ac, char *av[]) {
             }
           } else {
             g.edgeScore = g.sComp;
-            for (auto &s : g.edgeScore) if (s < min_edge_weight) s = 0.0f;
+            for (auto &s : g.edgeScore) {
+              if (edge_is_gfa(s)) { s = (StoredDistance)g_gfa_weight; continue; }
+              if (s < min_edge_weight) s = 0.0f;
+            }
           }
         };
 
@@ -3930,7 +4154,7 @@ static int rb_cmd_bin(int ac, char *av[]) {
         std::vector<double> wdeg(nobs, 0.0);
         double Wtot = 0.0;
         for (size_t e = 0; e < E; ++e) {
-          double w = (double)g.sComp[e];
+          double w = edge_is_gfa(g.sComp[e]) ? g_gfa_weight : (double)g.sComp[e];
           Wtot += w; wdeg[g.from[e]] += w; wdeg[g.to[e]] += w;
         }
         const double invWtot  = Wtot > 0 ? 1.0 / Wtot : 0.0;
@@ -3938,7 +4162,8 @@ static int rb_cmd_bin(int ac, char *av[]) {
         auto modularity = [&](const std::vector<size_t> &mem) -> double {
           double Wintra = 0.0;
           for (size_t e = 0; e < E; ++e)
-            if (mem[g.from[e]] == mem[g.to[e]]) Wintra += (double)g.sComp[e];
+            if (mem[g.from[e]] == mem[g.to[e]])
+              Wintra += edge_is_gfa(g.sComp[e]) ? g_gfa_weight : (double)g.sComp[e];
           std::unordered_map<size_t, double> vol;
           for (size_t i = 0; i < nobs; ++i)
             if (wdeg[i] > 0.0) vol[mem[i]] += wdeg[i];
@@ -4109,6 +4334,11 @@ static int rb_cmd_bin(int ac, char *av[]) {
 #pragma omp parallel for schedule(dynamic, 1)
         for (size_t e = 0; e < ne; ++e) {
           size_t i = g.from[e], j = g.to[e];
+          if (edge_is_gfa(g.sComp[e])) {
+            // GFA adjacency: fixed high weight, bypass the depth-correlation gate.
+            g.edgeScore[e] = (StoredDistance)g_gfa_weight;
+            continue;
+          }
           if (num_depth_samples <= 1) {
             double w = (double)g.sComp[e];
             if (g_edge_power != 1.0) w = std::pow(w, g_edge_power);
@@ -4131,7 +4361,10 @@ static int rb_cmd_bin(int ac, char *av[]) {
         }
       } else {
         g.edgeScore = g.sComp;
-        for (auto &s : g.edgeScore) if (s < min_edge_weight) s = 0.0f;
+        for (auto &s : g.edgeScore) {
+          if (edge_is_gfa(s)) { s = (StoredDistance)g_gfa_weight; continue; }
+          if (s < min_edge_weight) s = 0.0f;
+        }
       }
 
       rb_phase("graph+edgescore done");
@@ -4180,6 +4413,13 @@ static int rb_cmd_bin(int ac, char *av[]) {
       cluster_by_propagation(g, membership, node_order);
       rb_phase("label propagation done");
       }  // end !used_no_gold (single-resolution production path)
+
+      // Per-contig confidence / soft assignment (feature #8): one O(|E|) pass
+      // over the converged graph + membership (covers both the production and
+      // the reuse/no_gold selection paths, since membership + incs are final).
+      if (g_emit_confidence)
+        compute_node_confidence(g, membership, g_node_confidence,
+                                g_node_second, g_node_second_score);
 
       // ── 6. Collect bins ────────────────────────────────────────────────
       for (size_t i = 0; i < nobs; ++i) {
@@ -4725,6 +4965,18 @@ static int rb_cmd_bin(int ac, char *av[]) {
       rb_purify_bins(c);
     }
   };
+
+  // ── MGE awareness (feature #2): write the circular/DTR table + host bin ────
+  // Detection already ran post-parse (sequences resident); here we only join the
+  // flags with the final clustering (raw label+1, matching the matrix ClusterId
+  // column; 0 = unbinned) and emit <prefix>.mge.tsv.
+  if (g_mge_scan) {
+    std::vector<size_t> contig_binnum(g_mge_dtr.size(), 0);
+    for (auto &kv : cls)
+      for (auto c : kv.second)
+        if (c < contig_binnum.size()) contig_binnum[c] = kv.first + 1;
+    mge_write_table(contig_binnum);
+  }
 
   if (g_resolutions.empty()) {
     do_split_purify(cls);

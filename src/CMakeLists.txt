@@ -236,6 +236,16 @@ else()
   message("rabbitbin: LTO not supported by compiler")
 endif()
 
+# Aggressive loop unrolling for the hand-vectorised hot kernels (k-mer rolling,
+# winner-match / popcount / dot-product inner loops).  Matches the build flags
+# used by RabbitSketch and RabbitTClust, where -funroll-loops complements the
+# manual 8/16-lane unrolling in the SIMD paths.  No effect on FP semantics.
+check_cxx_compiler_flag("-funroll-loops" COMPILER_SUPPORTS_FUNROLL)
+if(COMPILER_SUPPORTS_FUNROLL)
+  target_compile_options(rabbitbin PRIVATE -funroll-loops)
+  message("rabbitbin: -funroll-loops enabled")
+endif()
+
 install(TARGETS rabbitbin DESTINATION bin/)
 
 set(targets rabbit_depth rabbit_overlap)
