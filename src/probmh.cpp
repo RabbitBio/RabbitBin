@@ -491,6 +491,18 @@ void ProbMinHash4::finalize() noexcept {
     perm_.clear();                // ~8 KB: val_[] + ver_arr_[], update-only
 }
 
+void ProbMinHash4::reset() {
+    // Re-initialise to the empty post-construction state for buffer reuse.
+    // Only the O(m) fills the constructor itself performs are repeated; no
+    // heap (de)allocation, no TED rebuild (ted_params_ stays shared/valid).
+    // perm_ needs no explicit reset: addHashFromRng() calls perm_.reset()
+    // before its first next(), and the version counter is overflow-safe, so a
+    // carried-over ver_ produces the identical permutation as a fresh stream.
+    total_weight_ = 0.0;
+    tracker_.reset(std::numeric_limits<double>::infinity());
+    std::fill_n(winners_.get(), m_, static_cast<uint64_t>(0));
+}
+
 std::shared_ptr<const ProbMinHash4::TedParam[]>
 ProbMinHash4::getOrBuildTedParams(uint32_t m, double& out_firstBoundaryInv) {
     // Function-local statics: thread-safe init in C++11+, lives until program

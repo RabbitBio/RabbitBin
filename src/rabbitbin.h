@@ -391,6 +391,12 @@ double getUsedPhysMem() {
 int cluster_by_propagation(Graph &g, std::vector<size_t> &membership,
                       std::vector<size_t> &node_order);
 
+void compute_node_confidence(Graph &g,
+                             const std::vector<size_t> &membership,
+                             std::vector<float> &confidence,
+                             std::vector<size_t> &second_choice,
+                             std::vector<float> &second_score);
+
 struct CompareEdge {
   // Total order so a top-maxEdges heap has a UNIQUE kept set / drain order
   // regardless of insertion order (required for run-to-run determinism under

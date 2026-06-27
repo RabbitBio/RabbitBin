@@ -19,7 +19,14 @@ void output_bins(BinMap &cls) {
       std::string outFile_members = rb_members_path();
       std::ofstream os_members(outFile_members.c_str());
       verbose_message("Writing Members stats to: %s\n", outFile_members.c_str());
-      os_members << "BinNum\tSequenceName\tTotalDepth\n";
+      os_members << "BinNum\tSequenceName\tTotalDepth";
+      if (g_emit_confidence) os_members << "\tConfidence";
+      os_members << "\n";
+
+      // Soft-assignment map: raw cluster label -> sequential bin id, so the
+      // per-contig runner-up (second-choice) bin can be reported by its output
+      // BinNum.  Filled as bins are emitted below (feature #8).
+      std::unordered_map<size_t, size_t> label2binid;
 
       // Optional CAMI bioboxes output (<prefix>.binning).
       std::ofstream os_bbx;
@@ -58,7 +65,19 @@ void output_bins(BinMap &cls) {
             for (auto i = 0; i < (int)num_depth_samples; i++)
               total += (*it2 < nobs) ? depth_matrix(idx, i) : small_depth_matrix(idx, i);
             lengthWeightedAvgCoverage += len * total;
-            ss << bin_id << "\t" << sequence_name << "\t" << total << "\n";
+            ss << bin_id << "\t" << sequence_name << "\t" << total;
+            if (g_emit_confidence) {
+              // Large contigs are graph nodes with a propagation margin; small
+              // recruited contigs have no node → NA.
+              if (*it2 < nobs && idx < g_node_confidence.size() &&
+                  g_node_confidence[idx] >= 0.0f)
+                ss << "\t" << std::fixed << std::setprecision(4)
+                   << g_node_confidence[idx];
+              else
+                ss << "\tNA";
+              ss.unsetf(std::ios::fixed);
+            }
+            ss << "\n";
           }
           if (s + s1 < min_bin_bp) continue;
 
@@ -74,6 +93,9 @@ void output_bins(BinMap &cls) {
             assert(cluster[i] < (int)clsMap.size());
             clsMap[cluster[i]] = kk + 1;
           }
+          // Map raw cluster label -> sequential output BinNum for the soft
+          // assignment file (feature #8).
+          if (g_emit_confidence) label2binid[kk] = bin_id;
           if (g_write_bioboxes) {
             for (auto c : cluster) {
               auto idx = (c < nobs) ? c : c - nobs;
@@ -183,6 +205,45 @@ void output_bins(BinMap &cls) {
           if (!os) {
             cerr << "[Error!] Failed to write cluster membership\n";
             exit(1);
+          }
+        }
+      }
+
+      // ── Soft assignment / confidence file (feature #8) ────────────────────
+      if (g_emit_confidence) {
+#pragma omp task firstprivate(label2binid)
+        {
+          std::string path = std::string(outFile) + ".confidence.tsv";
+          if (verbose) verbose_message("Saving per-contig confidence to %s\n",
+                                       path.c_str());
+          std::ofstream os(path.c_str());
+          if (os) {
+            os << "ContigName\tBinNum\tConfidence\tSecondBinNum\tSecondScore\n";
+            for (size_t i = 0; i < nobs; ++i) {
+              if (clsMap[i] == 0) continue;              // unbinned large contig
+              // clsMap stores rawlabel+1; map to the sequential output BinNum.
+              auto bit = label2binid.find(clsMap[i] - 1);
+              if (bit == label2binid.end()) continue;
+              size_t binid = bit->second;
+              float conf = (i < g_node_confidence.size()) ? g_node_confidence[i] : -1.0f;
+              long second_bin = -1;
+              float second_sc = 0.0f;
+              if (i < g_node_second.size() && g_node_second[i] != SIZE_MAX) {
+                auto it = label2binid.find(g_node_second[i]);
+                if (it != label2binid.end()) second_bin = (long)it->second;
+                second_sc = g_node_second_score[i];
+              }
+              os << contig_names[i] << "\t" << binid << "\t";
+              if (conf >= 0.0f) os << std::fixed << std::setprecision(4) << conf;
+              else              os << "NA";
+              os.unsetf(std::ios::fixed);
+              os << "\t" << second_bin << "\t"
+                 << std::fixed << std::setprecision(4) << second_sc << "\n";
+              os.unsetf(std::ios::fixed);
+            }
+            os.flush(); os.close();
+          } else {
+            cerr << "[Warn] could not write confidence file " << path << "\n";
           }
         }
       }

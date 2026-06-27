@@ -255,5 +255,71 @@ int cluster_by_propagation(Graph &g, std::vector<size_t> &membership,
   return 0;
 }
 
+// ── Per-node assignment confidence + soft (second-choice) assignment ─────────
+// Feature #8: after label propagation converges, quantify how strongly each
+// node belongs to its assigned bin.  For node v we combine the per-neighbour-
+// cluster Fisher p-values (exactly as the propagation step does) and report:
+//   confidence[v]   = chi2cdf(assigned cluster) − chi2cdf(best OTHER cluster),
+//                     clamped to [0,1].  1.0 = unambiguous; ~0 = borderline.
+//   second_choice[v]= the competing cluster id (best alternative bin).
+//   second_score[v] = that competitor's chi2cdf score.
+// This is the soft / uncertainty information almost no binner exposes, computed
+// in a single O(|E|) pass over the converged graph (negligible cost).  Nodes
+// with no positive-weight edge get confidence 0 and second_choice = SIZE_MAX.
+void compute_node_confidence(Graph &g,
+                             const std::vector<size_t> &membership,
+                             std::vector<float> &confidence,
+                             std::vector<size_t> &second_choice,
+                             std::vector<float> &second_score) {
+  const size_t nnodes = g.getNodeCount();
+  const size_t nedges = g.getEdgeCount();
+  confidence.assign(nnodes, 0.0f);
+  second_choice.assign(nnodes, SIZE_MAX);
+  second_score.assign(nnodes, 0.0f);
+  if (nnodes == 0 || nedges == 0) return;
+
+  std::vector<StoredDistance> logsscr(nedges);
+  for (size_t e = 0; e < nedges; ++e)
+    logsscr[e] = (StoredDistance)LOG(1. - g.edgeScore[e]);
+
+  std::vector<double>  nscore(nnodes, 0.0);
+  std::vector<int32_t> ncount(nnodes, 0);
+  std::vector<size_t>  touched;
+  touched.reserve(256);
+
+  for (size_t v1 = 0; v1 < nnodes; ++v1) {
+    std::vector<size_t> &ineis = g.incs[v1];
+    if (ineis.empty()) continue;
+    touched.clear();
+    for (size_t j = 0; j < ineis.size(); ++j) {
+      size_t edgeID = ineis[j];
+      size_t k = membership[g.getOtherNode(edgeID, v1)];
+      if (ncount[k] == 0) touched.push_back(k);
+      nscore[k] += logsscr[edgeID];
+      ncount[k]++;
+    }
+    const size_t kAssigned = membership[v1];
+    double assigned_val = 0.0;
+    double best_other = -std::numeric_limits<double>::infinity();
+    size_t best_other_k = SIZE_MAX;
+    for (size_t k : touched) {
+      double val = chi2_2dof_cdf((int)ncount[k], -2.0 * nscore[k]);
+      if (k == kAssigned) {
+        assigned_val = val;
+      } else if (val > best_other) {
+        best_other = val; best_other_k = k;
+      }
+      nscore[k] = 0.0; ncount[k] = 0;   // reset for next node
+    }
+    double bo = (best_other_k == SIZE_MAX) ? 0.0 : best_other;
+    double margin = assigned_val - bo;
+    if (margin < 0.0) margin = 0.0;
+    if (margin > 1.0) margin = 1.0;
+    confidence[v1]   = (float)margin;
+    second_choice[v1] = best_other_k;
+    second_score[v1]  = (best_other_k == SIZE_MAX) ? 0.0f : (float)best_other;
+  }
+}
+
 StoredDistance get_element(Matrix const &m, int i, int j) { return m(i, j); }
 

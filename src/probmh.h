@@ -163,6 +163,18 @@ public:
     void addHash(uint64_t h, double weight = 1.0);
 
     /**
+     * Reset the sketch to the freshly-constructed empty state for reuse with
+     * the SAME m / kmer_size / seed, WITHOUT releasing and re-allocating the
+     * register / winner / permutation buffers.  Lets a parallel sketch loop
+     * keep one thread-local ProbMinHash4 and re-bin every contig through it,
+     * eliminating per-contig malloc/free churn and allocator contention
+     * (mirrors RabbitTClust's thread-local memory pools).  The post-reset state
+     * is bit-for-bit equivalent to a fresh ProbMinHash4(m, kmer_size, seed).
+     * Must NOT be called after finalize() (which frees the permutation arrays).
+     */
+    void reset();
+
+    /**
      * Return the probability Jaccard similarity in [0, 1].
      * Compares register VALUES (exact float equality).  Correct for
      * unweighted update() / updateEntropy() where the same element
