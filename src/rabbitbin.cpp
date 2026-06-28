@@ -3723,7 +3723,9 @@ static int rb_cmd_bin(int ac, char *av[]) {
       size_t ignored_too_small = 0;
 
       depth_matrix.resize(nobs, num_depth_samples, false);
-      depth_var_matrix.resize(nobs, num_depth_samples, false);
+      // depth_var_matrix is intentionally left unallocated: its only reader,
+      // cal_depth_dist(), has no live call sites, so allocating + zero-filling
+      // nobs×S floats here was pure waste.  Revive both if cal_depth_dist returns.
       small_depth_matrix.resize(nobs1, num_depth_samples, false);
 
       // Iterate large contigs in order (preserves original row semantics).
@@ -3805,7 +3807,6 @@ static int rb_cmd_bin(int ac, char *av[]) {
       small_contig_names.erase(std::remove(small_contig_names.begin(), small_contig_names.end(), ""), small_contig_names.end());
 
       depth_matrix.resize(nobs, num_depth_samples, true);
-      depth_var_matrix.resize(nobs, num_depth_samples, true);
       small_depth_matrix.resize(nobs1, num_depth_samples, true);
 
       verbose_message("Merged %d contigs and %d coverages from %s "
@@ -3830,7 +3831,6 @@ static int rb_cmd_bin(int ac, char *av[]) {
       contigs.clear();
       small_contigs.clear();
       depth_matrix.resize(nobs, 1, false);
-      depth_var_matrix.resize(nobs, 1, false);
       small_depth_matrix.resize(nobs1, 1, false);
     }
   }
@@ -4201,6 +4201,15 @@ static int rb_cmd_bin(int ac, char *av[]) {
             simCutoff / 10., getUsedPhysMem(), getTotalPhysMem() / 1024 / 1024);
         build_similarity_graph(g, simCutoff / 1000.);
       }
+
+      // PMH winner arrays fed ONLY the O(N²) composition-similarity kernel
+      // (graph_sim / Fusion D / calibration), which is now complete — the
+      // similarities are baked into g.sComp.  No later stage (edgeScore, LP,
+      // recruit, split, output, certify, cache) reads them, so release the
+      // packed 16-bit (2·nobs·m) and any 32-bit winner array here, before the
+      // edge-scoring + propagation phases.  No-op on the --load-cache path.
+      if (!g_win16.empty())    std::vector<uint16_t>().swap(g_win16);
+      if (!g_win_flat.empty()) std::vector<uint32_t>().swap(g_win_flat);
 
       // ── Save hook: persist the post-graph state, then continue normally so
       // the same invocation also emits its bins. ───────────────────────────
@@ -4635,6 +4644,14 @@ static int rb_cmd_bin(int ac, char *av[]) {
       // maintaining a separate unordered_set (which cost ~2·|E| hash inserts).
       size_t n_connected = 0;
       for (size_t i = 0; i < nobs; ++i) if (!g.incs[i].empty()) ++n_connected;
+
+      // g.sComp (raw composition similarity, 4·E bytes) has no reader left on the
+      // production path now that edgeScore + incidence exist: LP, confidence and
+      // bin collection all use edgeScore/incs.  The cache (if any) was written
+      // earlier, before edgeScore.  Release it before LP to avoid carrying both
+      // sComp + edgeScore (8·E) through propagation.  --certify re-derives
+      // edgeScore from sComp, so keep it in that case.
+      if (!g_certify) std::vector<StoredDistance>().swap(g.sComp);
 
       // ── 5. Label propagation ───────────────────────────────────────────
       verbose_message("Starting Label Propagation. connected=%zu nobs=%d "
