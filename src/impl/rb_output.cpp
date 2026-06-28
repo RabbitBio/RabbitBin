@@ -343,68 +343,10 @@ void output_bins(BinMap &cls) {
       }
 
       // ── Stability-aware MAG certification output (feature #6) ─────────────
+      // Implemented in impl/rb_certify.cpp; BinNum numbering is final here.
       if (do_cert) {
 #pragma omp task firstprivate(label2binid)
-        {
-          const std::string sm = std::string(outFile) + ".stable_members.tsv";
-          const std::string bs = std::string(outFile) + ".bin_stability.tsv";
-          const std::string ac = std::string(outFile) + ".ambiguous_contigs.tsv";
-          verbose_message("Writing MAG stability certification to: %s, %s, %s\n",
-                          bs.c_str(), sm.c_str(), ac.c_str());
-          std::ofstream osm(sm.c_str()), obs(bs.c_str()), oac(ac.c_str());
-          osm << "ContigName\tBinNum\tLength\tAssignmentProb\tCore\tAmbiguous"
-                 "\tAlternativeBin\tAltProb\n";
-          oac << "ContigName\tBinNum\tLength\tAssignmentProb\tAlternativeBin"
-                 "\tAltProb\n";
-          obs << "BinNum\tTotalBp\tCoreBp\tCoreFraction\tMeanAssignmentProb"
-                 "\tCertified\n";
-          // Per output bin: total/core bp and length-weighted mean prob over the
-          // bin's LARGE contigs (only those carry a graph node / stability score).
-          struct Acc { size_t total = 0, core = 0; double probLw = 0.0; };
-          std::map<size_t, Acc> perBin;
-          for (size_t i = 0; i < nobs; ++i) {
-            if (clsMap[i] == 0) continue;                 // unbinned large contig
-            auto bit = label2binid.find(clsMap[i] - 1);
-            if (bit == label2binid.end()) continue;
-            const size_t binid = bit->second;
-            const float p = (i < g_cert_prob.size()) ? g_cert_prob[i] : -1.0f;
-            if (p < 0.0f) continue;                       // no stability score
-            const size_t len = seq_lens[i];
-            const bool core = p >= (float)g_cert_core_thr;
-            const bool amb = p < (float)g_cert_amb_thr;
-            long altBin = -1; float altP = 0.0f;
-            if (i < g_cert_alt.size() && g_cert_alt[i] != SIZE_MAX) {
-              auto ait = label2binid.find(g_cert_alt[i]);
-              if (ait != label2binid.end()) altBin = (long)ait->second;
-              altP = g_cert_alt_prob[i];
-            }
-            osm << contig_names[i] << "\t" << binid << "\t" << len << "\t"
-                << std::fixed << std::setprecision(3) << p << "\t"
-                << (core ? "Y" : "N") << "\t" << (amb ? "Y" : "N") << "\t"
-                << altBin << "\t" << altP << "\n";
-            osm.unsetf(std::ios::fixed);
-            if (amb) {
-              oac << contig_names[i] << "\t" << binid << "\t" << len << "\t"
-                  << std::fixed << std::setprecision(3) << p << "\t" << altBin
-                  << "\t" << altP << "\n";
-              oac.unsetf(std::ios::fixed);
-            }
-            Acc &a = perBin[binid];
-            a.total += len; a.probLw += (double)p * len;
-            if (core) a.core += len;
-          }
-          for (auto &kv : perBin) {
-            const Acc &a = kv.second;
-            double cf = a.total ? (double)a.core / (double)a.total : 0.0;
-            double mp = a.total ? a.probLw / (double)a.total : 0.0;
-            bool cert = (cf >= g_cert_frac_thr) && (mp >= g_cert_prob_thr);
-            obs << kv.first << "\t" << a.total << "\t" << a.core << "\t"
-                << std::fixed << std::setprecision(3) << cf << "\t" << mp
-                << "\t" << (cert ? "Y" : "N") << "\n";
-            obs.unsetf(std::ios::fixed);
-          }
-          osm.flush(); obs.flush(); oac.flush();
-        }
+        rb_write_certification(label2binid, clsMap);
       }
 
       if (outUnbinned) {
