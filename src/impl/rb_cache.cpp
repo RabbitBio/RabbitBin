@@ -92,7 +92,10 @@ static inline bool rbc_rd_mat(FILE *f, Matrix &m) {
 }
 
 static const char RBC_MAGIC[8] = {'R', 'B', 'C', 'A', 'C', 'H', 'E', '1'};
-static const uint32_t RBC_VERSION = 1;
+// v1: original (no SNV).  v2: appends an optional per-large-contig SNV block
+// (feature #5) so --strain results are reusable from cache.  v1 caches still
+// load (the SNV block is simply absent).
+static const uint32_t RBC_VERSION = 2;
 
 } // namespace
 
@@ -149,6 +152,18 @@ bool rb_write_cache(const std::string &path, const Graph &g, bool has_depth) {
   rbc_wr_vec(f, g.to);
   rbc_wr_vec(f, g.sComp);
 
+  // ── SNV / strain block (v2; feature #5) ──────────────────────────────────
+  // Row-aligned with contig_names (nobs × num_depth_samples).  Stored so a
+  // re-bin from cache reproduces <prefix>.snv.tsv / <prefix>.strain.tsv without
+  // re-scanning the BAMs.  Flag = 0 means "no SNV data in this cache".
+  uint8_t v_hs = (g_strain_scan && !g_snv_pi.empty()) ? 1 : 0;
+  rbc_wr_pod(f, v_hs);
+  if (v_hs) {
+    rbc_wr_vec(f, g_snv_pi);
+    rbc_wr_vec(f, g_snv_nsnv);
+    rbc_wr_vec(f, g_snv_cov);
+  }
+
   bool ok = (ferror(f) == 0);
   fclose(f);
   if (!ok) {
@@ -171,8 +186,8 @@ bool rb_load_cache(const std::string &path) {
     return false;
   }
   uint32_t ver = 0;
-  if (!rbc_rd_pod(f, ver) || ver != RBC_VERSION) {
-    cerr << "[Error!] unsupported cache version (" << ver << ", expected "
+  if (!rbc_rd_pod(f, ver) || ver < 1 || ver > RBC_VERSION) {
+    cerr << "[Error!] unsupported cache version (" << ver << ", expected 1.."
          << RBC_VERSION << ")\n";
     fclose(f);
     return false;
@@ -233,6 +248,22 @@ bool rb_load_cache(const std::string &path) {
   ok &= rbc_rd_vec(f, g_cache_from);
   ok &= rbc_rd_vec(f, g_cache_to);
   ok &= rbc_rd_vec(f, g_cache_scomp);
+
+  // ── SNV / strain block (v2; feature #5) ──────────────────────────────────
+  g_cache_has_snv = false;
+  if (ok && ver >= 2) {
+    uint8_t v_hs = 0;
+    ok &= rbc_rd_pod(f, v_hs);
+    if (ok && v_hs) {
+      ok &= rbc_rd_vec(f, g_snv_pi);
+      ok &= rbc_rd_vec(f, g_snv_nsnv);
+      ok &= rbc_rd_vec(f, g_snv_cov);
+      if (ok) {
+        g_cache_has_snv = true;
+        g_strain_scan = true;  // re-emit snv/strain tables from cached vectors
+      }
+    }
+  }
 
   fclose(f);
   if (!ok) {

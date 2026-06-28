@@ -562,12 +562,96 @@ static uint64_t shard_start_voff(hts_idx_t *idx, int32_t lo, int32_t hi,
   return 0;
 }
 
+// ── SNV pileup helpers (feature #5) ─────────────────────────────────────────
+// Accumulate one already-filtered read's aligned bases into a per-position
+// 4-allele counter (A,C,G,T at index 0..3) for the current contig.  Walks the
+// CIGAR exactly like caldepth's reference-coordinate bookkeeping but only needs
+// the query bases (reference-free / consensus variant model).
+static inline void snv_accumulate_read(const bam1_t *b, uint32_t *cnt,
+                                       int32_t reflen, int minBaseQ) {
+  const uint32_t *cigar = bam_get_cigar(b);
+  const uint8_t *seq = bam_get_seq(b);
+  const uint8_t *qual = bam_get_qual(b);
+  const bool haveQual = (minBaseQ > 0) && qual && (qual[0] != 0xff);
+  int32_t refpos = b->core.pos;
+  int32_t seqpos = 0;
+  const int ncig = b->core.n_cigar;
+  for (int i = 0; i < ncig; ++i) {
+    const int op = bam_cigar_op(cigar[i]);
+    const int oplen = bam_cigar_oplen(cigar[i]);
+    switch (op) {
+    case BAM_CMATCH:
+    case BAM_CEQUAL:
+    case BAM_CDIFF:
+      for (int j = 0; j < oplen; ++j) {
+        const int32_t rp = refpos + j;
+        if (rp < 0 || rp >= reflen)
+          continue;
+        if (haveQual && qual[seqpos + j] < minBaseQ)
+          continue;
+        const int base = seq_nt16_int[bam_seqi(seq, seqpos + j)]; // 0..3, 4=N
+        if (base < 4)
+          cnt[(size_t)rp * 4 + base]++;
+      }
+      refpos += oplen;
+      seqpos += oplen;
+      break;
+    case BAM_CINS:
+    case BAM_CSOFT_CLIP:
+      seqpos += oplen;
+      break;
+    case BAM_CDEL:
+    case BAM_CREF_SKIP:
+      refpos += oplen;
+      break;
+    default: // hard clip / pad consume neither
+      break;
+    }
+  }
+}
+
+// Reduce one contig's finished per-position pileup to the three SNV scalars.
+static inline void snv_finalize_contig(const uint32_t *cnt, int32_t reflen,
+                                       int minDepth, double minAf,
+                                       SnvContigStat &out) {
+  uint32_t covered = 0, nsnv = 0;
+  double pisum = 0.0;
+  for (int32_t p = 0; p < reflen; ++p) {
+    const uint32_t *c = cnt + (size_t)p * 4;
+    const uint32_t tot = c[0] + c[1] + c[2] + c[3];
+    if (tot < (uint32_t)minDepth)
+      continue;
+    covered++;
+    uint32_t mx = c[0];
+    for (int a = 1; a < 4; ++a)
+      if (c[a] > mx)
+        mx = c[a];
+    const uint32_t minor = tot - mx;
+    const double invtot = 1.0 / (double)tot;
+    double sumsq = 0.0;
+    for (int a = 0; a < 4; ++a) {
+      const double pa = c[a] * invtot;
+      sumsq += pa * pa;
+    }
+    // Unbiased per-site nucleotide diversity: n/(n-1) * (1 - sum p_a^2).
+    pisum += (tot > 1) ? ((double)tot / (tot - 1.0)) * (1.0 - sumsq) : 0.0;
+    if ((double)minor * invtot >= minAf && minor >= 2)
+      nsnv++;
+  }
+  out.covered = covered;
+  out.nsnv = nsnv;
+  out.pi_sum = pisum;
+}
+
 static void process_depth_shard(const DepthShard &sh,
                                 const std::string &bamPath,
                                 const BamHeaderT &header,
                                 CountType *contigDepths, float percentIdentity,
                                 int maxEdgeBases, bool includeEdgeBases,
-                                int avgRead, int minMapQual) {
+                                int avgRead, int minMapQual,
+                                SnvContigStat *snvBam = nullptr,
+                                int snvMinDepth = 5, double snvMinAf = 0.05,
+                                int snvMinBaseQ = 0) {
   if (!sh.hasData)
     return;
   htsFile *fp = hts_open(bamPath.c_str(), "rb");
@@ -582,6 +666,17 @@ static void process_depth_shard(const DepthShard &sh,
   DepthCounts none{};
   const int32_t n_targets = header->n_targets;
   const int edge = includeEdgeBases ? 0 : std::min(maxEdgeBases, avgRead / 3);
+
+  // SNV pileup state for the contig currently being scanned (reads are
+  // coordinate-sorted and each tid lies entirely within one shard, so we only
+  // ever hold ONE contig's per-position buffer per worker thread).
+  std::vector<uint32_t> snvCnt;
+  int32_t snvCurTid = -1, snvCurLen = 0;
+  auto snvFlush = [&]() {
+    if (snvBam && snvCurTid >= 0)
+      snv_finalize_contig(snvCnt.data(), snvCurLen, snvMinDepth, snvMinAf,
+                          snvBam[snvCurTid]);
+  };
 
   while (bam_read1(bgzf, b) >= 0) {
     int32_t tid = b->core.tid;
@@ -604,14 +699,26 @@ static void process_depth_shard(const DepthShard &sh,
       if (!CheckRead::checkEnd(b, header.get()))
         continue;
     }
+    // Advance the SNV pileup buffer when we cross into a new contig.
+    if (snvBam && tid != snvCurTid) {
+      snvFlush();
+      snvCurTid = tid;
+      snvCurLen = (int32_t)header->target_len[tid];
+      snvCnt.assign((size_t)snvCurLen * 4, 0u);
+    }
     ReadStatistics rs;
     // One pass: caldepth's return (edge-trimmed overlap) is identical with or
     // without a per-base buffer, so this matches the serial depth exactly.
     CountType ov =
         caldepth(b, none, header->target_len[tid], NULL, edge, &rs);
-    if (rs.isValid() && rs.getPctId() >= percentIdentity)
+    if (rs.isValid() && rs.getPctId() >= percentIdentity) {
       contigDepths[tid] += ov;
+      // SNV uses the IDENTICAL read set as depth (same pct-id / edge filters).
+      if (snvBam)
+        snv_accumulate_read(b, snvCnt.data(), snvCurLen, snvMinBaseQ);
+    }
   }
+  snvFlush();   // finalize the last contig of this shard
   bam_destroy1(b);
   hts_close(fp);
 }
@@ -631,7 +738,8 @@ std::string compute_depth_tsv_inmem(const StringVector &bamFilePaths,
                                     float percentIdentity, int minContigLength,
                                     float minContigDepth, int maxEdgeBases,
                                     bool includeEdgeBases,
-                                    bool intraDepthVariance, int numThreads) {
+                                    bool intraDepthVariance, int numThreads,
+                                    SnvResult *snv) {
   const int num_bams = (int)bamFilePaths.size();
   if (num_bams < 1)
     throw std::runtime_error("compute_depth_tsv_inmem: no BAM files");
@@ -733,13 +841,31 @@ std::string compute_depth_tsv_inmem(const StringVector &bamFilePaths,
     if (minAvgRead > averageReadSize[bi])
       minAvgRead = averageReadSize[bi];
   }
+  // SNV output channel (feature #5): allocate one [num_bams * n_targets] stat
+  // grid up front so each shard writes its disjoint tid range lock-free.
+  const bool snvOn = (snv != nullptr);
+  if (snvOn) {
+    snv->n_targets = header->n_targets;
+    snv->num_bams = num_bams;
+    snv->names.resize(header->n_targets);
+    for (int32_t t = 0; t < header->n_targets; ++t)
+      snv->names[t] = header->target_name[t];
+    snv->stats.assign((size_t)num_bams * header->n_targets, SnvContigStat{});
+  }
+
   omp_set_num_threads(g_full_threads);
 #pragma omp parallel for schedule(dynamic, 1)
   for (int s = 0; s < (int)shards.size(); s++) {
-    process_depth_shard(shards[s], bamFilePaths[shards[s].bamIdx], header,
-                        bamContigDepths[shards[s].bamIdx].get(),
+    const int bi = shards[s].bamIdx;
+    SnvContigStat *snvBam =
+        snvOn ? (snv->stats.data() + (size_t)bi * header->n_targets) : nullptr;
+    process_depth_shard(shards[s], bamFilePaths[bi], header,
+                        bamContigDepths[bi].get(),
                         percentIdentity, maxEdgeBases, includeEdgeBases,
-                        averageReadSize[shards[s].bamIdx], minMapQual);
+                        averageReadSize[bi], minMapQual, snvBam,
+                        snvOn ? snv->minDepth : 5,
+                        snvOn ? snv->minAf : 0.05,
+                        snvOn ? snv->minBaseQ : 0);
   }
   if (intraDepthVariance) {
 #pragma omp parallel for schedule(static)
