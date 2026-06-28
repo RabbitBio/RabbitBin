@@ -26,6 +26,19 @@ struct SnvContigStat {
   double pi_sum = 0.0;    // sum over covered sites of per-site nucleotide diversity
 };
 
+// One polymorphic position, captured per (sample, contig) for strain resolution.
+// maj/alt are the consensus / second-allele nucleotide indices (0..3 = A,C,G,T)
+// so the same site reported by different samples can be matched + oriented by
+// allele identity.  alt-allele frequency = altCount/total traces the minor
+// strain's per-sample relative abundance (the DESMAN/inStrain linkage signal).
+struct SnvSite {
+  uint32_t pos;
+  uint8_t maj;
+  uint8_t alt;
+  uint32_t altCount;
+  uint32_t total;
+};
+
 // Output channel filled by compute_depth_tsv_inmem when SNV extraction is on.
 // stats is laid out [sampleIdx * n_targets + tid]; names[tid] is the BAM
 // reference name so the caller can map tid -> contig row by name.
@@ -34,10 +47,15 @@ struct SnvResult {
   int minDepth = 5;       // min position depth to score a site
   double minAf = 0.05;    // min minor-allele frequency to call a SNV
   int minBaseQ = 0;       // min base quality (0 = ignore quals)
+  bool resolve = false;   // also collect per-site allele data (strain resolution)
+  int maxSites = 96;      // cap of retained polymorphic sites per (contig,sample)
   int32_t n_targets = 0;
   int num_bams = 0;
   std::vector<std::string> names;       // [n_targets]
   std::vector<SnvContigStat> stats;     // [num_bams * n_targets]
+  // Per (sample, contig) capped list of polymorphic sites, indexed b*n_targets+tid.
+  // Empty unless resolve == true.  Populated only for polymorphic contigs.
+  std::vector<std::vector<SnvSite>> sites;
 };
 
 // ── Fused map->depth (rabbitbin map --fused-depth) ──────────────────────────

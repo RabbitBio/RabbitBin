@@ -50,7 +50,10 @@ void output_bins(BinMap &cls) {
           os_snv << "\tPi_s" << (i + 1);
         os_snv << "\n";
         os_strain << "BinNum\tNumContigs\tTotalBp\tMeanPi\tMeanSNVperKb"
-                     "\tMultiStrain\n";
+                     "\tMultiStrain\tEstStrains";
+        for (int i = 0; i < (int)num_depth_samples; ++i)
+          os_strain << "\tMinorAbund_s" << (i + 1);
+        os_strain << "\n";
       }
 
       // Optional CAMI bioboxes output (<prefix>.binning).
@@ -159,10 +162,21 @@ void output_bins(BinMap &cls) {
             os_snv << snv_ss.str();
             double meanpi = bin_snv_bp ? bin_pi_lw / (double)bin_snv_bp : 0.0;
             double meankb = bin_snv_bp ? bin_snvkb_lw / (double)bin_snv_bp : 0.0;
+            // Linkage-based strain count + dominant minor-strain abundance.
+            std::vector<double> minorAbund;
+            int estStrains = estimate_bin_strains(it->second, minorAbund);
+            bool multi = (estStrains > 1) || (meanpi >= STRAIN_PI_THR);
             os_strain << bin_id << "\t" << bin_snv_n << "\t" << bin_snv_bp << "\t"
                       << std::fixed << std::setprecision(5) << meanpi << "\t"
                       << std::setprecision(3) << meankb << "\t"
-                      << (meanpi >= STRAIN_PI_THR ? "Y" : "N") << "\n";
+                      << (multi ? "Y" : "N") << "\t"
+                      << estStrains;
+            os_strain << std::setprecision(4);
+            for (int i = 0; i < (int)num_depth_samples; ++i)
+              os_strain << "\t"
+                        << ((estStrains > 1 && i < (int)minorAbund.size())
+                                ? minorAbund[i] : 0.0);
+            os_strain << "\n";
             os_strain.unsetf(std::ios::fixed);
           }
           for (size_t i = 0; i < cluster.size(); ++i) {
