@@ -359,6 +359,28 @@ static int    g_strain_max_k     = 4;    // --strain-max-k (cap on reported stra
 // contig_names: g_snv_sites[idx * num_depth_samples + sample].
 static std::vector<std::vector<SnvSite>> g_snv_sites;
 
+// ── Stability-aware MAG certification (feature #6) ──────────────────────────
+// --certify: after the (cheap) one-graph binning, re-run the edge-score ->
+// incidence -> label-propagation tail under a handful of parameter / seed
+// perturbations on the SAME reused similarity graph, then report how stably each
+// contig stays with its baseline bin-mates.  Leverages RabbitBin's cache-grade
+// graph reuse: the expensive parse/sketch/graph build happens once, perturbations
+// cost only the tail.  Output certifies which MAGs (and which contigs within
+// them) survive parameter wobble — the part downstream users actually need
+// (publication-grade MAG selection, contamination triage).  Per-contig stability
+// is computed by consensus: for each baseline bin, in each perturbed run we find
+// the run-cluster the bin's members predominantly fall into, and a contig "agrees"
+// when it lands there too (robust to label renumbering and bin merging/splitting).
+static bool   g_certify        = false;  // --certify
+static double g_cert_core_thr  = 0.80;   // AssignmentProb >= -> core contig
+static double g_cert_amb_thr   = 0.50;   // AssignmentProb <  -> ambiguous contig
+static double g_cert_frac_thr  = 0.80;   // CoreFraction   >= -> certified bin
+static double g_cert_prob_thr  = 0.80;   // MeanAssignProb >= -> certified bin
+static std::vector<float>  g_cert_prob;     // [nobs] AssignmentProb (-1 = unbinned/NA)
+static std::vector<size_t> g_cert_alt;      // [nobs] most-frequent alternative baseline label
+static std::vector<float>  g_cert_alt_prob; // [nobs] frequency of that alternative
+static int    g_cert_nruns     = 0;      // number of perturbation runs actually done
+
 // ── Incremental multi-sample binning (feature #3) ───────────────────────────
 // --add-depth FILE (with --load-cache): fold the depth columns of FILE in as
 // NEW samples on top of the cached state, reusing the (expensive) one-off FASTA
@@ -1550,6 +1572,166 @@ static int estimate_bin_strains(const ContigVector &cluster,
   if (am > 0.5) for (size_t b = 0; b < S; ++b) acc[b] = 1.0 - acc[b];
   minorAbund = std::move(acc);
   return std::min(1 + kept, g_strain_max_k);
+}
+
+// ── Stability certification (feature #6): perturb the tail, score stability ──
+// Re-runs edge-score -> incidence -> label-propagation on the reused graph `g`
+// under a fixed grid of parameter/seed perturbations and fills g_cert_* with each
+// large contig's per-bin assignment stability vs the baseline partition.  Clobbers
+// g.edgeScore / g.incs (caller must no longer need them — invoked after the
+// baseline bins are collected, just before `g` is destroyed).
+static void certify_stability(Graph &g, const std::vector<size_t> &baseline,
+                              bool has_depth) {
+  const size_t E = g.getEdgeCount();
+  const size_t N = nobs;
+  static constexpr StoredDistance SSCR_MAX = 1.0f - 1e-6f;
+  g_cert_prob.assign(N, -1.0f);
+  g_cert_alt.assign(N, SIZE_MAX);
+  g_cert_alt_prob.assign(N, 0.0f);
+  if (N == 0 || E == 0) return;
+
+  // Baseline "binned" mask from the production incidence still resident in g.
+  std::vector<char> baseBinned(N, 0);
+  for (size_t i = 0; i < N; ++i) baseBinned[i] = !g.incs[i].empty();
+
+  // Mirror the production edge-score / incidence / LP exactly (so a zero-delta
+  // config reproduces the baseline partition).
+  auto compute_es = [&]() {
+    g.edgeScore.assign(E, 0.0f);
+    if (has_depth) {
+#pragma omp parallel for schedule(dynamic, 1)
+      for (size_t e = 0; e < E; ++e) {
+        size_t i = g.from[e], j = g.to[e];
+        if (edge_is_gfa(g.sComp[e])) { g.edgeScore[e] = (StoredDistance)g_gfa_weight; continue; }
+        if (num_depth_samples <= 1) {
+          double w = (double)g.sComp[e];
+          if (g_edge_power != 1.0) w = std::pow(w, g_edge_power);
+          g.edgeScore[e] = (StoredDistance)w;
+        } else {
+          bool depth_ok;
+          double dterm = depth_edge_term(i, j, depth_ok);
+          if (!depth_ok) { g.edgeScore[e] = 0.0f; continue; }
+          double w = g_w_comp * (double)g.sComp[e] + (1.0 - g_w_comp) * dterm;
+          if (!std::isfinite(w) || w < (double)min_edge_weight) w = 0.0;
+          if (g_edge_power != 1.0 && w > 0.0) w = std::pow(w, g_edge_power);
+          g.edgeScore[e] = (StoredDistance)w;
+        }
+      }
+    } else {
+      g.edgeScore = g.sComp;
+      for (auto &s : g.edgeScore) {
+        if (edge_is_gfa(s)) { s = (StoredDistance)g_gfa_weight; continue; }
+        if (s < min_edge_weight) s = 0.0f;
+      }
+    }
+  };
+  auto rebuild_incs = [&]() {
+    g.incs.assign(N, {});
+    for (size_t e = 0; e < E; ++e)
+      if (g.edgeScore[e] > 0) {
+        if (g.edgeScore[e] > SSCR_MAX) g.edgeScore[e] = SSCR_MAX;
+        g.incs[g.from[e]].push_back(e);
+        g.incs[g.to[e]].push_back(e);
+      }
+#pragma omp parallel for schedule(dynamic, 256)
+    for (size_t v = 0; v < N; ++v) {
+      auto &inc = g.incs[v];
+      std::sort(inc.begin(), inc.end(), [&](size_t e1, size_t e2) {
+        return g.getOtherNode(e1, v) < g.getOtherNode(e2, v);
+      });
+    }
+  };
+  auto run_lp = [&](unsigned sd) {
+    std::vector<size_t> mem;
+    std::vector<size_t> order(N);
+    std::iota(order.begin(), order.end(), 0);
+    std::shuffle(order.begin(), order.end(), std::default_random_engine(sd));
+    cluster_by_propagation(g, mem, order);
+    return mem;
+  };
+
+  // Perturbation grid around the baseline (composition weight, edge power,
+  // min-edge-score, seed).  ~10 runs; clamps keep params in-range.
+  struct Cfg { double wc, ep, mew; unsigned sd; };
+  const double bwc = g_w_comp, bep = g_edge_power, bmew = (double)min_edge_weight;
+  const unsigned bsd = (unsigned)seed;
+  auto clampd = [](double x, double lo, double hi) { return x < lo ? lo : (x > hi ? hi : x); };
+  std::vector<Cfg> cfgs = {
+    {clampd(bwc - 0.10, 0.0, 1.0), bep, bmew, bsd},
+    {clampd(bwc + 0.10, 0.0, 1.0), bep, bmew, bsd},
+    {bwc, bep, std::max(0.01, bmew - 0.03), bsd},
+    {bwc, bep, bmew + 0.03, bsd},
+    {bwc, (bep == 1.0 ? 1.5 : 1.0), bmew, bsd},
+    {bwc, bep, bmew, bsd * 2u + 1u},
+    {bwc, bep, bmew, bsd * 7u + 13u},
+    {clampd(bwc - 0.10, 0.0, 1.0), bep, bmew, bsd * 3u + 5u},
+    {clampd(bwc + 0.10, 0.0, 1.0), bep, bmew, bsd * 5u + 9u},
+    {bwc, bep, std::max(0.01, bmew - 0.03), bsd * 11u + 1u},
+  };
+
+  std::vector<std::vector<size_t>> runs;
+  runs.reserve(cfgs.size());
+  for (const Cfg &cf : cfgs) {
+    g_w_comp = cf.wc; g_edge_power = cf.ep; min_edge_weight = (Similarity)cf.mew;
+    compute_es();
+    rebuild_incs();
+    runs.push_back(run_lp(cf.sd));
+  }
+  // Restore baseline globals.
+  g_w_comp = bwc; g_edge_power = bep; min_edge_weight = (Similarity)bmew;
+  g_cert_nruns = (int)runs.size();
+  if (runs.empty()) return;
+
+  // Baseline bins (binned contigs grouped by baseline LP label).
+  std::unordered_map<size_t, std::vector<size_t>> binMembers;
+  for (size_t i = 0; i < N; ++i)
+    if (baseBinned[i]) binMembers[baseline[i]].push_back(i);
+
+  std::vector<int> agree(N, 0), seen(N, 0);
+  std::vector<std::unordered_map<size_t, int>> altTally(N);
+  for (const auto &mem : runs) {
+    // Per baseline bin: the run-cluster its members predominantly fall into.
+    std::unordered_map<size_t, size_t> plurality;   // baseLabel -> runLabel
+    std::unordered_map<size_t, size_t> owner;        // runLabel -> baseLabel
+    for (auto &kv : binMembers) {
+      std::unordered_map<size_t, int> cnt;
+      int best = -1; size_t bestLab = 0;
+      for (size_t i : kv.second) {
+        int c = ++cnt[mem[i]];
+        if (c > best) { best = c; bestLab = mem[i]; }
+      }
+      plurality[kv.first] = bestLab;
+      // Whichever baseline bin contributes the most members to a run-cluster
+      // "owns" it (for naming a contig's alternative destination).
+      auto it = owner.find(bestLab);
+      if (it == owner.end() || (int)binMembers[it->second].size() < (int)kv.second.size())
+        owner[bestLab] = kv.first;
+    }
+    for (auto &kv : binMembers) {
+      const size_t pl = plurality[kv.first];
+      for (size_t i : kv.second) {
+        seen[i]++;
+        if (mem[i] == pl) agree[i]++;
+        else {
+          auto it = owner.find(mem[i]);
+          if (it != owner.end() && it->second != kv.first)
+            altTally[i][it->second]++;
+        }
+      }
+    }
+  }
+
+  for (size_t i = 0; i < N; ++i) {
+    if (!baseBinned[i] || seen[i] == 0) continue;
+    g_cert_prob[i] = (float)agree[i] / (float)seen[i];
+    int bestc = 0; size_t bestlab = SIZE_MAX;
+    for (auto &kv : altTally[i])
+      if (kv.second > bestc) { bestc = kv.second; bestlab = kv.first; }
+    if (bestlab != SIZE_MAX) {
+      g_cert_alt[i] = bestlab;
+      g_cert_alt_prob[i] = (float)bestc / (float)seen[i];
+    }
+  }
 }
 
 // ── Forward declarations for helpers used by build_similarity_graph ────────────────
@@ -2952,6 +3134,9 @@ static int rb_cmd_bin(int ac, char *av[]) {
       ("strain-max-sites", po::value<int>(&g_strain_max_sites)->default_value(96), "[--strain] Max polymorphic sites kept per contig per sample (memory cap)")
       ("strain-min-sites", po::value<int>(&g_strain_min_sites)->default_value(12), "[--strain] Min polymorphic sites in a bin to attempt strain resolution")
       ("strain-max-k", po::value<int>(&g_strain_max_k)->default_value(4), "[--strain] Max number of strains reported per bin")
+      ("certify", po::value<bool>(&g_certify)->zero_tokens(), "Stability-aware MAG certification: re-run the binning tail under parameter/seed perturbations on the reused graph -> <prefix>.bin_stability.tsv, .stable_members.tsv, .ambiguous_contigs.tsv")
+      ("cert-core", po::value<double>(&g_cert_core_thr)->default_value(0.80), "[--certify] AssignmentProb >= this marks a contig as core")
+      ("cert-fraction", po::value<double>(&g_cert_frac_thr)->default_value(0.80), "[--certify] Min stable-core length fraction to certify a bin")
       ("max-edges", po::value<size_t>(&maxEdges)->default_value(200), "Max neighbors per contig")
       ("sim-cutoff", po::value<Similarity>(&simCutoff)->default_value(0), "Composition similarity cutoff x100 (0=auto)")
       ("sketch-k", po::value<int>(&sketch_kmer_size)->default_value(8), "Sketch k-mer size")
@@ -4812,6 +4997,16 @@ static int rb_cmd_bin(int ac, char *av[]) {
           cls[membership[i]].push_back(i);
       }
       mems = membership;
+
+      // Stability certification (feature #6): perturb the tail on this reused
+      // graph and score per-contig stability.  Runs last (it clobbers
+      // edgeScore/incs, which are no longer needed) while `g` is still alive.
+      if (g_certify) {
+        verbose_message("Certifying MAG stability (parameter/seed perturbations "
+                        "on the reused graph)...\n");
+        certify_stability(g, membership, has_depth);
+        rb_phase("stability certification done");
+      }
     } // graph g destroyed here
 
     if (no_recruit) break;
