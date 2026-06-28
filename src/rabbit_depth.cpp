@@ -610,10 +610,15 @@ static inline void snv_accumulate_read(const bam1_t *b, uint32_t *cnt,
   }
 }
 
-// Reduce one contig's finished per-position pileup to the three SNV scalars.
+// Reduce one contig's finished per-position pileup to the three SNV scalars and
+// (optionally) the capped list of its most-covered polymorphic sites for strain
+// resolution.  When sitesOut != nullptr we keep up to maxSites sites, preferring
+// the deepest ones (most reliable allele frequencies).
 static inline void snv_finalize_contig(const uint32_t *cnt, int32_t reflen,
                                        int minDepth, double minAf,
-                                       SnvContigStat &out) {
+                                       SnvContigStat &out,
+                                       std::vector<SnvSite> *sitesOut = nullptr,
+                                       int maxSites = 0) {
   uint32_t covered = 0, nsnv = 0;
   double pisum = 0.0;
   for (int32_t p = 0; p < reflen; ++p) {
@@ -622,10 +627,16 @@ static inline void snv_finalize_contig(const uint32_t *cnt, int32_t reflen,
     if (tot < (uint32_t)minDepth)
       continue;
     covered++;
-    uint32_t mx = c[0];
+    // Top-2 alleles (consensus + second) for orientation and freq.
+    int a1 = 0;
     for (int a = 1; a < 4; ++a)
-      if (c[a] > mx)
-        mx = c[a];
+      if (c[a] > c[a1])
+        a1 = a;
+    int a2 = -1;
+    for (int a = 0; a < 4; ++a)
+      if (a != a1 && (a2 < 0 || c[a] > c[a2]))
+        a2 = a;
+    const uint32_t mx = c[a1];
     const uint32_t minor = tot - mx;
     const double invtot = 1.0 / (double)tot;
     double sumsq = 0.0;
@@ -635,12 +646,27 @@ static inline void snv_finalize_contig(const uint32_t *cnt, int32_t reflen,
     }
     // Unbiased per-site nucleotide diversity: n/(n-1) * (1 - sum p_a^2).
     pisum += (tot > 1) ? ((double)tot / (tot - 1.0)) * (1.0 - sumsq) : 0.0;
-    if ((double)minor * invtot >= minAf && minor >= 2)
+    if ((double)minor * invtot >= minAf && minor >= 2) {
       nsnv++;
+      if (sitesOut)
+        sitesOut->push_back(SnvSite{(uint32_t)p, (uint8_t)a1, (uint8_t)a2,
+                                    c[a2 < 0 ? a1 : a2], tot});
+    }
   }
   out.covered = covered;
   out.nsnv = nsnv;
   out.pi_sum = pisum;
+  // Cap: keep the deepest maxSites sites (partial sort by total descending).
+  if (sitesOut && maxSites > 0 && (int)sitesOut->size() > maxSites) {
+    std::nth_element(sitesOut->begin(), sitesOut->begin() + maxSites,
+                     sitesOut->end(),
+                     [](const SnvSite &x, const SnvSite &y) {
+                       return x.total > y.total;
+                     });
+    sitesOut->resize(maxSites);
+    std::sort(sitesOut->begin(), sitesOut->end(),
+              [](const SnvSite &x, const SnvSite &y) { return x.pos < y.pos; });
+  }
 }
 
 static void process_depth_shard(const DepthShard &sh,
@@ -651,7 +677,9 @@ static void process_depth_shard(const DepthShard &sh,
                                 int avgRead, int minMapQual,
                                 SnvContigStat *snvBam = nullptr,
                                 int snvMinDepth = 5, double snvMinAf = 0.05,
-                                int snvMinBaseQ = 0) {
+                                int snvMinBaseQ = 0,
+                                std::vector<SnvSite> *snvSitesBam = nullptr,
+                                int snvMaxSites = 0) {
   if (!sh.hasData)
     return;
   htsFile *fp = hts_open(bamPath.c_str(), "rb");
@@ -675,7 +703,9 @@ static void process_depth_shard(const DepthShard &sh,
   auto snvFlush = [&]() {
     if (snvBam && snvCurTid >= 0)
       snv_finalize_contig(snvCnt.data(), snvCurLen, snvMinDepth, snvMinAf,
-                          snvBam[snvCurTid]);
+                          snvBam[snvCurTid],
+                          snvSitesBam ? &snvSitesBam[snvCurTid] : nullptr,
+                          snvMaxSites);
   };
 
   while (bam_read1(bgzf, b) >= 0) {
@@ -844,6 +874,7 @@ std::string compute_depth_tsv_inmem(const StringVector &bamFilePaths,
   // SNV output channel (feature #5): allocate one [num_bams * n_targets] stat
   // grid up front so each shard writes its disjoint tid range lock-free.
   const bool snvOn = (snv != nullptr);
+  const bool snvSitesOn = snvOn && snv->resolve;
   if (snvOn) {
     snv->n_targets = header->n_targets;
     snv->num_bams = num_bams;
@@ -851,21 +882,27 @@ std::string compute_depth_tsv_inmem(const StringVector &bamFilePaths,
     for (int32_t t = 0; t < header->n_targets; ++t)
       snv->names[t] = header->target_name[t];
     snv->stats.assign((size_t)num_bams * header->n_targets, SnvContigStat{});
+    if (snvSitesOn)
+      snv->sites.assign((size_t)num_bams * header->n_targets,
+                        std::vector<SnvSite>{});
   }
 
   omp_set_num_threads(g_full_threads);
 #pragma omp parallel for schedule(dynamic, 1)
   for (int s = 0; s < (int)shards.size(); s++) {
     const int bi = shards[s].bamIdx;
-    SnvContigStat *snvBam =
-        snvOn ? (snv->stats.data() + (size_t)bi * header->n_targets) : nullptr;
+    const size_t base = (size_t)bi * header->n_targets;
+    SnvContigStat *snvBam = snvOn ? (snv->stats.data() + base) : nullptr;
+    std::vector<SnvSite> *snvSitesBam =
+        snvSitesOn ? (snv->sites.data() + base) : nullptr;
     process_depth_shard(shards[s], bamFilePaths[bi], header,
                         bamContigDepths[bi].get(),
                         percentIdentity, maxEdgeBases, includeEdgeBases,
                         averageReadSize[bi], minMapQual, snvBam,
                         snvOn ? snv->minDepth : 5,
                         snvOn ? snv->minAf : 0.05,
-                        snvOn ? snv->minBaseQ : 0);
+                        snvOn ? snv->minBaseQ : 0, snvSitesBam,
+                        snvSitesOn ? snv->maxSites : 0);
   }
   if (intraDepthVariance) {
 #pragma omp parallel for schedule(static)
