@@ -328,6 +328,25 @@ static size_t g_mge_dtr_min = 21;      // --mge-dtr-min : seed / min DTR length
 static size_t g_mge_dtr_max = 1000;    // --mge-dtr-max : max DTR / search window
 static std::vector<uint32_t> g_mge_dtr; // [nobs]; >0 = circular, value = DTR len
 
+// ── Strain resolution via per-contig SNV vectors (feature #5) ───────────────
+// --strain: during the BAM depth pass, extract a per-(contig,sample) SNV vector
+// (no second 88GB scan).  Reads' aligned bases are tallied into a transient
+// per-position allele pileup (reference-free / consensus model) which is reduced
+// to: covered sites, polymorphic-site count, and summed nucleotide diversity (pi).
+// These row-aligned arrays (one row per large contig, like g_node_confidence)
+// feed <prefix>.snv.tsv (per contig) and <prefix>.strain.tsv (per-bin strain
+// heterogeneity), and are folded into the re-binning cache.  Within-bin elevated
+// pi flags multi-strain genomes that depth+composition alone cannot resolve.
+static bool   g_strain_scan   = false;  // --strain
+static int    g_snv_min_depth = 5;      // --snv-min-depth
+static double g_snv_min_af    = 0.05;   // --snv-min-af
+static int    g_snv_min_baseq = 0;      // --snv-min-baseq (0 = ignore quals)
+static SnvResult g_snv_result;          // filled by the async depth task
+static std::vector<float>    g_snv_pi;   // [nobs * num_depth_samples] per-site pi
+static std::vector<uint32_t> g_snv_nsnv; // [nobs * num_depth_samples] SNV counts
+static std::vector<uint32_t> g_snv_cov;  // [nobs * num_depth_samples] covered sites
+static bool   g_cache_has_snv = false;   // restored from a v2 cache
+
 // ── Incremental multi-sample binning (feature #3) ───────────────────────────
 // --add-depth FILE (with --load-cache): fold the depth columns of FILE in as
 // NEW samples on top of the cached state, reusing the (expensive) one-off FASTA
@@ -1328,6 +1347,42 @@ static void mge_write_table(const std::vector<size_t> &contig_binnum) {
   }
   os.flush(); os.close();
   verbose_message("MGE: %zu circular/DTR contigs flagged -> %s\n", ncirc, path.c_str());
+}
+
+// ── Strain / SNV (feature #5): materialize per-large-contig row arrays ───────
+// Maps the depth-pass SNV grid (keyed by BAM tid / reference name) onto the
+// final large-contig row order (contig_names[idx] aligns with depth_matrix(idx,*)
+// and g_node_confidence[idx]).  Runs once, after the depth merge has compacted
+// contig_names, so the resulting g_snv_* arrays survive every downstream stage.
+static void materialize_snv_rows() {
+  const size_t S = num_depth_samples;
+  g_snv_pi.assign((size_t)nobs * S, 0.0f);
+  g_snv_nsnv.assign((size_t)nobs * S, 0u);
+  g_snv_cov.assign((size_t)nobs * S, 0u);
+  if (!g_snv_result.enabled || g_snv_result.n_targets == 0 ||
+      g_snv_result.num_bams == 0)
+    return;
+  const int32_t nt = g_snv_result.n_targets;
+  const int nb = g_snv_result.num_bams;
+  std::unordered_map<std::string, int32_t> name2tid;
+  name2tid.reserve((size_t)nt * 2);
+  for (int32_t t = 0; t < nt; ++t)
+    name2tid.emplace(g_snv_result.names[t], t);
+  const int useB = std::min<int>(nb, (int)S);  // sample order = BAM order
+  for (size_t idx = 0; idx < nobs; ++idx) {
+    auto it = name2tid.find(contig_names[idx]);
+    if (it == name2tid.end())
+      continue;
+    const int32_t tid = it->second;
+    for (int b = 0; b < useB; ++b) {
+      const SnvContigStat &st =
+          g_snv_result.stats[(size_t)b * nt + tid];
+      const size_t o = idx * S + (size_t)b;
+      g_snv_cov[o] = st.covered;
+      g_snv_nsnv[o] = st.nsnv;
+      g_snv_pi[o] = st.covered ? (float)(st.pi_sum / (double)st.covered) : 0.0f;
+    }
+  }
 }
 
 // ── Forward declarations for helpers used by build_similarity_graph ────────────────
@@ -2723,6 +2778,10 @@ static int rb_cmd_bin(int ac, char *av[]) {
       ("mge-scan", po::value<bool>(&g_mge_scan)->zero_tokens(), "Detect circular/DTR contigs (likely plasmids/phages/replicons) -> <prefix>.mge.tsv")
       ("mge-dtr-min", po::value<size_t>(&g_mge_dtr_min)->default_value(21), "Min direct-terminal-repeat length for circular detection")
       ("mge-dtr-max", po::value<size_t>(&g_mge_dtr_max)->default_value(1000), "Max DTR length / terminal search window")
+      ("strain", po::value<bool>(&g_strain_scan)->zero_tokens(), "Extract per-contig SNV vectors in the same --bam pass for strain resolution -> <prefix>.snv.tsv + <prefix>.strain.tsv (requires --bam)")
+      ("snv-min-depth", po::value<int>(&g_snv_min_depth)->default_value(5), "[--strain] Min position depth to score a site")
+      ("snv-min-af", po::value<double>(&g_snv_min_af)->default_value(0.05), "[--strain] Min minor-allele frequency to call a SNV")
+      ("snv-min-baseq", po::value<int>(&g_snv_min_baseq)->default_value(0), "[--strain] Min base quality (0=ignore quals)")
       ("max-edges", po::value<size_t>(&maxEdges)->default_value(200), "Max neighbors per contig")
       ("sim-cutoff", po::value<Similarity>(&simCutoff)->default_value(0), "Composition similarity cutoff x100 (0=auto)")
       ("sketch-k", po::value<int>(&sketch_kmer_size)->default_value(8), "Sketch k-mer size")
@@ -2820,6 +2879,25 @@ static int rb_cmd_bin(int ac, char *av[]) {
     cerr << "[Error!] --add-depth requires --load-cache (incremental binning "
             "folds new samples into a cached composition graph).\n";
     return 1;
+  }
+
+  // --strain (per-contig SNV extraction) reads alignments, so it needs --bam
+  // (or a v2 cache that already carries SNV via --load-cache).  CRAM input is
+  // not supported by the in-memory SNV path yet.
+  if (g_strain_scan) {
+#ifdef RABBITBIN_FUSE
+    const bool have_bam = !fuse_bams.empty();
+#else
+    const bool have_bam = false;
+#endif
+    if (!have_bam && cache_load_file.empty()) {
+      cerr << "[Error!] --strain requires --bam (SNV vectors are extracted from "
+              "alignments during the depth pass).\n";
+      return 1;
+    }
+    if (!g_reference_file.empty())
+      cerr << "[Warn] --strain: SNV extraction is not supported for CRAM input; "
+              "SNV output will be empty.\n";
   }
 
   // Per-bin FASTA is off by default; --bin-fasta re-enables it (and so keeps
@@ -3027,6 +3105,14 @@ static int rb_cmd_bin(int ac, char *av[]) {
       bool any_cram = !ref.empty();
       for (const auto &p : bams)
         if (p.size() >= 5 && p.compare(p.size() - 5, 5, ".cram") == 0) any_cram = true;
+      // Strain/SNV extraction rides the same BAM pass (in-memory path only).
+      const bool snvOn = g_strain_scan && !any_cram;
+      if (snvOn) {
+        g_snv_result.enabled = true;
+        g_snv_result.minDepth = g_snv_min_depth;
+        g_snv_result.minAf = g_snv_min_af;
+        g_snv_result.minBaseQ = g_snv_min_baseq;
+      }
       depth_future = std::async(std::launch::async, [=]() -> DepthMap {
         std::string tsv = any_cram
             ? compute_depth_tsv_generic(bams, pctid, mcl, (float)mcd, medge,
@@ -3034,7 +3120,8 @@ static int rb_cmd_bin(int ac, char *av[]) {
                                         /*intraDepthVariance=*/true, nt, ref)
             : compute_depth_tsv_inmem(bams, pctid, mcl, (float)mcd, medge,
                                       /*includeEdgeBases=*/false,
-                                      /*intraDepthVariance=*/true, nt);
+                                      /*intraDepthVariance=*/true, nt,
+                                      snvOn ? &g_snv_result : nullptr);
         return parse_depth_buf(tsv.data(), tsv.size(), cv, nds, fH, nt);
       });
     } else
@@ -3703,6 +3790,15 @@ static int rb_cmd_bin(int ac, char *av[]) {
                       r, num_depth_samples, depth_file.c_str(),
                       getUsedPhysMem(), getTotalPhysMem() / 1024 / 1024,
                       ignored_too_small);
+
+      // Strain/SNV (feature #5): contig_names is now final + row-aligned with
+      // depth_matrix, so project the SNV grid onto large-contig rows here.  Free
+      // the (potentially large) tid-keyed grid once projected.
+      if (g_strain_scan && g_snv_result.enabled) {
+        materialize_snv_rows();
+        std::vector<SnvContigStat>().swap(g_snv_result.stats);
+        std::vector<std::string>().swap(g_snv_result.names);
+      }
     } else {
       // No depth_matrix file - set totalSize from sequence lengths
       for (auto l : seq_lens)       totalSize  += l;

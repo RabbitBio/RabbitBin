@@ -28,6 +28,31 @@ void output_bins(BinMap &cls) {
       // BinNum.  Filled as bins are emitted below (feature #8).
       std::unordered_map<size_t, size_t> label2binid;
 
+      // ── Strain / SNV output (feature #5) ──────────────────────────────────
+      // Per-contig SNV vectors -> <prefix>.snv.tsv; per-bin strain heterogeneity
+      // -> <prefix>.strain.tsv.  Written inline so BinNum matches members.tsv
+      // exactly (same size/QC filters).  A bin whose length-weighted mean
+      // nucleotide diversity (pi) exceeds STRAIN_PI_THR is flagged multi-strain:
+      // composition+depth placed those contigs together but the reads carry
+      // intra-bin polymorphism that only strain-aware resolution can split.
+      const bool do_snv = g_strain_scan && !g_snv_pi.empty();
+      static const double STRAIN_PI_THR = 0.005;
+      std::ofstream os_snv, os_strain;
+      if (do_snv) {
+        std::string snv_path = std::string(outFile) + ".snv.tsv";
+        std::string str_path = std::string(outFile) + ".strain.tsv";
+        os_snv.open(snv_path.c_str());
+        os_strain.open(str_path.c_str());
+        verbose_message("Writing per-contig SNV vectors to: %s\n", snv_path.c_str());
+        verbose_message("Writing per-bin strain heterogeneity to: %s\n", str_path.c_str());
+        os_snv << "BinNum\tContigName\tLength\tMeanPi\tMaxSNV\tSNVperKb";
+        for (int i = 0; i < (int)num_depth_samples; ++i)
+          os_snv << "\tPi_s" << (i + 1);
+        os_snv << "\n";
+        os_strain << "BinNum\tNumContigs\tTotalBp\tMeanPi\tMeanSNVperKb"
+                     "\tMultiStrain\n";
+      }
+
       // Optional CAMI bioboxes output (<prefix>.binning).
       std::ofstream os_bbx;
       if (g_write_bioboxes) {
@@ -48,6 +73,10 @@ void output_bins(BinMap &cls) {
         double lengthWeightedAvgCoverage = 0;
         size_t s = 0, s1 = 0;
         std::string outFile_cls = rb_bin_output_path(bin_id);
+        // Per-bin strain accumulators (large contigs only carry SNV vectors).
+        std::stringstream snv_ss;
+        double bin_pi_lw = 0.0, bin_snvkb_lw = 0.0;
+        size_t bin_snv_bp = 0, bin_snv_n = 0;
         {
           const auto &cluster = it->second;
           std::stringstream ss;
@@ -78,6 +107,40 @@ void output_bins(BinMap &cls) {
               ss.unsetf(std::ios::fixed);
             }
             ss << "\n";
+
+            // Per-contig SNV vector (large contigs only; small recruits have no
+            // SNV row).  MeanPi averages over samples that covered the contig.
+            if (do_snv && *it2 < nobs && idx < nobs) {
+              const size_t S = num_depth_samples;
+              double pisum = 0.0;
+              uint32_t maxsnv = 0;
+              int ncov = 0;
+              for (size_t b = 0; b < S; ++b) {
+                const size_t o = idx * S + b;
+                if (o < g_snv_cov.size() && g_snv_cov[o] > 0) {
+                  pisum += g_snv_pi[o];
+                  ncov++;
+                }
+                if (o < g_snv_nsnv.size() && g_snv_nsnv[o] > maxsnv)
+                  maxsnv = g_snv_nsnv[o];
+              }
+              double meanpi = ncov ? pisum / ncov : 0.0;
+              double snvkb = len ? (double)maxsnv / (double)len * 1000.0 : 0.0;
+              snv_ss << bin_id << "\t" << sequence_name << "\t" << len << "\t"
+                     << std::fixed << std::setprecision(5) << meanpi << "\t"
+                     << maxsnv << "\t" << std::setprecision(3) << snvkb;
+              snv_ss << std::setprecision(5);
+              for (size_t b = 0; b < S; ++b) {
+                const size_t o = idx * S + b;
+                snv_ss << "\t" << ((o < g_snv_pi.size()) ? g_snv_pi[o] : 0.0f);
+              }
+              snv_ss << "\n";
+              snv_ss.unsetf(std::ios::fixed);
+              bin_pi_lw += meanpi * (double)len;
+              bin_snvkb_lw += snvkb * (double)len;
+              bin_snv_bp += len;
+              bin_snv_n++;
+            }
           }
           if (s + s1 < min_bin_bp) continue;
 
@@ -89,6 +152,19 @@ void output_bins(BinMap &cls) {
           if (g_keep_hq_only && !is_hq) continue;
 
           os_members << ss.str();
+          // Strain / SNV (feature #5): the bin passed the size/QC filters, so
+          // emit its per-contig SNV rows + one strain-summary row under this
+          // (now final) BinNum.
+          if (do_snv) {
+            os_snv << snv_ss.str();
+            double meanpi = bin_snv_bp ? bin_pi_lw / (double)bin_snv_bp : 0.0;
+            double meankb = bin_snv_bp ? bin_snvkb_lw / (double)bin_snv_bp : 0.0;
+            os_strain << bin_id << "\t" << bin_snv_n << "\t" << bin_snv_bp << "\t"
+                      << std::fixed << std::setprecision(5) << meanpi << "\t"
+                      << std::setprecision(3) << meankb << "\t"
+                      << (meanpi >= STRAIN_PI_THR ? "Y" : "N") << "\n";
+            os_strain.unsetf(std::ios::fixed);
+          }
           for (size_t i = 0; i < cluster.size(); ++i) {
             assert(cluster[i] < (int)clsMap.size());
             clsMap[cluster[i]] = kk + 1;
