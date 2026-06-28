@@ -327,6 +327,15 @@ static bool   g_mge_scan    = false;   // --mge-scan
 static size_t g_mge_dtr_min = 21;      // --mge-dtr-min : seed / min DTR length
 static size_t g_mge_dtr_max = 1000;    // --mge-dtr-max : max DTR / search window
 static std::vector<uint32_t> g_mge_dtr; // [nobs]; >0 = circular, value = DTR len
+
+// ── Incremental multi-sample binning (feature #3) ───────────────────────────
+// --add-depth FILE (with --load-cache): fold the depth columns of FILE in as
+// NEW samples on top of the cached state, reusing the (expensive) one-off FASTA
+// parse + composition sketch + O(N^2) composition graph.  Realises longitudinal
+// / streaming multi-sample binning: each new sample is incorporated by re-doing
+// only the cheap depth-correlation + edge-score + label-propagation tail, so the
+// per-sample marginal cost is seconds instead of a full re-run.
+static std::string g_add_depth_file;   // --add-depth PATH ("" = disabled)
 // GC-content normalization for PMH k-mer weights (RABBIT_GC_NORM=1):
 //   Instead of using raw k-mer frequency as weight, use enrichment ratio:
 //     weight(v) = observed_freq(v) / expected_freq(v | composition)
@@ -2518,6 +2527,99 @@ parse_depth_async(const std::string& depth_file, bool cvExt, int num_depth_sampl
   return result;
 }
 
+// ── Incremental multi-sample depth (feature #3) ──────────────────────────────
+// Append @p add_file's depth columns as NEW samples on top of the depth state
+// restored by --load-cache, reusing the cached composition graph.  Rebuilds the
+// raw depth (g_depth_raw / g_large_means), the rank-transformed depth_matrix
+// (re-ranked over ALL samples so Spearman correlation is exact), and the raw
+// small_depth_matrix.  Returns the new total sample count, 0 on failure.
+static int apply_incremental_depth(const std::string &add_file) {
+  const int nNonFeat = cvExt ? 1 : 3;
+  long raw_cols = (long)ncols(add_file.c_str(), 1) - nNonFeat;
+  if (raw_cols <= 0) {
+    cerr << "[Error!] --add-depth: no feature columns in " << add_file << "\n";
+    return 0;
+  }
+  if (!cvExt && (raw_cols % 2 != 0)) {
+    cerr << "[Error!] --add-depth: odd feature-column count (expected depth+variance pairs)\n";
+    return 0;
+  }
+  const int new_S = cvExt ? (int)raw_cols : (int)(raw_cols / 2);
+
+  auto m = parse_depth_async(add_file, cvExt, new_S, fullHeader, (int)numThreads);
+  if (m.empty()) {
+    cerr << "[Error!] --add-depth: parsed 0 rows from " << add_file << "\n";
+    return 0;
+  }
+
+  const size_t old_S = (size_t)num_depth_samples;
+  const size_t tot_S = old_S + (size_t)new_S;
+  const size_t nL = (size_t)nobs, nS = (size_t)nobs1;
+
+  // Expand raw large-contig depth + means, copying old columns then appending
+  // the new samples (matched by contig name; absent → 0).
+  std::vector<float> new_raw(nL * tot_S, 0.0f);
+  std::vector<float> new_means(nL * tot_S, 0.0f);
+  size_t matched = 0;
+  for (size_t i = 0; i < nL; ++i) {
+    for (size_t k = 0; k < old_S; ++k) {
+      const size_t o = i * old_S + k;
+      const float v  = (o < g_depth_raw.size())   ? g_depth_raw[o]   : 0.0f;
+      const float mv = (o < g_large_means.size()) ? g_large_means[o] : v;
+      new_raw[i * tot_S + k]   = v;
+      new_means[i * tot_S + k] = mv;
+    }
+    auto it = m.find(contig_names[i]);
+    if (it != m.end()) {
+      ++matched;
+      for (int j = 0; j < new_S; ++j) {
+        const float v = (j < (int)it->second.means.size()) ? it->second.means[j] : 0.0f;
+        new_raw[i * tot_S + old_S + j]   = v;
+        new_means[i * tot_S + old_S + j] = v;
+      }
+    }
+  }
+  g_depth_raw.swap(new_raw);
+  g_large_means.swap(new_means);
+
+  // Rebuild the rank-transformed depth_matrix over ALL samples (per-row Spearman
+  // rank), so the depth-correlation edge term uses every accumulated sample.
+  depth_matrix.resize(nL, tot_S, false);
+#pragma omp parallel num_threads(numThreads)
+  {
+    std::vector<double> rin(tot_S), rout(tot_S);
+#pragma omp for schedule(static)
+    for (size_t i = 0; i < nL; ++i) {
+      for (size_t k = 0; k < tot_S; ++k) rin[k] = g_depth_raw[i * tot_S + k];
+      rank(rin, rout);
+      for (size_t k = 0; k < tot_S; ++k)
+        depth_matrix(i, k) = (StoredDistance)rout[k];
+    }
+  }
+
+  // Expand the RAW small-contig depth (recruit re-ranks it in place later).
+  if (nS > 0) {
+    Matrix new_small(nS, tot_S);
+    for (size_t i = 0; i < nS; ++i) {
+      for (size_t k = 0; k < old_S; ++k)
+        new_small(i, k) = (k < small_depth_matrix.size2()) ? small_depth_matrix(i, k)
+                                                           : (StoredDistance)0;
+      auto it = m.find(small_contig_names[i]);
+      for (int j = 0; j < new_S; ++j)
+        new_small(i, old_S + j) =
+            (it != m.end() && j < (int)it->second.means.size())
+                ? (StoredDistance)it->second.means[j] : (StoredDistance)0;
+    }
+    small_depth_matrix.swap(new_small);
+  }
+
+  num_depth_samples = (int)tot_S;
+  verbose_message("Incremental: appended %d sample(s) from %s (%zu/%zu large "
+                  "contigs matched); total samples %zu -> %zu\n",
+                  new_S, add_file.c_str(), matched, nL, old_S, tot_S);
+  return (int)tot_S;
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Marker-guided bin splitting (Phase 2) — C++ port of post_split.py
 // ═══════════════════════════════════════════════════════════════════════════
@@ -2610,6 +2712,7 @@ static int rb_cmd_bin(int ac, char *av[]) {
       ("depth,d", po::value<std::string>(&depth_file), "Coverage depth TSV")
       ("save-cache", po::value<std::string>(&cache_save_file), "Write a re-binning cache after the similarity graph is built, then continue normally")
       ("load-cache", po::value<std::string>(&cache_load_file), "Re-bin from a cache (skips parse/sketch/depth/graph); only cheap params (min-bin-size, split-silhouette, min-edge-score, ...) take effect")
+      ("add-depth", po::value<std::string>(&g_add_depth_file), "Incremental multi-sample: with --load-cache, append this depth file's samples as NEW samples on the cached composition graph (no re-sketch)")
       ("min-contig,m", po::value<size_t>(&minContig)->default_value(2500), "Minimum contig length (>=1500)")
       ("min-small-contig", po::value<size_t>(&min_small_contig)->default_value(1000), "Min length for small-contig recruiting")
       ("max-posterior", po::value<Similarity>(&calib_connected_pct)->default_value(95), "Well-connected contig percent for calibration")
@@ -2711,6 +2814,13 @@ static int rb_cmd_bin(int ac, char *av[]) {
   // mode this decides whether to reproduce the cached run's seed or honour an
   // override supplied on the rebin command line.
   const bool user_set_seed = vm.count("seed") && !vm["seed"].defaulted();
+
+  // --add-depth (incremental multi-sample) only makes sense on a cached run.
+  if (!g_add_depth_file.empty() && cache_load_file.empty()) {
+    cerr << "[Error!] --add-depth requires --load-cache (incremental binning "
+            "folds new samples into a cached composition graph).\n";
+    return 1;
+  }
 
   // Per-bin FASTA is off by default; --bin-fasta re-enables it (and so keeps
   // sequences resident for the output stage).
@@ -2868,6 +2978,12 @@ static int rb_cmd_bin(int ac, char *av[]) {
                     getUsedPhysMem(), getTotalPhysMem() / 1024 / 1024);
     if (!rb_load_cache(cache_load_file)) return 1;
     has_depth = g_cache_has_depth;
+    // Incremental multi-sample (feature #3): fold new samples into the cached
+    // depth before the cheap edge/LP tail re-runs on the reused composition graph.
+    if (!g_add_depth_file.empty()) {
+      if (apply_incremental_depth(g_add_depth_file) <= 0) return 1;
+      has_depth = true;
+    }
     if (!user_set_seed) seed = g_cache_seed;  // reproduce cached run by default
     srand(seed);
     g_inv_one_minus_b0 = (g_pmh_baseline > 0.0 && g_pmh_baseline < 1.0)
