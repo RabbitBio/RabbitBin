@@ -80,12 +80,26 @@ std::string depth_format_table(const std::vector<DepthColumn> &cols,
                                int maxEdgeBases, bool includeEdgeBases,
                                bool intraDepthVariance);
 
+// Structured per-contig depth (means only) — an in-memory alternative to the TSV
+// string.  Lets the fused binning path skip formatting millions of contigs to
+// text and parsing them back: ~format+parse of the depth round-trip.  Emits the
+// SAME contig set as the TSV (length >= minContigLength); means[i] is one float
+// per sample for contig names[i] (length lens[i]).
+struct DepthMatrixOut {
+  std::vector<std::string> names;
+  std::vector<int32_t> lens;
+  std::vector<std::vector<float>> means; // means[contig][sample]
+};
+
+// When outCols != nullptr, compute_depth_tsv_inmem fills *outCols directly and
+// returns "" (no TSV formatting).  Otherwise it returns the MetaBAT TSV string.
 std::string compute_depth_tsv_inmem(const std::vector<std::string> &bamFilePaths,
                                     float percentIdentity, int minContigLength,
                                     float minContigDepth, int maxEdgeBases,
                                     bool includeEdgeBases,
                                     bool intraDepthVariance, int numThreads,
-                                    SnvResult *snv = nullptr);
+                                    SnvResult *snv = nullptr,
+                                    DepthMatrixOut *outCols = nullptr);
 
 // Generic BAM/CRAM, reference-aware depth (used for CRAM input or when a
 // reference is supplied). Same output format as compute_depth_tsv_inmem.

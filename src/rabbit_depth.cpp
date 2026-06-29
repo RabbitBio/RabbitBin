@@ -685,7 +685,8 @@ static void process_depth_shard(const DepthShard &sh,
                                 int snvMinDepth = 5, double snvMinAf = 0.05,
                                 int snvMinBaseQ = 0,
                                 std::vector<SnvSite> *snvSitesBam = nullptr,
-                                int snvMaxSites = 0) {
+                                int snvMaxSites = 0,
+                                const int32_t *tid2compact = nullptr) {
   if (!sh.hasData)
     return;
   htsFile *fp = hts_open(bamPath.c_str(), "rb");
@@ -726,6 +727,10 @@ static void process_depth_shard(const DepthShard &sh,
       break;              // reached the next shard's contigs
     if (tid < sh.lo)
       continue;           // straggler from block-aligned seek, or unmapped(-1)
+    // Compact mode: a read on a filtered-out contig contributes nothing to the
+    // kept output, so skip it BEFORE the expensive caldepth (pct-id/CIGAR scan).
+    if (tid2compact && tid2compact[tid] < 0)
+      continue;
     if ((b->core.flag & BAM_FUNMAP) == 0 && (tid >= n_targets || pos < 0))
       continue;
     if ((b->core.flag & (BAM_FPAIRED | BAM_FMUNMAP)) == BAM_FPAIRED &&
@@ -753,7 +758,16 @@ static void process_depth_shard(const DepthShard &sh,
     CountType ov =
         caldepth(b, none, header->target_len[tid], NULL, edge, &rs);
     if (rs.isValid() && rs.getPctId() >= percentIdentity) {
-      contigDepths[tid] += ov;
+      // Compact mode (tid2compact != null): write to the dense index of kept
+      // contigs (len >= minContigLength), skipping filtered ones — shrinks the
+      // per-bam depth array from n_targets to n_kept (huge with millions of tiny
+      // contigs). SNV is disabled in compact mode (snvBam == null).
+      if (tid2compact) {
+        int32_t ci = tid2compact[tid];
+        if (ci >= 0) contigDepths[ci] += ov;
+      } else {
+        contigDepths[tid] += ov;
+      }
       // SNV uses the IDENTICAL read set as depth (same pct-id / edge filters).
       if (snvBam)
         snv_accumulate_read(b, snvCnt.data(), snvCurLen, snvMinBaseQ);
@@ -1036,7 +1050,7 @@ std::string compute_depth_tsv_inmem(const StringVector &bamFilePaths,
                                     float minContigDepth, int maxEdgeBases,
                                     bool includeEdgeBases,
                                     bool intraDepthVariance, int numThreads,
-                                    SnvResult *snv) {
+                                    SnvResult *snv, DepthMatrixOut *outCols) {
   const int num_bams = (int)bamFilePaths.size();
   if (num_bams < 1)
     throw std::runtime_error("compute_depth_tsv_inmem: no BAM files");
@@ -1221,9 +1235,26 @@ std::string compute_depth_tsv_inmem(const StringVector &bamFilePaths,
     }
   }
 
+  // Compact-index mode: when emitting the structured matrix without SNV, keep
+  // depth only for contigs that pass the length filter (the only ones ever
+  // output), shrinking each per-bam array from n_targets to n_kept.  With
+  // millions of tiny contigs this turns ~num_bams×n_targets×8 B into a small
+  // fraction (e.g. CAMI3: 982 MB → ~13 MB; 100-sample sets scale far worse).
+  const bool compactMode = (outCols != nullptr) && (snv == nullptr);
+  std::vector<int32_t> tid2compact;
+  int32_t n_kept = header->n_targets;
+  if (compactMode) {
+    tid2compact.assign(header->n_targets, -1);
+    n_kept = 0;
+    for (int32_t t = 0; t < header->n_targets; ++t)
+      if (contigLengthPass[t]) tid2compact[t] = n_kept++;
+  }
+  const int32_t depthN = compactMode ? n_kept : header->n_targets;
+  const int32_t *t2c = compactMode ? tid2compact.data() : nullptr;
+
   int minAvgRead = INT_MAX;
   for (int bi = 0; bi < num_bams; bi++) {
-    bamContigDepths[bi].reset(new CountType[header->n_targets]());
+    bamContigDepths[bi].reset(new CountType[depthN]());
     if (intraDepthVariance)
       bamContigVariances[bi].assign(header->n_targets, VarianceType());
     averageReadSize[bi] = sampledAvgRead[bi];
@@ -1261,7 +1292,7 @@ std::string compute_depth_tsv_inmem(const StringVector &bamFilePaths,
                         snvOn ? snv->minDepth : 5,
                         snvOn ? snv->minAf : 0.05,
                         snvOn ? snv->minBaseQ : 0, snvSitesBam,
-                        snvSitesOn ? snv->maxSites : 0);
+                        snvSitesOn ? snv->maxSites : 0, t2c);
   }
 
   // Route B2: process byte-range shards in parallel into ordered per-shard
@@ -1283,13 +1314,19 @@ std::string compute_depth_tsv_inmem(const StringVector &bamFilePaths,
       if (!ok)
         bamFailed[sh.bamIdx] = 1;
     }
-    // Merge successful BAMs' partial sums.
+    // Merge successful BAMs' partial sums (compact-aware: skip filtered contigs).
     for (int s = 0; s < (int)b2shards.size(); s++) {
       if (bamFailed[b2shards[s].bamIdx])
         continue;
       CountType *cd = bamContigDepths[b2shards[s].bamIdx].get();
-      for (const auto &kv : b2local[s])
-        cd[kv.first] += kv.second;
+      for (const auto &kv : b2local[s]) {
+        if (t2c) {
+          int32_t ci = t2c[kv.first];
+          if (ci >= 0) cd[ci] += kv.second;
+        } else {
+          cd[kv.first] += kv.second;
+        }
+      }
     }
     // Whole-file fallback (route A) for any BAM whose re-sync failed.
     std::vector<int> failedBams;
@@ -1308,7 +1345,8 @@ std::string compute_depth_tsv_inmem(const StringVector &bamFilePaths,
         process_depth_shard(
             DepthShard{bi, 0, header->n_targets, ufHdrVoff[bi], true, budget},
             bamFilePaths[bi], header, bamContigDepths[bi].get(), percentIdentity,
-            maxEdgeBases, includeEdgeBases, averageReadSize[bi], minMapQual);
+            maxEdgeBases, includeEdgeBases, averageReadSize[bi], minMapQual,
+            nullptr, 5, 0.05, 0, nullptr, 0, t2c);
       }
     }
   }
@@ -1326,6 +1364,46 @@ std::string compute_depth_tsv_inmem(const StringVector &bamFilePaths,
         vars[t].variance = 0.0f;
       }
     }
+  }
+
+  // Structured (means-only) output: skip the TSV format+parse round-trip for the
+  // fused binning path.  Per-sample mean = bamContigVariances[bi][t].mean (the
+  // exact value printDepthTable would emit), with the same huge-value clamp; the
+  // emitted contig set is contigLengthPass (length >= minContigLength), matching
+  // the TSV rows.  Returns "" (no formatting).
+  if (outCols) {
+    const int32_t nt2 = header->n_targets;
+    size_t keep = 0;
+    for (int32_t t = 0; t < nt2; ++t) if (contigLengthPass[t]) ++keep;
+    outCols->names.clear();
+    outCols->lens.clear();
+    outCols->means.clear();
+    outCols->names.reserve(keep);
+    outCols->lens.reserve(keep);
+    outCols->means.reserve(keep);
+    for (int32_t t = 0; t < nt2; ++t) {
+      if (!contigLengthPass[t]) continue;
+      const int32_t di = compactMode ? tid2compact[t] : t; // depth-array index
+      outCols->names.emplace_back(header->target_name[t]);
+      outCols->lens.push_back((int32_t)header->target_len[t]);
+      std::vector<float> mv((size_t)num_bams);
+      for (int bi = 0; bi < num_bams; ++bi) {
+        float m;
+        if (intraDepthVariance) {
+          m = (float)bamContigVariances[bi][t].mean;
+        } else {
+          const int edge =
+              includeEdgeBases ? 0 : std::min(maxEdgeBases, averageReadSize[bi] / 3);
+          int32_t cl = header->target_len[t];
+          int32_t adj = (cl > 2 * edge + 1) ? (cl - 2 * edge) : cl;
+          m = (adj > 2) ? (float)((double)bamContigDepths[bi].get()[di] / adj) : 0.0f;
+        }
+        if (m > 1000000.0f) m = 0.0f; // match printDepth's huge-value clamp
+        mv[bi] = m;
+      }
+      outCols->means.emplace_back(std::move(mv));
+    }
+    return std::string();
   }
 
   std::ostringstream out;
