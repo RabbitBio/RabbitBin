@@ -3135,15 +3135,39 @@ static int rb_cmd_bin(int ac, char *av[]) {
         g_snv_result.maxSites = g_strain_max_sites;
       }
       depth_future = std::async(std::launch::async, [=]() -> DepthMap {
-        std::string tsv = any_cram
-            ? compute_depth_tsv_generic(bams, pctid, mcl, (float)mcd, medge,
-                                        /*includeEdgeBases=*/false,
-                                        /*intraDepthVariance=*/true, nt, ref)
-            : compute_depth_tsv_inmem(bams, pctid, mcl, (float)mcd, medge,
-                                      /*includeEdgeBases=*/false,
-                                      /*intraDepthVariance=*/true, nt,
-                                      snvOn ? &g_snv_result : nullptr);
-        return parse_depth_buf(tsv.data(), tsv.size(), cv, nds, fH, nt);
+        // CRAM/generic still goes through the TSV (no structured path there).
+        if (any_cram) {
+          std::string tsv = compute_depth_tsv_generic(
+              bams, pctid, mcl, (float)mcd, medge,
+              /*includeEdgeBases=*/false, /*intraDepthVariance=*/true, nt, ref);
+          return parse_depth_buf(tsv.data(), tsv.size(), cv, nds, fH, nt);
+        }
+        // BAM path: get per-contig depths as a structured matrix and build the
+        // name->RawDepthEntry map directly, skipping the format-to-TSV +
+        // parse-back round-trip (≈ a few seconds + a multi-hundred-MB string on
+        // assemblies with millions of contigs).
+        DepthMatrixOut cols;
+        // intraDepthVariance=false: the structured fill computes per-sample means
+        // directly from the raw depth sums (identical to variance.mean), so the
+        // full num_bams × n_targets variance matrix (~1 GB on million-contig
+        // assemblies) is never allocated.
+        compute_depth_tsv_inmem(bams, pctid, mcl, (float)mcd, medge,
+                                /*includeEdgeBases=*/false,
+                                /*intraDepthVariance=*/false, nt,
+                                snvOn ? &g_snv_result : nullptr, &cols);
+        DepthMap m;
+        m.reserve(cols.names.size());
+        const bool prefilter = rb_env_depth_prefilter_on();
+        const size_t minlen = min_small_contig; // same prefilter parse_depth_buf uses
+        for (size_t i = 0; i < cols.names.size(); ++i) {
+          if (prefilter && (size_t)cols.lens[i] < minlen) continue;
+          std::string name = cols.names[i];
+          if (!fH) trim_fasta_label(name);
+          RawDepthEntry e;
+          e.means = std::move(cols.means[i]);
+          m.emplace(std::move(name), std::move(e));
+        }
+        return m;
       });
     } else
 #endif
@@ -3835,6 +3859,7 @@ static int rb_cmd_bin(int ac, char *av[]) {
     }
   }
   }  // end else (non-cache feature construction)
+  rb_phase("depth merge done");
 
   verbose_message("Number of target contigs: %d of large (>= %d) and %d of "
                   "small ones (>=%d & <%d). \n",
@@ -4077,6 +4102,7 @@ static int rb_cmd_bin(int ac, char *av[]) {
     g_win64_flat.clear(); g_win64_flat.shrink_to_fit(); // not queried at run time
   }
 
+  rb_phase("comp sketch loop done");
   verbose_message("Composition sketches ready%s. [%.1fGb / %.1fGb]"
                   "                          \n",
                   (num_depth_samples > 1 ? " + Spearman" : ""),

@@ -18,6 +18,250 @@ static inline double chi2_2dof_cdf(int m, double x) {
   return v < 0.0 ? 0.0 : v;
 }
 
+// ── Alternative clustering: weighted multilevel modularity (Louvain) ─────────
+// Edge weight w_e = -log(1 - edgeScore[e]) — the same per-edge "evidence" the
+// Fisher label-propagation sums.  Modularity with resolution gamma: higher gamma
+// yields finer communities, which matters for metagenome binning (many small,
+// pure genomes) where standard modularity's resolution limit would over-merge.
+// Selected via RABBIT_CLUSTER=louvain ; gamma via RABBIT_CLUSTER_GAMMA (def 1.0).
+namespace rb_louvain {
+struct AdjGraph {
+  std::vector<std::vector<std::pair<int, double>>> adj; // (neighbor, weight)
+  std::vector<double> selfloop;                         // self-loop weight
+  std::vector<double> k;                                // weighted degree (incl 2*selfloop)
+  double m2 = 0.0;                                      // 2m = Σ k
+};
+
+// One Louvain level: local moving on G. Fills comm (contiguous ids) and ncomm;
+// returns true if any node moved.
+static bool local_move(const AdjGraph &G, double gamma, std::mt19937 &rng,
+                       std::vector<int> &comm, int &ncomm) {
+  const int N = (int)G.adj.size();
+  comm.resize(N);
+  std::iota(comm.begin(), comm.end(), 0);
+  std::vector<double> ktot(G.k);
+  std::vector<int> order(N);
+  std::iota(order.begin(), order.end(), 0);
+  std::shuffle(order.begin(), order.end(), rng);
+
+  const double inv2m = (G.m2 > 0.0) ? 1.0 / G.m2 : 0.0;
+  std::vector<double> wToComm(N, 0.0);
+  std::vector<int> touched;
+  touched.reserve(64);
+
+  bool any = false, improved = true;
+  int passes = 0;
+  while (improved && passes++ < 100) {
+    improved = false;
+    for (int idx = 0; idx < N; ++idx) {
+      const int i = order[idx];
+      const int ci = comm[i];
+      touched.clear();
+      for (const auto &pr : G.adj[i]) {
+        int c = comm[pr.first];
+        if (wToComm[c] == 0.0) touched.push_back(c);
+        wToComm[c] += pr.second;
+      }
+      const double ki = G.k[i];
+      ktot[ci] -= ki; // tentatively remove i from its community
+      int bestc = ci;
+      double bestgain = wToComm[ci] - gamma * ki * ktot[ci] * inv2m;
+      for (int c : touched) {
+        double gain = wToComm[c] - gamma * ki * ktot[c] * inv2m;
+        if (gain > bestgain + 1e-12) { bestgain = gain; bestc = c; }
+      }
+      ktot[bestc] += ki;
+      if (bestc != ci) { comm[i] = bestc; improved = true; any = true; }
+      for (int c : touched) wToComm[c] = 0.0;
+    }
+  }
+  std::vector<int> remap(N, -1);
+  ncomm = 0;
+  for (int i = 0; i < N; ++i) {
+    if (remap[comm[i]] < 0) remap[comm[i]] = ncomm++;
+    comm[i] = remap[comm[i]];
+  }
+  return any;
+}
+
+// Aggregate G into a super-graph (one node per community).
+static AdjGraph aggregate(const AdjGraph &G, const std::vector<int> &comm, int ncomm) {
+  AdjGraph H;
+  H.adj.assign(ncomm, {});
+  H.selfloop.assign(ncomm, 0.0);
+  std::vector<phmap::flat_hash_map<int, double>> acc(ncomm);
+  for (int i = 0; i < (int)G.adj.size(); ++i) {
+    int ci = comm[i];
+    H.selfloop[ci] += G.selfloop[i];
+    for (const auto &pr : G.adj[i]) {
+      int cj = comm[pr.first];
+      if (ci == cj) H.selfloop[ci] += pr.second * 0.5; // each intra edge seen twice
+      else if (ci < cj) acc[ci][cj] += pr.second;
+    }
+  }
+  for (int c = 0; c < ncomm; ++c)
+    for (const auto &kv : acc[c]) {
+      H.adj[c].push_back({kv.first, kv.second});
+      H.adj[kv.first].push_back({c, kv.second});
+    }
+  H.k.assign(ncomm, 0.0);
+  H.m2 = 0.0;
+  for (int c = 0; c < ncomm; ++c) {
+    double kc = 2.0 * H.selfloop[c];
+    for (const auto &pr : H.adj[c]) kc += pr.second;
+    H.k[c] = kc;
+    H.m2 += kc;
+  }
+  return H;
+}
+} // namespace rb_louvain
+
+int cluster_by_louvain(Graph &g, std::vector<size_t> &membership, unsigned seed,
+                       double gamma) {
+  using namespace rb_louvain;
+  const size_t n = g.getNodeCount();
+  const size_t E = g.getEdgeCount();
+  membership.resize(n);
+  std::iota(membership.begin(), membership.end(), 0);
+  if (n == 0 || E == 0) return 0;
+
+  AdjGraph G;
+  G.adj.assign(n, {});
+  G.selfloop.assign(n, 0.0);
+  for (size_t e = 0; e < E; ++e) {
+    double s = g.edgeScore[e];
+    if (s <= 0.0) continue;
+    if (s > 1.0 - 1e-6) s = 1.0 - 1e-6;
+    double w = -std::log(1.0 - s);
+    size_t a = g.from[e], b = g.to[e];
+    if (a == b) { G.selfloop[a] += w; continue; }
+    G.adj[a].push_back({(int)b, w});
+    G.adj[b].push_back({(int)a, w});
+  }
+  G.k.assign(n, 0.0);
+  G.m2 = 0.0;
+  for (size_t i = 0; i < n; ++i) {
+    double ki = 2.0 * G.selfloop[i];
+    for (const auto &pr : G.adj[i]) ki += pr.second;
+    G.k[i] = ki;
+    G.m2 += ki;
+  }
+
+  std::mt19937 rng(seed);
+  std::vector<int> cur(n);
+  std::iota(cur.begin(), cur.end(), 0);
+  for (int level = 0; level < 20; ++level) {
+    std::vector<int> comm;
+    int ncomm = 0;
+    bool moved = local_move(G, gamma, rng, comm, ncomm);
+    for (size_t i = 0; i < n; ++i) cur[i] = comm[cur[i]];
+    if (!moved || ncomm == (int)G.adj.size()) break;
+    G = aggregate(G, comm, ncomm);
+  }
+  for (size_t i = 0; i < n; ++i) membership[i] = (size_t)cur[i];
+  return 0;
+}
+
+// chi-squared (2m dof) CDF with a fast path for large m: the exact Poisson sum
+// is O(m), which is wasteful for the aggregated super-edges of multilevel
+// merging (m = #edges between two communities, can be large).  For m>256 use the
+// Wilson–Hilferty normal approximation (well within ULPs of the exact value at
+// that scale, and only used for the merge tie-break).
+static inline double chi2_2dof_cdf_fast(int m, double x) {
+  if (m <= 256) return chi2_2dof_cdf(m, x);
+  const double k = 2.0 * (double)m;
+  const double t = std::cbrt(x / k);
+  const double mu = 1.0 - 2.0 / (9.0 * k);
+  const double sd = std::sqrt(2.0 / (9.0 * k));
+  const double z = (t - mu) / sd;
+  return 0.5 * std::erfc(-z / std::sqrt(2.0));
+}
+
+// Multilevel Fisher-LPA, merge phase.  After the (proven) level-0 LPA converges,
+// treat each community as a super-node and CONSERVATIVELY merge super-nodes whose
+// inter-community edges are collectively very significant — i.e. fragments of the
+// same genome that LPA left split.  Unlike modularity (which over-merges via the
+// null model), the criterion is the SAME Fisher statistic the LPA uses, gated by
+// a high confidence threshold tau and a minimum supporting-edge count so only
+// near-certain same-genome merges happen (no collapse).  Modifies `membership`.
+static void fisher_super_merge(Graph &g, std::vector<size_t> &membership,
+                               const std::vector<StoredDistance> &logsscr,
+                               double tau, int min_count) {
+  const size_t n = g.getNodeCount();
+  const size_t E = g.getEdgeCount();
+  // Relabel level-0 communities to a contiguous [0, C).
+  phmap::flat_hash_map<size_t, int> remap;
+  std::vector<int> comm0(n);
+  int C = 0;
+  for (size_t i = 0; i < n; ++i) {
+    auto it = remap.find(membership[i]);
+    if (it == remap.end()) { comm0[i] = C; remap.emplace(membership[i], C++); }
+    else comm0[i] = it->second;
+  }
+  if (C <= 1) return;
+  // Aggregate inter-community super-edges: (Σlog, count), additive.
+  std::vector<phmap::flat_hash_map<int, std::pair<double, int>>> sadj(C);
+  for (size_t e = 0; e < E; ++e) {
+    if (g.edgeScore[e] <= 0) continue;
+    int a = comm0[g.from[e]], b = comm0[g.to[e]];
+    if (a == b) continue;
+    double sl = (double)logsscr[e];
+    auto &ab = sadj[a][b]; ab.first += sl; ab.second += 1;
+    auto &ba = sadj[b][a]; ba.first += sl; ba.second += 1;
+  }
+  // Gauss-Seidel Fisher local-move on the super-graph, gated by tau/min_count so
+  // a super-node only joins a neighbour when that merge is near-certain.
+  std::vector<int> comm(C);
+  std::iota(comm.begin(), comm.end(), 0);
+  std::vector<double> sscore(C, 0.0);
+  std::vector<int> scount(C, 0);
+  std::vector<int> touched; touched.reserve(64);
+  std::unordered_map<int, std::unordered_set<int>> visited;
+  std::unordered_set<int> blacklist;
+  std::vector<char> active(C, 1);
+  size_t nLeftMin = INT_MAX, attempt = 0;
+  bool running = true;
+  while (running) {
+    running = false;
+    size_t nLeft = 0;
+    for (int v = 0; v < C; ++v) {
+      if (!active[v]) continue;
+      active[v] = 0;
+      touched.clear();
+      for (const auto &kv : sadj[v]) {
+        int k = comm[kv.first];
+        if (k == comm[v]) continue;          // self community: no merge target
+        if (scount[k] == 0) touched.push_back(k);
+        sscore[k] += kv.second.first;
+        scount[k] += kv.second.second;
+      }
+      if (touched.empty()) continue;
+      double best_val = -std::numeric_limits<double>::infinity();
+      int best_k = -1;
+      for (int k : touched) {
+        double val = chi2_2dof_cdf_fast(scount[k], -2.0 * sscore[k]);
+        // Conservative gate: only consider near-certain, well-supported merges.
+        if (val >= tau && scount[k] >= min_count && val > best_val) {
+          best_val = val; best_k = k;
+        }
+        sscore[k] = 0.0; scount[k] = 0;
+      }
+      if (best_k < 0) continue;              // nothing confident enough → stay
+      int prev = comm[v];
+      if (prev != best_k && blacklist.find(v) == blacklist.end()) {
+        comm[v] = best_k;
+        for (const auto &kv : sadj[v]) active[kv.first] = 1;
+        if (visited[v].find(best_k) == visited[v].end()) { nLeft++; running = true; }
+        else blacklist.insert(v);
+        visited[v].insert(best_k);
+      }
+    }
+    if (nLeft < nLeftMin) { nLeftMin = nLeft; attempt = 0; }
+    else { attempt++; if (attempt >= 10) break; }
+  }
+  for (size_t i = 0; i < n; ++i) membership[i] = (size_t)comm[comm0[i]];
+}
+
 int cluster_by_propagation(Graph &g, std::vector<size_t> &membership,
                       std::vector<size_t> &node_order) {
   size_t no_of_nodes = g.getNodeCount();
@@ -27,6 +271,49 @@ int cluster_by_propagation(Graph &g, std::vector<size_t> &membership,
     cerr << "There were " << no_of_nodes << " nodes and " << no_of_edges
          << " edges -- skipping cluster_by_propagation" << endl;
     return 0;
+  }
+
+  // Multilevel Fisher-LPA: run the standard level-0 LPA below (identity init,
+  // byte-identical to the baseline), then merge communities in a super-graph.
+  bool do_mlpa = false;
+  double mlpa_tau = 1.0 - 1e-9;
+  int mlpa_min_count = 3;
+
+  // Algorithm dispatch (LPA stays the default).  RABBIT_CLUSTER=louvain selects
+  // weighted multilevel modularity; the rng seed is derived from node_order so a
+  // fixed --seed stays deterministic.
+  if (const char *alg = getenv("RABBIT_CLUSTER")) {
+    double gamma = 8.0;
+    if (const char *gg = getenv("RABBIT_CLUSTER_GAMMA")) {
+      double v = atof(gg);
+      if (v > 0) gamma = v;
+    }
+    unsigned lseed = 0x9e3779b9u ^ (unsigned)node_order.size();
+    if (!node_order.empty())
+      lseed ^= (unsigned)(node_order[0] * 2654435761u);
+    if (std::strcmp(alg, "louvain") == 0) {
+      // Pure modularity Louvain.
+      return cluster_by_louvain(g, membership, lseed, gamma);
+    }
+    if (std::strcmp(alg, "fuse") == 0) {
+      // Fusion: Louvain global structure as the LPA initial partition, then the
+      // Fisher label-propagation below refines it (membership is left sized to
+      // n, so the LPA loop uses it as the seed instead of the identity).
+      cluster_by_louvain(g, membership, lseed, gamma);
+      // fall through to LPA refinement
+    }
+    if (std::strcmp(alg, "mlpa") == 0) {
+      // Multilevel Fisher-LPA: standard LPA (below) + conservative super-merge.
+      do_mlpa = true;
+      if (const char *t = getenv("RABBIT_MLPA_TAU")) {
+        double v = atof(t);
+        if (v > 0 && v < 1) mlpa_tau = v;
+      }
+      if (const char *c = getenv("RABBIT_MLPA_MINCOUNT")) {
+        int v = atoi(c);
+        if (v > 0) mlpa_min_count = v;
+      }
+    }
   }
 
   if (g.edgeScore.size() != no_of_edges) {
@@ -251,6 +538,11 @@ int cluster_by_propagation(Graph &g, std::vector<size_t> &membership,
     }
     // cout << "nLeft: " << nLeft << " & attempt: " << attempt << endl;
   }
+
+  // Multilevel merge phase (opt-in): conservatively merge same-genome fragments
+  // the level-0 LPA left split, using the same Fisher statistic + a high gate.
+  if (do_mlpa)
+    fisher_super_merge(g, membership, logsscr, mlpa_tau, mlpa_min_count);
 
   return 0;
 }
