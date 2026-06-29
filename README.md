@@ -41,6 +41,8 @@ rm -rf build && mkdir build && cd build && cmake .. && make -j
 
 ### 1. Bin from BAMs in one shot (depth computed internally)
 
+The pipeline takes coordinate-sorted BAMs directly; a `.bai` index is optional.
+
 ```bash
 rabbitbin bin \
   --fasta contigs.fa \
