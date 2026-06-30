@@ -687,7 +687,8 @@ static void process_depth_shard(const DepthShard &sh,
                                 std::vector<SnvSite> *snvSitesBam = nullptr,
                                 int snvMaxSites = 0,
                                 const int32_t *tid2compact = nullptr,
-                                CountType *contigDepthsU = nullptr, int dualQ = 0) {
+                                CountType *contigDepthsU = nullptr, int dualQ = 0,
+                                std::unordered_map<uint64_t, uint32_t> *peLink = nullptr) {
   if (!sh.hasData)
     return;
   htsFile *fp = hts_open(bamPath.c_str(), "rb");
@@ -774,6 +775,18 @@ static void process_depth_shard(const DepthShard &sh,
       // SNV uses the IDENTICAL read set as depth (same pct-id / edge filters).
       if (snvBam)
         snv_accumulate_read(b, snvCnt.data(), snvCurLen, snvMinBaseQ);
+      // Paired-end cross-contig linkage: this read's mate maps to a DIFFERENT
+      // kept contig → a physical adjacency edge.  Accumulated from the same
+      // depth-quality read set, in compact-row space, into this shard's own map.
+      if (peLink && (b->core.flag & BAM_FPAIRED) && b->core.mtid >= 0 &&
+          b->core.mtid != tid && b->core.mtid < n_targets) {
+        int32_t ca = tid2compact ? tid2compact[tid] : tid;
+        int32_t cb = tid2compact ? tid2compact[b->core.mtid] : b->core.mtid;
+        if (ca >= 0 && cb >= 0) {
+          uint32_t lo = (uint32_t)std::min(ca, cb), hi = (uint32_t)std::max(ca, cb);
+          (*peLink)[((uint64_t)lo << 32) | hi]++;
+        }
+      }
     }
   }
   snvFlush();   // finalize the last contig of this shard
@@ -1064,7 +1077,8 @@ std::string compute_depth_tsv_inmem(const StringVector &bamFilePaths,
                                     bool includeEdgeBases,
                                     bool intraDepthVariance, int numThreads,
                                     SnvResult *snv, DepthMatrixOut *outCols,
-                                    int minMapQualArg, int dualMapQual) {
+                                    int minMapQualArg, int dualMapQual,
+                                    bool collectPELink) {
   const int num_bams = (int)bamFilePaths.size();
   if (num_bams < 1)
     throw std::runtime_error("compute_depth_tsv_inmem: no BAM files");
@@ -1314,6 +1328,9 @@ std::string compute_depth_tsv_inmem(const StringVector &bamFilePaths,
                         std::vector<SnvSite>{});
   }
 
+  // Paired-end linkage: one sparse map per shard (lock-free), merged after.
+  const bool peOn = collectPELink && compactMode && (snv == nullptr);
+  std::vector<std::unordered_map<uint64_t, uint32_t>> peShard(peOn ? shards.size() : 0);
   omp_set_num_threads(g_full_threads);
 #pragma omp parallel for schedule(dynamic, 1)
   for (int s = 0; s < (int)shards.size(); s++) {
@@ -1330,7 +1347,8 @@ std::string compute_depth_tsv_inmem(const StringVector &bamFilePaths,
                         snvOn ? snv->minAf : 0.05,
                         snvOn ? snv->minBaseQ : 0, snvSitesBam,
                         snvSitesOn ? snv->maxSites : 0, t2c,
-                        dualOn ? bamContigDepthsU[bi].get() : nullptr, dualMapQual);
+                        dualOn ? bamContigDepthsU[bi].get() : nullptr, dualMapQual,
+                        peOn ? &peShard[s] : nullptr);
   }
 
   // Route B2: process byte-range shards in parallel into ordered per-shard
@@ -1463,6 +1481,20 @@ std::string compute_depth_tsv_inmem(const StringVector &bamFilePaths,
         }
       }
       outCols->means.emplace_back(std::move(mv));
+    }
+    // Merge the per-shard paired-end linkage maps (compact-row keys, summed over
+    // all shards/BAMs) into outCols->pe_links.  Compact rows == outCols rows.
+    if (peOn) {
+      std::unordered_map<uint64_t, uint32_t> peAll;
+      for (auto &m : peShard)
+        for (auto &kv : m) peAll[kv.first] += kv.second;
+      outCols->pe_links.clear();
+      outCols->pe_links.reserve(peAll.size());
+      for (auto &kv : peAll) {
+        int32_t a = (int32_t)(kv.first >> 32);
+        int32_t b = (int32_t)(kv.first & 0xFFFFFFFFu);
+        outCols->pe_links.emplace_back(a, b, kv.second);
+      }
     }
     return std::string();
   }
