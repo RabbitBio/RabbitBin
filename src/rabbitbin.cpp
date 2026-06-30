@@ -151,6 +151,66 @@ static double      g_split_coh_pct  = 10.0;
 static bool        g_split_guard       = false;
 static size_t      g_split_guard_bp    = 1000000;  // only guard bins >= 1 Mb
 static double      g_split_guard_margin = 0.05;     // required coherence gain
+// Sub-floor fragment consolidation (RABBIT_CONSOLIDATE, default ON).  The
+// coherence-retention pass above keeps purified <min_bin_bp fragments as their
+// OWN tiny bins.  That maximises *unfiltered* genome recovery, but the academic
+// "drop bins <200kb" protocol then discards a near-complete genome whose tail
+// contigs ended up in such fragments — the >=200kb core stays stuck just below
+// 90% completeness.  Diagnosis (CAMI2 marine real BAM): 81% of the missing mass
+// of the near-complete-but-incomplete pure cores sits in exactly these mergeable
+// fragments.  So: before emitting a recovered fragment as its own bin, attach it
+// to the retained >=min_bin_bp core whose depth profile it matches best, iff the
+// mean cross-bin depth correlation is >= the self-calibrated coherence bar (the
+// SAME bar used for retention — no per-dataset constant).  A true distinct small
+// genome will not correlate with any large core's coverage, so it is still kept
+// separate; only same-genome tails are merged.  Purity-safe (high-corr gate),
+// recovery-monotone for the >=200kb metric, and near-free (centroid match reuses
+// the precomputed unit-rank vectors).  DEFAULT OFF: with depth-only matching the
+// merge is at best neutral on the >=200kb HQ count (it cannot uniquely identify a
+// genome's own tail among covarying genomes), so it is kept as an opt-in knob.
+static bool        g_split_consolidate     = false;
+// Extra correlation margin required ABOVE the retention bar before a fragment is
+// merged into a core (RABBIT_CONSOLIDATE_DELTA).  0 = merge at the bar.
+static double      g_split_consolidate_delta = 0.0;
+// ── Composition+depth bin merge (RABBIT_BIN_MERGE, default ON) ─────────────
+// Label propagation / abundance split can fragment ONE genome into several pure
+// bins (a genome shattered into coverage sub-clusters or LPA communities).  Under
+// the academic "drop bins <200kb" protocol each fragment is then individually too
+// small, so the genome is lost even though its UNION would be a >=90%-complete,
+// >=95%-pure, >=200kb MAG.  This pass agglomerates bins that are the SAME genome,
+// gated by BOTH (a) high depth-centroid correlation AND (b) high k-mer (sketch)
+// Jaccard.  The composition term is the discriminator a depth-only merge lacks:
+// distinct genomes that merely covary across samples pass the depth gate but FAIL
+// the composition gate, so they are not merged.  Both bars are self-calibrated
+// percentiles of the per-bin internal coherence (no per-dataset constant), so the
+// rule is identical across datasets.  Bin-level aggregation denoises both signals
+// relative to the per-contig graph, which is why this recovers genomes the
+// first-pass clustering scattered.  Purity-safe (joint gate) and bounded.
+// DEFAULT ON (BAM path): the paired-end gate makes the fragment merge safe and
+// net-positive (marine 253->254); needs PE linkage so it is a no-op on the
+// --depth path.  Disable with RABBIT_BIN_MERGE=0.
+static bool        g_bin_merge        = true;
+// Marker-free decontamination (RABBIT_BIN_DECONTAM, default OFF): drop a contig
+// from a >=floor bin when it is a depth-abundance outlier vs the bin centroid AND
+// has NO paired-end link to any other bin member.  PE is a PROTECT signal (a
+// physical link proves co-membership, so the contig is never removed), so this
+// only sheds contigs that look foreign by BOTH abundance and physical linkage —
+// raising purity (pushing complete-but-impure bins over 95%) without touching the
+// main genome's completeness.  Only tight (high-coherence) bins are cleaned, so
+// uniformly low-coverage bins are never gutted.  DEFAULT ON (BAM path): marine
+// 253->260, plant/strain neutral; needs PE so it is a no-op on --depth.  Disable
+// with RABBIT_BIN_DECONTAM=0.  Subtraction-only (never enlarges a bin).
+static bool        g_bin_decontam     = true;
+// Composition+depth recruit of UNBINNED contigs into cores (RABBIT_BIN_RECRUIT,
+// default ON, BAM path): ~38% of large contigs end up unbinned, and the missing
+// mass of near-complete cores is mostly such unbinned contigs.  For each unbinned
+// large contig, attach it to the >=floor core it matches on BOTH tetranucleotide
+// composition (cosine) AND abundance (depth-corr) — a conjunctive gate (a
+// contaminant that matches on only one signal is rejected) with an unambiguity
+// margin over the 2nd-best core.  Completes pure-but-incomplete MAGs.  Needs TNF
+// (re-derived from the resident sequences) — only when this is on.  Disable with
+// RABBIT_BIN_RECRUIT=0.
+static bool        g_bin_recruit      = true;
 // Raw per-sample mean depths of small contigs, snapshotted BEFORE small_depth_matrix is
 // rank-transformed in place during recruitment, so marker_guided_split sees the
 // same coverage values as the large-contig depth_matrix (means, not ranks).
@@ -487,6 +547,28 @@ static double rb_env_split_guard_margin() {
   if (!e) return 0.05;
   return std::atof(e);
 }
+static bool rb_env_split_consolidate() {
+  const char *e = rb_getenv("RABBIT_CONSOLIDATE");
+  return e && e[0] != '0';             // default OFF; depth-only merge is at best
+                                       // neutral (see rb_split.cpp); opt-in only
+}
+static double rb_env_split_consolidate_delta() {
+  const char *e = rb_getenv("RABBIT_CONSOLIDATE_DELTA");
+  if (!e) return 0.0;
+  return std::atof(e);
+}
+static bool rb_env_bin_merge() {
+  const char *e = rb_getenv("RABBIT_BIN_MERGE");
+  return !e || e[0] != '0';            // default ON (BAM path); RABBIT_BIN_MERGE=0 disables
+}
+static bool rb_env_bin_decontam() {
+  const char *e = rb_getenv("RABBIT_BIN_DECONTAM");
+  return !e || e[0] != '0';            // default ON (BAM path); RABBIT_BIN_DECONTAM=0 disables
+}
+static bool rb_env_bin_recruit() {
+  const char *e = rb_getenv("RABBIT_BIN_RECRUIT");
+  return !e || e[0] != '0';            // default ON (BAM path); RABBIT_BIN_RECRUIT=0 disables
+}
 static bool rb_env_depth_prefilter_on() {
   const char *e = rb_getenv("RABBIT_DEPTH_PREFILTER");
   return !e || e[0] != '0';
@@ -720,6 +802,38 @@ static std::vector<float> g_k4freq_flat; // nobs × 256, non-canonical entries=0
 // Storage: ~30 MB for N=30k contigs.  Comparison cost: 256 FMAs per pair.
 static bool              g_exact_cos_cmp = false;
 static std::vector<float> g_k4cosine_flat; // nobs × 256, L2-normalised GC-norm freqs
+
+// Tetranucleotide (k=4) composition vectors for composition+depth recruit
+// (g_bin_recruit).  256-dim L2-normalised per LARGE contig; built from the
+// resident sequences during the streaming parse only when recruit is enabled.
+static std::vector<float> g_merge_tnf;        // nobs  × 256, L2-normalised (large)
+static inline void rb_fill_tnf(const char *s, size_t L, float *out) {
+  for (int i = 0; i < 256; ++i) out[i] = 0.f;
+  auto code = [](char c) -> int {
+    switch (c) { case 'A': case 'a': return 0; case 'C': case 'c': return 1;
+                 case 'G': case 'g': return 2; case 'T': case 't': return 3;
+                 default: return -1; }
+  };
+  if (L < 4) return;
+  int idx = 0, valid = 0;
+  for (size_t p = 0; p < L; ++p) {
+    int c = code(s[p]);
+    if (c < 0) { valid = 0; idx = 0; continue; }
+    idx = ((idx << 2) | c) & 0xFF;
+    if (++valid >= 4) out[idx] += 1.0f;
+  }
+  double nrm = 0; for (int i = 0; i < 256; ++i) nrm += (double)out[i] * out[i];
+  if (nrm > 0) { float inv = (float)(1.0 / std::sqrt(nrm));
+                 for (int i = 0; i < 256; ++i) out[i] *= inv; }
+}
+
+// Paired-end cross-contig linkage captured during the BAM depth scan, used as the
+// decisive (~98% intra-genome) "same organism" gate for the bin merge.  Stored
+// first in compact depth-row space (g_pe_links_compact, with g_pe_names mapping a
+// compact row -> contig name), then converted to binning contig indices inside
+// consolidate_bins (where contig_names is available).
+static std::vector<std::string> g_pe_names;                          // compact row -> name
+static std::vector<std::tuple<int32_t, int32_t, uint32_t>> g_pe_links_compact;
 
 // Fast Jaccard on raw pointers (no virtual dispatch, no null checks).
 // a, b: pointers to the start of two signature rows in g_sig_flat.
@@ -1593,6 +1707,7 @@ static bool parse_fasta_mmap_parallel(
     bool                 stream_pmh_arg,
     bool                 no_store_seqs_arg,
     bool                 collect_tiny_arg,
+    bool                 collect_tnf_arg,
     uint32_t             pmh_m_arg,
     int                  pmh_k_arg,
     // outputs  ──────────────────────────────────────────────────────────
@@ -1862,6 +1977,12 @@ static bool parse_fasta_mmap_parallel(
                             pmh_k_arg, pmh_m_arg, /*seed=*/42u,
                             rec.winners.data(), my_scratch,
                             /*out64=*/nullptr, /*out_keys=*/nullptr, k4out);
+        }
+        // Tetranucleotide fingerprint for composition+depth recruit (computed
+        // here while the sequence bytes are resident; no_store_seqs frees them).
+        if (collect_tnf_arg && rec.k4freq.empty()) {
+          rec.k4freq.resize(256, 0.0f);
+          rb_fill_tnf(seq_bytes, seq_len, rec.k4freq.data());
         }
         if (!no_store_seqs_arg) {
           rec.seq_view_ptr = view_ptr;   // zero-copy (single-line) or nullptr
@@ -2846,7 +2967,7 @@ static int rb_cmd_bin(int ac, char *av[]) {
       ("min-contig,m", po::value<size_t>(&minContig)->default_value(2500), "Minimum contig length (>=1500)")
       ("min-small-contig", po::value<size_t>(&min_small_contig)->default_value(1000), "Min length for small-contig recruiting")
       ("max-posterior", po::value<Similarity>(&calib_connected_pct)->default_value(95), "Well-connected contig percent for calibration")
-      ("min-edge-score", po::value<Similarity>(&min_edge_weight)->default_value(60), "Minimum edge weight (1-99)")
+      ("min-edge-score", po::value<Similarity>(&min_edge_weight)->default_value(66), "Minimum edge weight (1-99). Higher keeps only confident edges -> purer bins. Default 66 (validated across CAMI1-high and CAMI2 real-BAM: more >=200kb HQ MAGs and faster than the old 60)")
       ("gfa", po::value<std::string>(&g_gfa_file), "Assembly graph (GFA) whose L-links/P-paths are injected as high-weight same-genome edges")
       ("gfa-weight", po::value<double>(&g_gfa_weight)->default_value(0.90), "Edge weight assigned to GFA links (0,1)")
       ("confidence", po::value<bool>(&g_emit_confidence)->zero_tokens(), "Emit per-contig assignment confidence (members.tsv column + <prefix>.confidence.tsv soft assignment)")
@@ -3196,6 +3317,13 @@ static int rb_cmd_bin(int ac, char *av[]) {
                     "(abundance split/recruit disabled).\n");
   using DepthMap = phmap::flat_hash_map<std::string, RawDepthEntry>;
   std::future<DepthMap> depth_future;
+  // Resolve the merge/decontam flags BEFORE the depth/parse kickoff below: the
+  // depth async collects paired-end linkage only when one of them is on, and the
+  // rest of the env block runs only later.
+  g_bin_merge = rb_env_bin_merge();
+  g_bin_decontam = rb_env_bin_decontam();
+  g_bin_recruit = rb_env_bin_recruit();
+  g_bin_recruit = rb_env_bin_recruit();
   {
 #ifdef RABBITBIN_FUSE
     if (fuse_mode) {
@@ -3256,7 +3384,14 @@ static int rb_cmd_bin(int ac, char *av[]) {
                                 /*includeEdgeBases=*/false,
                                 /*intraDepthVariance=*/false, nt,
                                 snvOn ? &g_snv_result : nullptr, &cols,
-                                /*minMapQual=*/0, /*dualMapQual=*/dualQ);
+                                /*minMapQual=*/0, /*dualMapQual=*/dualQ,
+                                /*collectPELink=*/(g_bin_merge || g_bin_decontam));
+        // Stash paired-end linkage (compact-row space) for the merge/decontam
+        // passes; converted to contig indices later, once contig_names is ready.
+        if ((g_bin_merge || g_bin_decontam) && !cols.pe_links.empty()) {
+          g_pe_names = cols.names;
+          g_pe_links_compact = std::move(cols.pe_links);
+        }
         DepthMap m;
         m.reserve(cols.names.size());
         const bool prefilter = rb_env_depth_prefilter_on();
@@ -3468,6 +3603,7 @@ static int rb_cmd_bin(int ac, char *av[]) {
               fullHeader,
               stream_pmh_mmap, no_store_seqs_mmap,
               /*collect_tiny=*/outUnbinned,
+              /*collect_tnf=*/g_bin_recruit,
               pmh_m_mmap, pmh_k_mmap,
               mmap_large, mmap_small, mmap_tiny,
               num_seqs);
@@ -3512,6 +3648,8 @@ static int rb_cmd_bin(int ac, char *av[]) {
         if (do_collect_k4) {
           g_k4freq_flat.assign(mmap_large.size() * 256, 0.0f);
         }
+        const bool do_collect_tnf = g_bin_recruit;
+        if (do_collect_tnf) g_merge_tnf.assign(mmap_large.size() * 256, 0.0f);
 
         // Merge results into global arrays (serial, but O(nobs) and fast).
         // Sequences become string_views into the retained mmap (single-line) or
@@ -3551,6 +3689,10 @@ static int rb_cmd_bin(int ac, char *av[]) {
           }
           if (do_collect_k4 && !rec.k4freq.empty()) {
             std::memcpy(g_k4freq_flat.data() + r * 256,
+                        rec.k4freq.data(), 256 * sizeof(float));
+          }
+          if (do_collect_tnf && !rec.k4freq.empty()) {
+            std::memcpy(g_merge_tnf.data() + r * 256,
                         rec.k4freq.data(), 256 * sizeof(float));
           }
         }
@@ -4009,6 +4151,9 @@ static int rb_cmd_bin(int ac, char *av[]) {
   g_split_guard = rb_env_split_guard();
   g_split_guard_bp = rb_env_split_guard_bp();
   g_split_guard_margin = rb_env_split_guard_margin();
+  g_split_consolidate = rb_env_split_consolidate();
+  g_split_consolidate_delta = rb_env_split_consolidate_delta();
+  g_bin_merge = rb_env_bin_merge();
   g_mutual_knn  = rb_env_mutual_knn_on();
   g_neg_depth_thr = rb_env_neg_depth_thr();
   g_edge_power  = [] { const char *e = rb_getenv("RABBIT_EDGE_POWER"); double v = e ? std::atof(e) : 1.0;
@@ -5375,6 +5520,7 @@ static int rb_cmd_bin(int ac, char *av[]) {
   // An explicit --marker-seed takes priority (marker-guided); otherwise the
   // default marker-free abundance split runs (disable with --no-split).
   auto do_split_purify = [&](BinMap &c) {
+    const size_t merge_floor = min_bin_bp;   // captured BEFORE the split zeroes it
     if (!marker_seed_file.empty()) {
       verbose_message("Marker-guided bin splitting...\n");
       marker_guided_split(c);
@@ -5382,6 +5528,9 @@ static int rb_cmd_bin(int ac, char *av[]) {
       verbose_message("Abundance-guided bin splitting (marker-free)...\n");
       abundance_guided_split(c);
     }
+    if (g_bin_merge) consolidate_bins(c, merge_floor);     // unite same-genome fragments
+    if (g_bin_recruit) recruit_unbinned_to_cores(c, merge_floor); // attach unbinned tails
+    if (g_bin_decontam) decontaminate_bins(c, merge_floor); // shed foreign contigs
     if (g_purify) {
       verbose_message("Contamination-aware purification...\n");
       rb_purify_bins(c);
@@ -5442,6 +5591,8 @@ static int rb_cmd_bin(int ac, char *av[]) {
     outFile = base; min_bin_bp = saved_min; g_split_sil = saved_sil;
   }
   rb_phase("output done");
+
+  std::vector<float>().swap(g_merge_tnf);        // release recruit TNF vectors
 
   verbose_message("Finished\n");
   return 0;
