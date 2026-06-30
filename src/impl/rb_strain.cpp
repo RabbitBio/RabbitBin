@@ -196,3 +196,105 @@ static int estimate_bin_strains(const ContigVector &cluster,
   minorAbund = std::move(acc);
   return std::min(1 + kept, g_strain_max_k);
 }
+
+// ── Validation dump (env RABBIT_SNV_TRAJ_DUMP=path): per large-contig dominant
+// SNV allele-frequency trajectory across samples.  For each contig we build the
+// same per-site mean-centred unit trajectories as estimate_bin_strains, then
+// sign-fold them onto the contig's strongest direction and average -> one S-dim
+// signature per contig.  Used to test whether same-genome contigs share a
+// trajectory (strong strain fingerprint) where the corrupted coverage cannot.
+// Build one L2-normalised per-sample SNV trajectory per large contig into the
+// global g_snv_traj / g_snv_traj_have (the strain fingerprint used by the
+// SNV-aware edge gate). Same per-site math as estimate_bin_strains, aggregated
+// per contig: each polymorphic site's oriented per-sample alt-frequency forms a
+// mean-centred unit direction; the contig signature is the sign-folded average
+// of its sites' directions, re-normalised. Contigs with no usable site get
+// have=0 (left out of the gate). Optionally also dumps a TSV for validation.
+static void build_contig_snv_traj(const char *dump_path) {
+  const size_t S = num_depth_samples;
+  g_snv_traj.assign(nobs * S, 0.0f);
+  g_snv_traj_have.assign(nobs, 0);
+  if (S < 2 || g_snv_sites.empty()) return;
+  const int minReport = std::max(2, g_snv_traj_minrep);
+
+  std::ofstream os;
+  if (dump_path) {
+    os.open(dump_path);
+    if (os) {
+      os << "contigName";
+      for (size_t b = 0; b < S; ++b) os << "\ttraj_s" << (b + 1);
+      os << "\tnSites\n";
+    }
+  }
+
+#pragma omp parallel for schedule(dynamic, 256)
+  for (size_t idx = 0; idx < nobs; ++idx) {
+    std::unordered_map<uint32_t, std::vector<std::pair<int, SnvSite>>> raw;
+    for (size_t b = 0; b < S; ++b) {
+      const std::vector<SnvSite> &lst = g_snv_sites[idx * S + b];
+      for (const SnvSite &s : lst) raw[s.pos].push_back({(int)b, s});
+    }
+    std::vector<std::vector<double>> dirs;
+    for (auto &kv : raw) {
+      auto &r = kv.second;
+      if ((int)r.size() < minReport) continue;
+      int deep = 0;
+      for (size_t i = 1; i < r.size(); ++i)
+        if (r[i].second.total > r[deep].second.total) deep = (int)i;
+      const uint8_t canon = r[deep].second.alt;
+      std::vector<double> f(S, -1.0);
+      for (auto &pr : r) {
+        const SnvSite &s = pr.second;
+        double fr = s.total ? (double)s.altCount / (double)s.total : 0.0;
+        double v = (s.alt == canon) ? fr : (s.maj == canon ? 1.0 - fr : 0.0);
+        f[pr.first] = v;
+      }
+      double sum = 0.0; int nrep = 0;
+      for (size_t b = 0; b < S; ++b) if (f[b] >= 0.0) { sum += f[b]; nrep++; }
+      if (nrep == 0) continue;
+      double mean = sum / nrep;
+      for (size_t b = 0; b < S; ++b) if (f[b] < 0.0) f[b] = mean;
+      std::vector<double> d(S);
+      double dm = 0.0; for (double x : f) dm += x; dm /= S;
+      double nn = 0.0; for (size_t b = 0; b < S; ++b) { d[b] = f[b] - dm; nn += d[b]*d[b]; }
+      if (nn < 1e-9) continue;
+      double inv = 1.0 / std::sqrt(nn);
+      for (size_t b = 0; b < S; ++b) d[b] *= inv;
+      dirs.push_back(std::move(d));
+    }
+    if (dirs.empty()) continue;
+    std::vector<double> sig(S, 0.0);
+    const std::vector<double> &ref = dirs[0];
+    for (auto &d : dirs) {
+      double dot = 0.0; for (size_t b = 0; b < S; ++b) dot += d[b]*ref[b];
+      double sgn = (dot < 0) ? -1.0 : 1.0;
+      for (size_t b = 0; b < S; ++b) sig[b] += sgn * d[b];
+    }
+    double nn = 0.0; for (double x : sig) nn += x*x;
+    if (nn < 1e-12) continue;
+    double inv = 1.0 / std::sqrt(nn);
+    float *out = g_snv_traj.data() + idx * S;
+    for (size_t b = 0; b < S; ++b) out[b] = (float)(sig[b] * inv);
+    g_snv_traj_have[idx] = 1;
+  }
+
+  if (os) {
+    for (size_t idx = 0; idx < nobs; ++idx) {
+      if (!g_snv_traj_have[idx]) continue;
+      os << contig_names[idx];
+      const float *v = g_snv_traj.data() + idx * S;
+      for (size_t b = 0; b < S; ++b) os << '\t' << v[b];
+      os << "\t1\n";
+    }
+    os.close();
+  }
+  size_t have = 0; for (char c : g_snv_traj_have) have += c;
+  verbose_message("[snv-edge] built per-contig SNV trajectories: %zu/%zu contigs "
+                  "(%.0f%%) carry a strain fingerprint\n",
+                  have, (size_t)nobs, nobs ? 100.0 * have / nobs : 0.0);
+}
+
+// Thin wrapper kept for the validation-only env dump path.
+static void dump_contig_snv_traj(const char *path) {
+  build_contig_snv_traj(path);
+}

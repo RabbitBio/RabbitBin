@@ -359,6 +359,33 @@ static int    g_strain_max_k     = 4;    // --strain-max-k (cap on reported stra
 // contig_names: g_snv_sites[idx * num_depth_samples + sample].
 static std::vector<std::vector<SnvSite>> g_snv_sites;
 
+// ── SNV-aware edge signal (strain fingerprint recovery) ─────────────────────
+// For near-identical strains, BWA scatters the 91% MAPQ=0 reads arbitrarily, so
+// the per-contig COVERAGE fingerprint (what the abundance graph normally uses)
+// collapses — different strains end up with similar depth and get merged (purity
+// crashes).  The strain signal survives in the SNVs each read carries: a
+// contig's per-sample allele-frequency TRAJECTORY is a strain fingerprint
+// (validated: same-genome |cos|≈0.25 vs cross-genome ≈0.03, ~7×).  g_snv_traj
+// holds each large contig's L2-normalised S-dim trajectory (zeros if none); the
+// depth edge term consults it to GATE edges whose trajectories strongly disagree
+// (different strains) and reward agreement.  Opt-in via RABBIT_SNV_EDGE (default
+// off → byte-identical baseline); auto-enabled is left to the caller.
+static std::vector<float> g_snv_traj;       // nobs * num_depth_samples, unit
+static std::vector<char>  g_snv_traj_have;  // 1 if contig idx has a trajectory
+static bool   g_snv_edge       = false;     // blend SNV trajectory into edges
+static double g_snv_edge_lo    = 0.10;      // |cos| below this ⇒ different strain
+static int    g_snv_traj_minrep = 2;        // min reporting samples per site
+// Dual-coverage: when >0, append a unique-read (MAPQ>=g_dual_q) depth block as
+// extra samples alongside the all-read block (opt-in RABBIT_DUAL_DEPTH).
+static int    g_dual_q         = 0;
+// Conjunctive dual metric (opt-in RABBIT_DUAL_CONJ, needs g_dual_q): an edge's
+// depth correlation is min(corr over the all-read half, corr over the unique-
+// read half).  A cross-strain pair that cross-mapping made look similar on the
+// all-read half but NOT on the (clean) unique-read half is cut → protects
+// purity on strain-heavy data, while same-strain pairs (agree on both) survive.
+static bool   g_dual_conj      = false;
+static std::vector<float> g_depth_unit_blk;  // per-half centered+L2 unit rows
+
 // ── Stability-aware MAG certification (feature #6) ──────────────────────────
 // --certify: after the (cheap) one-graph binning, re-run the edge-score ->
 // incidence -> label-propagation tail under a handful of parameter / seed
@@ -604,8 +631,41 @@ static inline float unit_dot_f(const float *__restrict__ a,
 
 // Depth term for edge blending, dispatching on g_depth_sim.  Sets ok=false to
 // hard-cut the edge (non-finite, or strongly negative correlation).
+// Conjunctive dual depth correlation: min(corr over all-read half, corr over
+// unique-read half), using the per-half unit rows. Both halves are unit vectors
+// so each block dot is a correlation in [-1,1]; the min is the conservative
+// "agree on BOTH coverage views" signal that suppresses cross-strain edges.
+static inline double depth_corr_conj(size_t i, size_t j) {
+  if (g_depth_unit_blk.empty()) return depth_corr_fast(i, j);
+  const size_t S = num_depth_samples, Sh = S / 2;
+  const float *a = g_depth_unit_blk.data() + i * S;
+  const float *b = g_depth_unit_blk.data() + j * S;
+  double s0 = 0.0, s1 = 0.0;
+  for (size_t k = 0; k < Sh; ++k)      s0 += (double)a[k] * (double)b[k];
+  for (size_t k = Sh; k < S; ++k)      s1 += (double)a[k] * (double)b[k];
+  return s0 < s1 ? s0 : s1;
+}
+
+static inline double snv_traj_cos(size_t i, size_t j) {
+  // |cosine| of two unit trajectories; <0 means "no fingerprint for the pair".
+  if (!g_snv_traj_have[i] || !g_snv_traj_have[j]) return -1.0;
+  const size_t S = num_depth_samples;
+  const float *a = g_snv_traj.data() + i * S;
+  const float *b = g_snv_traj.data() + j * S;
+  double d = 0.0;
+  for (size_t k = 0; k < S; ++k) d += (double)a[k] * (double)b[k];
+  return d < 0 ? -d : d;   // both unit ⇒ |dot| = |cos|
+}
+
 static inline double depth_edge_term(size_t i, size_t j, bool &ok) {
   ok = true;
+  // SNV-aware strain gate (opt-in): when both contigs carry a trajectory
+  // fingerprint and it strongly DISAGREES, they are different strains that
+  // cross-mapping made look depth-similar — cut the edge to protect purity.
+  if (g_snv_edge) {
+    double sc = snv_traj_cos(i, j);
+    if (sc >= 0.0 && sc < g_snv_edge_lo) { ok = false; return 0.0; }
+  }
   if (g_depth_sim == 1) {                        // weighted Jaccard (magnitude)
     double wj = cal_depth_wjac(i, j);
     if (!std::isfinite(wj)) { ok = false; return 0.0; }
@@ -617,7 +677,8 @@ static inline double depth_edge_term(size_t i, size_t j, bool &ok) {
     }
     return wj < 0.0 ? 0.0 : (wj > 1.0 ? 1.0 : wj);
   }
-  double corr = depth_corr_fast(i, j);           // Spearman (default)
+  double corr = g_dual_conj ? depth_corr_conj(i, j)
+                            : depth_corr_fast(i, j);   // Spearman (default)
   if (!std::isfinite(corr)) { ok = false; return 0.0; }
   if (g_neg_depth_thr > -0.99 && corr < g_neg_depth_thr) { ok = false; return 0.0; }
   double cp = corr < 0.0 ? 0.0 : corr;
@@ -1389,6 +1450,8 @@ static void mge_write_table(const std::vector<size_t> &contig_binnum) {
 // size); they are #included into this TU near the other impl modules.  Forward
 // declarations so rb_cmd_bin / rb_output.cpp can call them before that point.
 static void materialize_snv_rows();
+static void dump_contig_snv_traj(const char *path);
+static void build_contig_snv_traj(const char *dump_path);
 static int  estimate_bin_strains(const ContigVector &cluster,
                                  std::vector<double> &minorAbund);
 static void certify_stability(Graph &g, const std::vector<size_t> &baseline,
@@ -2858,6 +2921,10 @@ static int rb_cmd_bin(int ac, char *av[]) {
        "[--bam] Min contig depth emitted into depth (rabbit_depth default)")
       ("max-edge-bases", po::value<int>(&fuse_max_edge)->default_value(75),
        "[--bam] Max edge bases trimmed per contig end")
+      ("dual-depth", po::value<int>(&fuse_dual_depth)->default_value(5),
+       "[--bam] Also add a unique-read (MAPQ>=arg) depth block as extra abundance "
+       "dimensions, computed in the same BAM scan (default 5; 0 disables). "
+       "Improves edge reliability on real mappings; near-zero extra runtime.")
 #endif
       ("verbose,v", po::value<bool>(&verbose)->zero_tokens(), "Verbose progress (default ON)");
 
@@ -2898,6 +2965,18 @@ static int rb_cmd_bin(int ac, char *av[]) {
     cerr << "[Error!] --add-depth requires --load-cache (incremental binning "
             "folds new samples into a cached composition graph).\n";
     return 1;
+  }
+
+  // SNV-aware strain edge gate (opt-in, env). It needs the per-site SNV data,
+  // so it implies --strain. Default OFF → baseline graph is byte-identical.
+  if (const char *e = getenv("RABBIT_SNV_EDGE")) {
+    if (atoi(e) != 0) { g_snv_edge = true; g_strain_scan = true; }
+  }
+  if (const char *e = getenv("RABBIT_SNV_EDGE_LO")) {
+    double v = atof(e); if (v > 0.0 && v < 1.0) g_snv_edge_lo = v;
+  }
+  if (const char *e = getenv("RABBIT_SNV_TRAJ_MINREP")) {
+    int v = atoi(e); if (v >= 2) g_snv_traj_minrep = v;
   }
 
   // --strain (per-contig SNV extraction) reads alignments, so it needs --bam
@@ -3062,6 +3141,23 @@ static int rb_cmd_bin(int ac, char *av[]) {
     cvExt = false;
     has_depth = true;
     num_depth_samples = (int)fuse_bams.size();
+    // Dual-coverage feature (opt-in RABBIT_DUAL_DEPTH=q): append a second,
+    // unique-read (MAPQ>=q) depth block as extra "samples".  The unique-read
+    // coverage is the same BAM's clean signal — cross-mapped (low-MAPQ) reads
+    // are excluded — so the Spearman edge metric estimates over richer, cleaner
+    // dimensions.  Validated: marine 299->309, plant 110->111 (same BAMs, no
+    // mapping change, no per-dataset tuning).  Doubles the depth columns.
+    // Dual coverage (default ON, q=5 via --dual-depth): append a unique-read
+    // depth block as extra abundance dimensions, computed in the SAME BAM scan.
+    // The SNV pass (--strain) forces its own depth scan and disables dual, so
+    // only double the columns when dual will actually run. Env RABBIT_DUAL_DEPTH
+    // overrides the CLI value (experiment hook); set either to 0 to disable.
+    int dualReq = fuse_dual_depth;
+    if (const char *e = getenv("RABBIT_DUAL_DEPTH")) dualReq = atoi(e);
+    if (dualReq > 0 && !g_strain_scan) { g_dual_q = dualReq; num_depth_samples *= 2; }
+    if (g_dual_q > 0 && getenv("RABBIT_DUAL_CONJ") &&
+        atoi(getenv("RABBIT_DUAL_CONJ")) != 0)
+      g_dual_conj = true;
   }
 #endif
 
@@ -3151,10 +3247,16 @@ static int rb_cmd_bin(int ac, char *av[]) {
         // directly from the raw depth sums (identical to variance.mean), so the
         // full num_bams × n_targets variance matrix (~1 GB on million-contig
         // assemblies) is never allocated.
+        // Dual coverage (g_dual_q>0): a SINGLE BAM scan accumulates both the
+        // all-read and the unique-read (MAPQ>=g_dual_q) depth, emitted as
+        // [all-read block | unique-read block] columns — no second decode pass.
+        // (SNV extraction forces its own pass, so dual is disabled when snvOn.)
+        const int dualQ = (g_dual_q > 0 && !snvOn) ? g_dual_q : 0;
         compute_depth_tsv_inmem(bams, pctid, mcl, (float)mcd, medge,
                                 /*includeEdgeBases=*/false,
                                 /*intraDepthVariance=*/false, nt,
-                                snvOn ? &g_snv_result : nullptr, &cols);
+                                snvOn ? &g_snv_result : nullptr, &cols,
+                                /*minMapQual=*/0, /*dualMapQual=*/dualQ);
         DepthMap m;
         m.reserve(cols.names.size());
         const bool prefilter = rb_env_depth_prefilter_on();
@@ -3844,6 +3946,13 @@ static int rb_cmd_bin(int ac, char *av[]) {
       // the (potentially large) tid-keyed grid once projected.
       if (g_strain_scan && g_snv_result.enabled) {
         materialize_snv_rows();
+        // Build the per-contig SNV trajectory fingerprint when the SNV-aware
+        // edge gate is on (or when only the validation dump is requested).
+        const char *tp = getenv("RABBIT_SNV_TRAJ_DUMP");
+        if (g_snv_edge || tp)
+          build_contig_snv_traj(tp);
+        // g_snv_sites is consumed by build/estimate; keep it only if needed by
+        // the per-bin strain report (estimate_bin_strains runs at output time).
         std::vector<SnvContigStat>().swap(g_snv_result.stats);
         std::vector<std::string>().swap(g_snv_result.names);
         std::vector<std::vector<SnvSite>>().swap(g_snv_result.sites);
@@ -4183,6 +4292,30 @@ static int rb_cmd_bin(int ac, char *av[]) {
         float *u = g_depth_unit.data() + r * S;
         for (size_t k = 0; k < S; ++k)
           u[k] = (float)(((double)depth_matrix(r, k) - mean) * inv);
+      }
+    }
+    // Conjunctive dual: also build per-HALF unit rows (all-read block [0,Sh),
+    // unique-read block [Sh,S)), each centered+normalised within its own half so
+    // depth_corr_conj can take min(dot_half0, dot_half1).
+    if (g_dual_conj && g_dual_q > 0 && (S % 2) == 0) {
+      const size_t Sh = S / 2;
+      g_depth_unit_blk.assign(nobs * S, 0.0f);
+#pragma omp parallel for schedule(static) num_threads(numThreads)
+      for (size_t r = 0; r < nobs; ++r) {
+        for (int half = 0; half < 2; ++half) {
+          const size_t off = (size_t)half * Sh;
+          double mean = 0.0;
+          for (size_t k = 0; k < Sh; ++k) mean += depth_matrix(r, off + k);
+          mean /= (double)Sh;
+          double ss = 0.0;
+          for (size_t k = 0; k < Sh; ++k) { double d = (double)depth_matrix(r, off + k) - mean; ss += d * d; }
+          if (ss > 0.0) {
+            const double inv = 1.0 / std::sqrt(ss);
+            float *u = g_depth_unit_blk.data() + r * S + off;
+            for (size_t k = 0; k < Sh; ++k)
+              u[k] = (float)(((double)depth_matrix(r, off + k) - mean) * inv);
+          }
+        }
       }
     }
   }

@@ -686,7 +686,8 @@ static void process_depth_shard(const DepthShard &sh,
                                 int snvMinBaseQ = 0,
                                 std::vector<SnvSite> *snvSitesBam = nullptr,
                                 int snvMaxSites = 0,
-                                const int32_t *tid2compact = nullptr) {
+                                const int32_t *tid2compact = nullptr,
+                                CountType *contigDepthsU = nullptr, int dualQ = 0) {
   if (!sh.hasData)
     return;
   htsFile *fp = hts_open(bamPath.c_str(), "rb");
@@ -762,11 +763,13 @@ static void process_depth_shard(const DepthShard &sh,
       // contigs (len >= minContigLength), skipping filtered ones — shrinks the
       // per-bam depth array from n_targets to n_kept (huge with millions of tiny
       // contigs). SNV is disabled in compact mode (snvBam == null).
+      const bool uniq = contigDepthsU && b->core.qual >= dualQ;
       if (tid2compact) {
         int32_t ci = tid2compact[tid];
-        if (ci >= 0) contigDepths[ci] += ov;
+        if (ci >= 0) { contigDepths[ci] += ov; if (uniq) contigDepthsU[ci] += ov; }
       } else {
         contigDepths[tid] += ov;
+        if (uniq) contigDepthsU[tid] += ov;
       }
       // SNV uses the IDENTICAL read set as depth (same pct-id / edge filters).
       if (snvBam)
@@ -943,7 +946,8 @@ static bool process_depth_byterange(
     const std::string &bamPath, const BamHeaderT &header, uint64_t startVoff,
     uint64_t endCoff, bool needResync, float percentIdentity, int maxEdgeBases,
     bool includeEdgeBases, int avgRead, int minMapQual,
-    std::vector<std::pair<int32_t, CountType>> &out) {
+    std::vector<std::pair<int32_t, CountType>> &out,
+    std::vector<std::pair<int32_t, CountType>> *outU = nullptr, int dualQ = 0) {
   htsFile *fp = hts_open(bamPath.c_str(), "rb");
   if (!fp)
     return false;
@@ -992,6 +996,7 @@ static bool process_depth_byterange(
   DepthCounts none{};
   int32_t curTid = -1;
   CountType curSum = 0;
+  CountType curSumU = 0;   // unique-read (MAPQ>=dualQ) accumulator (dual mode)
   while (true) {
     uint64_t voffBefore = (uint64_t)bgzf_tell(bgzf);
     if ((voffBefore >> 16) >= endCoff)
@@ -1019,16 +1024,24 @@ static bool process_depth_byterange(
     CountType ov = caldepth(b, none, header->target_len[tid], NULL, edge, &rs);
     if (rs.isValid() && rs.getPctId() >= percentIdentity) {
       if (tid != curTid) {
-        if (curTid >= 0)
+        if (curTid >= 0) {
           out.emplace_back(curTid, curSum);
+          if (outU) outU->emplace_back(curTid, curSumU);
+        }
         curTid = tid;
         curSum = 0;
+        curSumU = 0;
       }
       curSum += ov;
+      // Same decoded read feeds the unique-read block in one pass — no second
+      // BAM scan. Only reads that map uniquely (MAPQ>=dualQ) count here.
+      if (outU && b->core.qual >= dualQ) curSumU += ov;
     }
   }
-  if (curTid >= 0)
+  if (curTid >= 0) {
     out.emplace_back(curTid, curSum);
+    if (outU) outU->emplace_back(curTid, curSumU);
+  }
   bam_destroy1(b);
   hts_close(fp);
   return true;
@@ -1050,7 +1063,8 @@ std::string compute_depth_tsv_inmem(const StringVector &bamFilePaths,
                                     float minContigDepth, int maxEdgeBases,
                                     bool includeEdgeBases,
                                     bool intraDepthVariance, int numThreads,
-                                    SnvResult *snv, DepthMatrixOut *outCols) {
+                                    SnvResult *snv, DepthMatrixOut *outCols,
+                                    int minMapQualArg, int dualMapQual) {
   const int num_bams = (int)bamFilePaths.size();
   if (num_bams < 1)
     throw std::runtime_error("compute_depth_tsv_inmem: no BAM files");
@@ -1058,7 +1072,11 @@ std::string compute_depth_tsv_inmem(const StringVector &bamFilePaths,
   omp_set_dynamic(0);
   omp_set_num_threads(numThreads);
   const int g_full_threads = numThreads;
-  const int minMapQual = 0;
+  const int minMapQual = minMapQualArg;
+  // Dual coverage: when >0, accumulate a SECOND unique-read (MAPQ>=dualMapQual)
+  // depth per contig in the SAME scan, emitted as extra columns (all-read block
+  // then unique-read block). Only meaningful for the structured outCols path.
+  const bool dualOn = (dualMapQual > 0) && (outCols != nullptr) && (snv == nullptr);
 
   // Open ONE consolidated header (each shard opens its own handle).
   BamFile firstBam = BamUtils::openBam(bamFilePaths[0], false);
@@ -1269,9 +1287,11 @@ std::string compute_depth_tsv_inmem(const StringVector &bamFilePaths,
   const int32_t depthN = compactMode ? n_kept : header->n_targets;
   const int32_t *t2c = compactMode ? tid2compact.data() : nullptr;
 
+  CountTypeMatrix bamContigDepthsU(dualOn ? num_bams : 0);
   int minAvgRead = INT_MAX;
   for (int bi = 0; bi < num_bams; bi++) {
     bamContigDepths[bi].reset(new CountType[depthN]());
+    if (dualOn) bamContigDepthsU[bi].reset(new CountType[depthN]());
     if (intraDepthVariance)
       bamContigVariances[bi].assign(header->n_targets, VarianceType());
     averageReadSize[bi] = sampledAvgRead[bi];
@@ -1309,7 +1329,8 @@ std::string compute_depth_tsv_inmem(const StringVector &bamFilePaths,
                         snvOn ? snv->minDepth : 5,
                         snvOn ? snv->minAf : 0.05,
                         snvOn ? snv->minBaseQ : 0, snvSitesBam,
-                        snvSitesOn ? snv->maxSites : 0, t2c);
+                        snvSitesOn ? snv->maxSites : 0, t2c,
+                        dualOn ? bamContigDepthsU[bi].get() : nullptr, dualMapQual);
   }
 
   // Route B2: process byte-range shards in parallel into ordered per-shard
@@ -1319,6 +1340,8 @@ std::string compute_depth_tsv_inmem(const StringVector &bamFilePaths,
   if (!b2shards.empty()) {
     std::vector<std::vector<std::pair<int32_t, CountType>>> b2local(
         b2shards.size());
+    std::vector<std::vector<std::pair<int32_t, CountType>>> b2localU(
+        dualOn ? b2shards.size() : 0);
     std::vector<char> bamFailed(num_bams, 0);
     omp_set_num_threads(g_full_threads);
 #pragma omp parallel for schedule(dynamic, 1)
@@ -1327,7 +1350,8 @@ std::string compute_depth_tsv_inmem(const StringVector &bamFilePaths,
       bool ok = process_depth_byterange(
           bamFilePaths[sh.bamIdx], header, sh.startVoff, sh.endCoff,
           sh.needResync, percentIdentity, maxEdgeBases, includeEdgeBases,
-          averageReadSize[sh.bamIdx], minMapQual, b2local[s]);
+          averageReadSize[sh.bamIdx], minMapQual, b2local[s],
+          dualOn ? &b2localU[s] : nullptr, dualMapQual);
       if (!ok)
         bamFailed[sh.bamIdx] = 1;
     }
@@ -1342,6 +1366,17 @@ std::string compute_depth_tsv_inmem(const StringVector &bamFilePaths,
           if (ci >= 0) cd[ci] += kv.second;
         } else {
           cd[kv.first] += kv.second;
+        }
+      }
+      if (dualOn) {
+        CountType *cdU = bamContigDepthsU[b2shards[s].bamIdx].get();
+        for (const auto &kv : b2localU[s]) {
+          if (t2c) {
+            int32_t ci = t2c[kv.first];
+            if (ci >= 0) cdU[ci] += kv.second;
+          } else {
+            cdU[kv.first] += kv.second;
+          }
         }
       }
     }
@@ -1363,7 +1398,8 @@ std::string compute_depth_tsv_inmem(const StringVector &bamFilePaths,
             DepthShard{bi, 0, header->n_targets, ufHdrVoff[bi], true, budget},
             bamFilePaths[bi], header, bamContigDepths[bi].get(), percentIdentity,
             maxEdgeBases, includeEdgeBases, averageReadSize[bi], minMapQual,
-            nullptr, 5, 0.05, 0, nullptr, 0, t2c);
+            nullptr, 5, 0.05, 0, nullptr, 0, t2c,
+            dualOn ? bamContigDepthsU[bi].get() : nullptr, dualMapQual);
       }
     }
   }
@@ -1403,20 +1439,28 @@ std::string compute_depth_tsv_inmem(const StringVector &bamFilePaths,
       const int32_t di = compactMode ? tid2compact[t] : t; // depth-array index
       outCols->names.emplace_back(header->target_name[t]);
       outCols->lens.push_back((int32_t)header->target_len[t]);
-      std::vector<float> mv((size_t)num_bams);
+      // Dual mode: 2*num_bams columns = [all-read block | unique-read block].
+      std::vector<float> mv((size_t)num_bams * (dualOn ? 2 : 1));
       for (int bi = 0; bi < num_bams; ++bi) {
+        const int edge =
+            includeEdgeBases ? 0 : std::min(maxEdgeBases, averageReadSize[bi] / 3);
+        int32_t cl = header->target_len[t];
+        int32_t adj = (cl > 2 * edge + 1) ? (cl - 2 * edge) : cl;
         float m;
         if (intraDepthVariance) {
           m = (float)bamContigVariances[bi][t].mean;
         } else {
-          const int edge =
-              includeEdgeBases ? 0 : std::min(maxEdgeBases, averageReadSize[bi] / 3);
-          int32_t cl = header->target_len[t];
-          int32_t adj = (cl > 2 * edge + 1) ? (cl - 2 * edge) : cl;
           m = (adj > 2) ? (float)((double)bamContigDepths[bi].get()[di] / adj) : 0.0f;
         }
         if (m > 1000000.0f) m = 0.0f; // match printDepth's huge-value clamp
         mv[bi] = m;
+        if (dualOn) {
+          float mu = (adj > 2)
+                         ? (float)((double)bamContigDepthsU[bi].get()[di] / adj)
+                         : 0.0f;
+          if (mu > 1000000.0f) mu = 0.0f;
+          mv[(size_t)num_bams + bi] = mu;
+        }
       }
       outCols->means.emplace_back(std::move(mv));
     }
