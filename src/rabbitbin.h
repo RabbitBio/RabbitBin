@@ -137,6 +137,9 @@ static int fuse_pctid = 97;
 static int fuse_min_contig_len = 1;
 static double fuse_min_contig_depth = 0.0;
 static int fuse_max_edge = 75;
+// Dual coverage: also derive a unique-read (MAPQ>=this) depth block in the same
+// BAM scan and use it as extra abundance dimensions. Default ON (5); 0 disables.
+static int fuse_dual_depth = 5;
 #endif
 static bool cvExt;
 static bool fullHeader = false;

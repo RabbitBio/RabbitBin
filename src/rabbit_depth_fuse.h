@@ -99,7 +99,9 @@ std::string compute_depth_tsv_inmem(const std::vector<std::string> &bamFilePaths
                                     bool includeEdgeBases,
                                     bool intraDepthVariance, int numThreads,
                                     SnvResult *snv = nullptr,
-                                    DepthMatrixOut *outCols = nullptr);
+                                    DepthMatrixOut *outCols = nullptr,
+                                    int minMapQual = 0,
+                                    int dualMapQual = 0);
 
 // Generic BAM/CRAM, reference-aware depth (used for CRAM input or when a
 // reference is supplied). Same output format as compute_depth_tsv_inmem.
