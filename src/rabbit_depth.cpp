@@ -1205,11 +1205,21 @@ std::string compute_depth_tsv_inmem(const StringVector &bamFilePaths,
         if (v > 0)
           sper = v;
       }
-      for (int bi : unindexed) {
+      // Shard-boundary discovery is per-BAM independent (each does fopen +
+      // ~sper find_next_bgzf_block seeks). With many BAMs this serial prep was
+      // the dominant fixed cost (e.g. 100 BAMs × ~15 boundary scans). Run it in
+      // parallel across BAMs into per-BAM shard lists, then concatenate in BAM
+      // order. Result is byte-identical: within a BAM the shard order (and thus
+      // its contiguous byte ranges) is preserved, and across BAMs the merge of
+      // per-shard partial sums is additive/commutative (order-independent).
+      std::vector<std::vector<B2Shard>> perBamB2(num_bams);
+      omp_set_num_threads(std::min(g_full_threads, (int)unindexed.size()));
+#pragma omp parallel for schedule(dynamic, 1)
+      for (int ui = 0; ui < (int)unindexed.size(); ui++) {
+        int bi = unindexed[ui];
         FILE *f = fopen(bamFilePaths[bi].c_str(), "rb");
         if (!f)
-          throw std::runtime_error("compute_depth_tsv_inmem: cannot open " +
-                                   bamFilePaths[bi]);
+          continue; // missing file surfaces later as a failed/empty BAM
         fseeko(f, 0, SEEK_END);
         uint64_t fsize = (uint64_t)ftello(f);
         const uint64_t hdrCoff = ufHdrVoff[bi] >> 16;
@@ -1222,12 +1232,19 @@ std::string compute_depth_tsv_inmem(const StringVector &bamFilePaths,
             bnd.push_back(c);
         }
         fclose(f);
+        std::vector<B2Shard> sv;
+        sv.reserve(bnd.size());
         for (size_t i = 0; i < bnd.size(); i++) {
-          uint64_t sv = (i == 0) ? ufHdrVoff[bi] : (bnd[i] << 16);
+          uint64_t svoff = (i == 0) ? ufHdrVoff[bi] : (bnd[i] << 16);
           uint64_t ec = (i + 1 < bnd.size()) ? bnd[i + 1] : fsize;
-          b2shards.push_back(B2Shard{bi, sv, ec, /*needResync=*/i != 0});
+          sv.push_back(B2Shard{bi, svoff, ec, /*needResync=*/i != 0});
         }
+        perBamB2[bi] = std::move(sv);
       }
+      omp_set_num_threads(g_full_threads);
+      for (int bi : unindexed)
+        for (auto &sh : perBamB2[bi])
+          b2shards.push_back(sh);
       fprintf(stderr,
               "[depth] %zu/%d BAM(s) without .bai: route B2 byte-range parallel "
               "scan (%zu shards, ~%d/BAM)\n",
