@@ -668,30 +668,44 @@ static Distance gen_fused_calib_graph(Graph &g, Distance coverage) {
   // pair that could pass the fused filter is ever dropped.
   const uint32_t ABD_S = (uint32_t)num_depth_samples;
   const float abd_corr_min_eps = (float)(abd_corr_min - 1e-4);
-  std::vector<float> abd_unit;
+  // The abd-first prune needs centered + L2-normalised rank vectors so that the
+  // depth correlation is a plain dot product.  The edge-weight stage already
+  // builds exactly this in the global g_depth_unit (identical layout and values;
+  // it is built before build_similarity_graph() is called and is not modified
+  // afterwards).  Reuse it to avoid a duplicate O(nobs·S) build pass and a second
+  // ~nobs·S float matrix; fall back to a local build only if it is unavailable.
+  std::vector<float> abd_unit;   // fallback storage only
+  const float *abd_u = nullptr;
+  bool abd_reused = false;
   if (abdfirst) {
-    abd_unit.assign((size_t)nobs * ABD_S, 0.0f);
+    if (!g_depth_unit.empty() && g_depth_unit.size() == (size_t)nobs * ABD_S) {
+      abd_u = g_depth_unit.data();
+      abd_reused = true;
+    } else {
+      abd_unit.assign((size_t)nobs * ABD_S, 0.0f);
 #pragma omp parallel for num_threads(numThreads) schedule(static)
-    for (size_t r = 0; r < nobs; ++r) {
-      double mean = 0.0;
-      for (uint32_t k = 0; k < ABD_S; ++k) mean += depth_matrix(r, k);
-      mean /= ABD_S;
-      double ss = 0.0;
-      for (uint32_t k = 0; k < ABD_S; ++k) {
-        double d = (double)depth_matrix(r, k) - mean; ss += d * d;
+      for (size_t r = 0; r < nobs; ++r) {
+        double mean = 0.0;
+        for (uint32_t k = 0; k < ABD_S; ++k) mean += depth_matrix(r, k);
+        mean /= ABD_S;
+        double ss = 0.0;
+        for (uint32_t k = 0; k < ABD_S; ++k) {
+          double d = (double)depth_matrix(r, k) - mean; ss += d * d;
+        }
+        if (ss > 0.0) {
+          const double inv = 1.0 / std::sqrt(ss);
+          float *u = abd_unit.data() + r * ABD_S;
+          for (uint32_t k = 0; k < ABD_S; ++k)
+            u[k] = (float)(((double)depth_matrix(r, k) - mean) * inv);
+        }
       }
-      if (ss > 0.0) {
-        const double inv = 1.0 / std::sqrt(ss);
-        float *u = abd_unit.data() + r * ABD_S;
-        for (uint32_t k = 0; k < ABD_S; ++k)
-          u[k] = (float)(((double)depth_matrix(r, k) - mean) * inv);
-      }
+      abd_u = abd_unit.data();
     }
     verbose_message("Abundance-first prune: skip pairs with depth corr < %.4f "
-                    "(g_w_comp=%.2f, min_edge=%.2f)\n",
-                    abd_corr_min, g_w_comp, (double)min_edge_weight);
+                    "(g_w_comp=%.2f, min_edge=%.2f)%s\n",
+                    abd_corr_min, g_w_comp, (double)min_edge_weight,
+                    abd_reused ? " [reused g_depth_unit]" : "");
   }
-  const float *abd_u = abd_unit.empty() ? nullptr : abd_unit.data();
 
   // ── Composition early-exit (exact) ───────────────────────────────────────
   // For the default PMH winners metric a pair can only become an edge if its

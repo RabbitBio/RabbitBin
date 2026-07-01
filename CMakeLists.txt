@@ -50,7 +50,10 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-set(CMAKE_C_STANDARD 17)
+# C11 (not C17): the only C source here is the vendored ssw.c, which needs no
+# C17 feature, and CMake 3.20 lacks the GNU C17 dialect-flag mapping (added in
+# 3.21) — forcing C17 breaks configure on the system toolchain.
+set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
 
