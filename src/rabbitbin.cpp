@@ -2998,7 +2998,7 @@ static int rb_cmd_bin(int ac, char *av[]) {
       ("min-contig,m", po::value<size_t>(&minContig)->default_value(2500), "Minimum contig length (>=1500)")
       ("min-small-contig", po::value<size_t>(&min_small_contig)->default_value(1000), "Min length for small-contig recruiting")
       ("max-posterior", po::value<Similarity>(&calib_connected_pct)->default_value(95), "Well-connected contig percent for calibration")
-      ("min-edge-score", po::value<Similarity>(&min_edge_weight)->default_value(66), "Minimum edge weight (1-99). Higher keeps only confident edges -> purer bins. Default 66 (validated across CAMI1-high and CAMI2 real-BAM: more >=200kb HQ MAGs and faster than the old 60)")
+      ("min-edge-score", po::value<Similarity>(&min_edge_weight)->default_value(70), "Minimum edge weight (1-99); higher keeps only confident edges -> purer bins. Default 70. For multi-sample data (S>=3) the LPA edge weight is the depth rank-correlation, so this is effectively a 'connect only if coverage correlation >= 0.70' cutoff; it sits on a flat 0.66-0.74 plateau (marine depth-only HQ 285/287/289 at 66/70/72).")
       ("gfa", po::value<std::string>(&g_gfa_file), "Assembly graph (GFA) whose L-links/P-paths are injected as high-weight same-genome edges")
       ("gfa-weight", po::value<double>(&g_gfa_weight)->default_value(0.90), "Edge weight assigned to GFA links (0,1)")
       ("confidence", po::value<bool>(&g_emit_confidence)->zero_tokens(), "Emit per-contig assignment confidence (members.tsv column + <prefix>.confidence.tsv soft assignment)")
