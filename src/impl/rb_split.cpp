@@ -264,8 +264,27 @@ static void abundance_guided_split(BinMap &cls) {
   struct BinResult { std::vector<ContigVector> emit; int kind = 1; };
   std::vector<BinResult> results(nbins);
 
+  // ── Largest-bin-first scheduling order (perf only, zero effect on output) ──
+  // split_bin's cost is dominated by uncapped KMeans over the bin's OWN contig
+  // count n (the "few hundred, microseconds" comment does not hold on datasets
+  // with LPA megaclusters — e.g. CAMI2 plant_associated has a 7838-contig bin
+  // vs marine's 993 max). Under schedule(dynamic,1) in bi-ascending order, a
+  // straggler megabin can end up starting late (after smaller bins are already
+  // drained), leaving 63 cores idle while one thread finishes it alone. Visiting
+  // bins largest-first lets that bin start at t=0 and run concurrently with the
+  // small-bin sweep, hiding most of its cost. `order` only changes ITERATION
+  // ORDER: `bi` (used for both `results[bi]` and the per-bin RNG seed below) is
+  // untouched, so every bin's KMeans/silhouette output is byte-identical to the
+  // bi-ascending schedule — this cannot change accuracy, only wall time.
+  std::vector<size_t> order(nbins);
+  for (size_t i = 0; i < nbins; ++i) order[i] = i;
+  std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+    return binList[a]->size() > binList[b]->size();
+  });
+
 #pragma omp parallel for schedule(dynamic, 1) num_threads(numThreads)
-  for (size_t bi = 0; bi < nbins; ++bi) {
+  for (size_t oi = 0; oi < nbins; ++oi) {
+    const size_t bi = order[oi];
     const ContigVector &contigs = *binList[bi];
     BinResult &res = results[bi];
 
@@ -349,8 +368,18 @@ static void abundance_guided_split(BinMap &cls) {
 
   std::vector<std::vector<ContigVector>> recov(captured.size());
   if (coh_gate) {
+    // Same largest-first scheduling fix as the main path above: `co` only
+    // reorders which `ci` a thread grabs next, `ci` itself (and thus the
+    // `captured[ci]` seed and `recov[ci]` output slot) is unchanged, so this
+    // cannot alter any bin's split/coherence result — perf only.
+    std::vector<size_t> co(captured.size());
+    for (size_t i = 0; i < captured.size(); ++i) co[i] = i;
+    std::sort(co.begin(), co.end(), [&](size_t a, size_t b) {
+      return binList[captured[a]]->size() > binList[captured[b]]->size();
+    });
 #pragma omp parallel for schedule(dynamic, 1) num_threads(numThreads)
-    for (size_t ci = 0; ci < captured.size(); ++ci) {
+    for (size_t oi = 0; oi < captured.size(); ++oi) {
+      const size_t ci = co[oi];
       const ContigVector &contigs = *binList[captured[ci]];
       std::vector<ContigVector> pieces, sub;
       if (split_bin(contigs, captured[ci], sub)) {
