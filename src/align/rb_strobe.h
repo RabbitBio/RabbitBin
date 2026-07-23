@@ -2,9 +2,8 @@
 #define RB_STROBE_H_
 
 // Bridge between RabbitBin and the vendored strobealign alignment engine
-// (src/align/strobe, MIT, Kristoffer Sahlin). strobealign is both much faster
-// and produces higher-quality binning than the legacy minimizer seed-and-extend
-// engine, so it is the preferred `rabbitbin map` backend.
+// (src/align/strobe, MIT, Kristoffer Sahlin). It is the preferred
+// `rabbitbin map` backend.
 //
 // The StrobeMapper owns the in-memory reference + strobemer index + SSW aligner
 // (built ONCE; reused across all samples -- a rabbitbin-specific win over

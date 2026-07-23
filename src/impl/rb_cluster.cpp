@@ -342,17 +342,14 @@ int cluster_by_propagation(Graph &g, std::vector<size_t> &membership,
   for (size_t e = 0; e < no_of_edges; ++e)
     logsscr[e] = (StoredDistance)LOG(1. - g.edgeScore[e]);
 
-  // ── Experimental parallel (Jacobi) label propagation ─────────────────────
+  // ── Optional parallel (Jacobi) label propagation ─────────────────────────
   // RABBIT_PAR_LPA=1 switches from the default order-dependent (Gauss-Seidel)
   // sweep to a synchronous one: every active node recomputes its best cluster
   // from the membership SNAPSHOT taken at the start of the round (read-only, so
   // the per-node work parallelises trivially), then all changes are committed
   // together in node_order.  Because neighbour updates are no longer visible
-  // mid-round, the converged labelling differs from the sequential baseline —
-  // hence this is opt-in and OFF by default.  MEASURED (CAMI2 plant, 64t): the
-  // LPA segment drops ~485ms→~288ms, but recovery falls 92→79 genomes and the
-  // binning fragments (149→184 bins), so it is NOT accuracy-neutral and must
-  // stay experimental.  Kept only for benchmarking the parallel ceiling.  The
+  // mid-round, the converged labelling differs from the sequential baseline,
+  // so this path is opt-in. The
   // commit is serial and in node_order, so a given thread count + flag is fully
   // deterministic, and the visited/blacklist oscillation guard + attempt-based
   // stop criterion are preserved verbatim.

@@ -3,7 +3,6 @@
 // ═══════════════════════════════════════════════════════════════════════════
 // build_similarity_graph  –  build edge list using KmerSketch Jaccard
 // ═══════════════════════════════════════════════════════════════════════════
-// All-pairs reference implementation (O(N^2) Jaccard), kept for A/B validation.
 // Reference all-pairs graph build (O(N^2) Jaccard); used when inverted index is off.
 static void build_graph_allpairs(Graph &g, Similarity cutoff) {
   ProgressTracker progress(nobs);
@@ -234,10 +233,10 @@ void build_similarity_graph(Graph &g, Similarity cutoff) {
   // the surviving candidates — never for all N^2 pairs.
   size_t minCommon = (size_t)std::floor((double)cutoff * Md * 0.7);
   if (minCommon < 1) minCommon = 1;
-  // Hybrid experiment: the cutoff-derived bound assumes the candidate metric IS
+  // The cutoff-derived bound assumes the candidate metric is
   // the OPH Jaccard, but in PMH mode the index is only a sparse k-mer prefilter
   // (candidate = shares >= minCommon exact OPH buckets) and the edge weight is
-  // the k=6 PMH winner-match.  Allow forcing minCommon to probe that regime.
+  // the PMH winner-match. An explicit minCommon override is available.
   if (const char *e = rb_getenv("RABBIT_MINCOMMON")) {
     long v = std::atol(e);
     if (v >= 1) minCommon = (size_t)v;
@@ -471,19 +470,12 @@ static void pmh_calib_maxsim(const std::vector<size_t>& sample,
   }
 }
 
-// ── Fusion D: fused calibration + graph build ─────────────────────────────
-// Replaces the two sequential O(N²) passes:
-//   • calibrate_sim_cutoff_fused : 25,000 × N = 771M pair-sims
-//   • build_graph_allpairs       : N²/2       = 475M pair-sims
-//
+// ── Fused calibration + graph build ───────────────────────────────────────
+// Replaces two sequential O(N²) passes with one tiled pass.
 // A single tiled N²/2 pass simultaneously:
 //   1. Accumulates per-contig top-maxEdges neighbor heaps (uncutoff).
 //   2. Accumulates maxsim[] for 10 × 2500 calibration samples.
 // Then calibrates (→ simCutoff) and emits edges from stored heaps.
-//
-// Pair-sim count: 475M vs 1,246M → ~2.6× reduction in the two heaviest phases.
-// Memory: N × maxEdges heaps ≈ 30841 × 200 × 12B ≈ 74 MB (negligible).
-//
 // Returns the calibrated simCutoff×10 and fills Graph g with edges.
 // ── Winner-banding LSH candidate generation (RABBIT_LSH=1) ─────────────────
 // The O(N²/2) all-pairs scan is compute-bound and scales out to the core count,
@@ -542,8 +534,8 @@ static Distance gen_fused_calib_graph(Graph &g, Distance coverage) {
   // never contends for the lock.  Correctness is re-verified inside the lock.
   // Compact 8-byte heap edge (uint32 neighbour id + float similarity) instead of
   // the global 16-byte Edge (size_t id).  Contig ids are < nobs < 2^32, so this
-  // halves the per-row neighbour-heap footprint (≈6.8GB→3.4GB at nobs=2.1M,
-  // maxEdges=200) on all inputs — no preallocation, so no waste on sparse data.
+  // halves the per-row neighbour-heap footprint without preallocating sparse
+  // rows.
   // CompareEdge32 reproduces CompareEdge's total order exactly (min-heap on sv;
   // equal-sv → larger id evicted first, so the smaller id is retained), keeping
   // the kept edge set and drain order bit-identical.
@@ -616,7 +608,7 @@ static Distance gen_fused_calib_graph(Graph &g, Distance coverage) {
   // TILE only affects blocking (never the result), so it is a safe speed knob.
   // The default sizes a tile-pair's two winner blocks for L2; larger tiles cut
   // the number of tile-pairs (fewer g_win_flat DRAM re-reads) at the cost of
-  // spilling block reuse to L3.  RABBIT_TILE overrides for experimentation.
+  // spilling block reuse to L3. RABBIT_TILE provides an explicit override.
   if (const char *e = getenv("RABBIT_TILE")) {
     long v = atol(e);
     if (v >= 10) TILE = (size_t)v;
@@ -633,7 +625,7 @@ static Distance gen_fused_calib_graph(Graph &g, Distance coverage) {
         tilepairs.emplace_back((uint32_t)ii, (uint32_t)jj);
   }
 
-  verbose_message("Fusion D (triangle): single-pass calib+graph nobs=%zu "
+  verbose_message("Fused graph (triangle): single-pass calib+graph nobs=%zu "
                   "SAMP=%zu×%zu TILE=%zu tilepairs=%zu\n",
                   nobs, NROUNDS, SAMP, TILE, tilepairs.size());
 
@@ -652,8 +644,7 @@ static Distance gen_fused_calib_graph(Graph &g, Distance coverage) {
   // Abundance-first prune is ON by default for multi-sample data (it is exact
   // w.r.t. the fused-edge filter and substantially improves multi-sample
   // binning by stopping high-composition / low-abundance pairs from starving
-  // the composition top-k).  RABBIT_NO_ABDFIRST=1 restores the old all-pairs
-  // composition pass for comparison.
+  // the composition top-k). RABBIT_NO_ABDFIRST=1 disables this pruning.
   const bool abdfirst = (getenv("RABBIT_NO_ABDFIRST") == nullptr) &&
                         num_depth_samples > 1 && g_w_comp < 1.0 &&
                         g_w_comp < min_edge_weight;
@@ -717,8 +708,8 @@ static Distance gen_fused_calib_graph(Graph &g, Distance coverage) {
   // can never be kept, so the remaining (g_pmh_m − EE_P) winner comparisons are
   // skipped.  This is exact w.r.t. heap contents.  Sample endpoints feed the
   // calibration maxsim[] and therefore always take the full compare, so the
-  // calibration (and hence simCutoff and every edge) is bit-identical.
-  // RABBIT_NO_COMP_EE=1 disables it for A/B comparison.
+  // calibration (and hence simCutoff and every edge) is unchanged.
+  // RABBIT_NO_COMP_EE=1 disables this optimization.
   const bool win16 = (g_win_bits == 16);
   const bool comp_ee = g_pmh_mode && !g_exact_cos_cmp && g_pmh_m >= 16 &&
                        (win16 ? !g_win16.empty() : !g_win_flat.empty()) &&

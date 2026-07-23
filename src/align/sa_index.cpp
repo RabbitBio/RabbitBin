@@ -31,12 +31,11 @@ bool SaIndex::build(const std::string &fasta, int k_, int w_, int threads) {
   }
 
   // Read the whole reference into memory, then parse + 2-bit encode in parallel.
-  // The previous version did a single-threaded char-by-char pass (~13s on a
-  // 4 Gbp reference). We split the raw bytes at LINE boundaries -- each chunk
+  // Split the raw bytes at line boundaries so each chunk
   // begins right after a '\n', where the FASTA header state is always reset, so
   // no record/line spans a split -- run the EXACT same state machine per chunk,
-  // then merge in file order. The resulting `seq` and `contigs` are byte-for-
-  // byte identical to the serial parse (verified end-to-end against the BAM).
+  // then merge in file order. The resulting `seq` and `contigs` preserve file
+  // order.
   seq.clear();
   contigs.clear();
   std::vector<char> raw;
