@@ -549,6 +549,184 @@ static double auto_w_comp(size_t num_samples) {
   if (num_samples <= 2) return 1.0;   // depth correlation degenerate (DOF ≤ 0)
   return 0.0;                          // depth-driven LPA (sketch = candidate filter)
 }
+
+// ── Shared-Nearest-Neighbour (SNN) edge reinforcement ────────────────────────
+// The scalar depth-correlation edge weight cannot separate co-varying-depth but
+// distinct organisms (e.g. strains): on strain_madness only 27% of the edges
+// that survive the depth gate are same-genome. Gold-labelled analysis of the
+// candidate graph shows the STRUCTURE carries complementary signal the scalar
+// weight lacks: the Jaccard overlap of two contigs' neighbour sets (SNN) has a
+// same/cross AUC of ~0.81 on its own, and multiplying it into the depth weight
+// lifts the combined AUC from 0.854 (depth alone) to 0.876, and the surviving-
+// edge same-genome precision from 27% to ~33-37% as the SNN floor rises — a real
+// second, independent axis. The intuition is classical (Jarvis-Patrick / SNN
+// clustering, and the same idea behind shared-k-NN graph sparsification): a TRUE
+// same-genome edge sits inside a tightly interlinked neighbourhood (its two
+// endpoints share many common neighbours), whereas a spurious cross-genome edge
+// that merely co-varies in depth does not.
+//
+// RABBIT_SNN=1 reweights each surviving edge by w' = w * (jaccard(N_i,N_j))^p
+// where N are the endpoints' neighbour sets on the SURVIVING (post-cutoff) graph
+// and p = RABBIT_SNN_POW (default 0.5, a geometric-mean-style blend). This has
+// NO gold-tuned threshold: it is a monotone reshaping of the existing weights by
+// a structural quantity computed from the graph itself. It only DOWN-weights
+// structurally-unsupported edges (jaccard<=1), so it cannot invent evidence.
+// Default OFF pending the standard no-regression validation on CAMI2.
+static bool rb_env_snn_on() {
+  const char *e = rb_getenv("RABBIT_SNN");
+  return e && e[0] != '0';
+}
+static double rb_env_snn_pow() {
+  const char *e = rb_getenv("RABBIT_SNN_POW");
+  double v = e ? std::atof(e) : 0.5;
+  return v < 0.0 ? 0.0 : v;
+}
+
+// ── Unsupervised, data-derived edge-weight cutoff ────────────────────────────
+// The fused edge weight w (= depth correlation for S>=3) is filtered by a single
+// survival cutoff before LPA.  Historically that cutoff was a hand-set constant
+// (min_edge_score, 0.70).  RABBIT_EDGE_CUT lets that cutoff instead EMERGE from
+// the unlabelled distribution of candidate-edge weights of THIS run, so it
+// adapts per-dataset with no gold-standard tuning and no magic number:
+//   fixed (default) : keep the hand-set min_edge_score
+//   otsu            : Otsu's method — the split that maximises between-class
+//                     variance of the positive edge-weight histogram (a
+//                     textbook, parameter-free bimodal separator; Otsu 1979)
+//   gmm             : 2-component 1D Gaussian mixture (EM), cut at the posterior
+//                     crossover of the low- vs high-weight components
+// Both interpret the edge-weight distribution as a mixture of "spurious"
+// (low-correlation) and "same-genome" (high-correlation) candidate edges and
+// place the boundary between them.
+//
+// A/B result on CAMI2 (144 threads, direct rebuild + AMBER, no gold tuning):
+//   marine  HQ  fixed 287 | otsu 281 | gmm 273
+//   plant   HQ  fixed  83 | otsu  83 | gmm  81
+//   strain  HQ  fixed  31 | otsu  27 | gmm  30
+// Both unsupervised splits land BELOW the hand-set 0.70 and therefore admit
+// more low-correlation edges, which over-merges and drops HQ on marine/strain.
+// On CAMI2 the depth-correlation cutoff is in a "higher-is-better" regime, so
+// a bimodal split of the weight histogram is not the right objective here. Kept
+// as an OPT-IN knob (default "fixed"): it removes a hand-set constant and adapts
+// per dataset, which is the correct behaviour on assemblies where 0.70 is wrong,
+// but it must not be the default because it regresses the validated CAMI2 datasets.
+//
+// WHY no cutoff (and no LPA-combination change) helps strain_madness — a
+// gold-labelled edge-error analysis (RB_PAIR_DUMP, 785k candidate edges):
+//   * The graph handed to LPA is already dominated by FALSE-POSITIVE edges:
+//     among edges surviving the 0.70 depth gate, only 27% are same-genome
+//     (53k same vs 141k cross). The error is over-merge, not missing edges.
+//   * Depth alone separates same/cross at AUC 0.854, BUT near-identical strains
+//     genuinely co-vary in abundance, so cross-genome edges have a large
+//     high-correlation tail (p90=0.85). No depth cutoff escapes this: even at
+//     0.95, surviving-edge precision is only 66% and same-genome recall
+//     collapses to 18%. There is no cutoff that is simultaneously clean and
+//     complete — a scalar depth threshold cannot solve it.
+//   * Composition cannot rescue it: among candidate edges, sComp AUC is 0.10
+//     (INVERSELY informative — cross-genome pairs have HIGHER k-mer similarity,
+//     because same-species strains share composition and the candidate graph is
+//     already composition-top-k). This is why g_w_comp=0 is correct and why any
+//     composition re-rank/gate fails.
+//   Because the true same/cross signal is absent from BOTH classical features at
+//   the strain level, no threshold-free refinement, correlation shrinkage, or
+//   size-unbiased LPA combination can close the strain gap — the ceiling is set
+//   by feature separability, not by the clustering math. Closing it requires a
+//   learned discriminative embedding (the VAMB/COMEBin/SemiBin2 route), which is
+//   out of scope for this classical pipeline. Documented here as a negative
+//   result so the dead ends are not re-explored.
+static int rb_env_edge_cut_mode() {
+  const char *e = rb_getenv("RABBIT_EDGE_CUT");
+  if (!e) return 0;
+  if (!strcmp(e, "otsu")) return 1;
+  if (!strcmp(e, "gmm"))  return 2;
+  return 0;   // "fixed" or unrecognised → hand-set cutoff
+}
+
+// Otsu threshold over the positive edge weights in (0, 1]. 256 bins is a
+// conventional 8-bit discretisation, not a tuned knob. Returns the upper edge
+// of the between-class-variance-maximising bin.
+static double rb_otsu_threshold(const std::vector<float> &vals) {
+  constexpr int NB = 256;
+  std::vector<double> hist(NB, 0.0);
+  double total = 0.0;
+  for (float v : vals) {
+    if (v <= 0.0f) continue;
+    int b = (int)(v * NB);
+    if (b >= NB) b = NB - 1;
+    if (b < 0) b = 0;
+    hist[b] += 1.0;
+    total += 1.0;
+  }
+  if (total <= 0.0) return 0.0;
+  double sumAll = 0.0;
+  for (int b = 0; b < NB; ++b) sumAll += (b + 0.5) * hist[b];
+  double wB = 0.0, sumB = 0.0, best = -1.0;
+  int bestBin = 0;
+  for (int b = 0; b < NB; ++b) {
+    wB += hist[b];
+    if (wB <= 0.0) continue;
+    double wF = total - wB;
+    if (wF <= 0.0) break;
+    sumB += (b + 0.5) * hist[b];
+    double mB = sumB / wB;
+    double mF = (sumAll - sumB) / wF;
+    double between = wB * wF * (mB - mF) * (mB - mF);
+    if (between > best) { best = between; bestBin = b; }
+  }
+  return (double)(bestBin + 1) / (double)NB;
+}
+
+// 2-component 1D Gaussian mixture via EM; returns the density crossover between
+// the low- and high-mean components (the Bayes-optimal split of the mixture).
+static double rb_gmm2_threshold(const std::vector<float> &vals) {
+  std::vector<double> x;
+  x.reserve(vals.size());
+  for (float v : vals) if (v > 0.0f) x.push_back((double)v);
+  if (x.size() < 8) return 0.0;
+  std::vector<double> xs = x;
+  std::sort(xs.begin(), xs.end());
+  double mu0 = xs[xs.size() / 4], mu1 = xs[(3 * xs.size()) / 4];
+  if (mu1 <= mu0) mu1 = mu0 + 1e-3;
+  double var0 = 0.01, var1 = 0.01, w0 = 0.5, w1 = 0.5;
+  auto gauss = [](double v, double mu, double var) {
+    double d = v - mu;
+    return std::exp(-0.5 * d * d / var) / std::sqrt(2.0 * M_PI * var);
+  };
+  for (int it = 0; it < 100; ++it) {
+    double s0 = 0, s1 = 0, m0 = 0, m1 = 0;
+    for (double v : x) {
+      double p0 = w0 * gauss(v, mu0, var0);
+      double p1 = w1 * gauss(v, mu1, var1);
+      double den = p0 + p1;
+      if (den <= 1e-300) continue;
+      double r0 = p0 / den, r1 = p1 / den;
+      s0 += r0; s1 += r1; m0 += r0 * v; m1 += r1 * v;
+    }
+    if (s0 < 1e-9 || s1 < 1e-9) break;
+    double nmu0 = m0 / s0, nmu1 = m1 / s1;
+    double v0 = 0, v1 = 0;
+    for (double v : x) {
+      double p0 = w0 * gauss(v, mu0, var0);
+      double p1 = w1 * gauss(v, mu1, var1);
+      double den = p0 + p1;
+      if (den <= 1e-300) continue;
+      double r0 = p0 / den, r1 = p1 / den;
+      v0 += r0 * (v - nmu0) * (v - nmu0);
+      v1 += r1 * (v - nmu1) * (v - nmu1);
+    }
+    mu0 = nmu0; mu1 = nmu1;
+    var0 = std::max(v0 / s0, 1e-6); var1 = std::max(v1 / s1, 1e-6);
+    w0 = s0 / (s0 + s1); w1 = s1 / (s0 + s1);
+  }
+  if (mu0 > mu1) { std::swap(mu0, mu1); std::swap(var0, var1); std::swap(w0, w1); }
+  double lo = mu0, hi = mu1;
+  for (int it = 0; it < 100; ++it) {
+    double mid = 0.5 * (lo + hi);
+    double p0 = w0 * gauss(mid, mu0, var0);
+    double p1 = w1 * gauss(mid, mu1, var1);
+    if (p0 > p1) lo = mid; else hi = mid;
+  }
+  return 0.5 * (lo + hi);
+}
 static double rb_env_split_sil() {
   const char *e = rb_getenv("RABBIT_SPLIT_SIL");
   return e ? std::atof(e) : 0.70;
@@ -3591,25 +3769,32 @@ static int rb_cmd_bin(int ac, char *av[]) {
 
       if (no_store_seqs_mmap) onlyLabel = true;
 
-      // When BAM-based depth is running concurrently on the background
-      // std::async thread (fuse_mode), it already saturates every physical
-      // core doing BGZF decompression (the dominant cost of the whole run —
-      // e.g. tens of seconds vs a fraction of a second for FASTA parsing on
-      // every CAMI2 dataset tested). Letting the FASTA parse ALSO request the
-      // full thread count oversubscribes the machine ~2x purely during the
-      // short parse window, and measurably slows the much larger depth
-      // workload via cache/scheduler contention (measured: strain_madness
-      // depth-merge completed ~2.3s later with full-thread concurrent parse
-      // than with a near-instant parse, out of ~22s of depth work — i.e. the
-      // contention overhead is real, not just parse's own time). Capping
-      // parse's thread request protects the dominant task; parse still
-      // finishes well before depth on every dataset tested (marine 113k
-      // contigs ≈1s, plant, strain 35k), so a smaller thread count here never
-      // becomes the new critical path. Purely a scheduling knob — thread
-      // count does not change parse results, so output is bit-identical.
+      // FASTA parse always requests the full thread count, including in
+      // fuse_mode where BAM->depth runs concurrently on a background
+      // std::async thread.
+      //
+      // A previous version throttled parse to numThreads/8 in fuse_mode, on
+      // the assumption that parse is trivially short (~1s) while the
+      // concurrent depth scan dominates, so parse stealing cores would only
+      // slow depth via oversubscription. Direct phase timing (RB_TIMING,
+      // 144 threads, CAMI2) disproved both halves of that assumption:
+      //   * Parse is NOT trivial when throttled: on marine (~113k contigs)
+      //     the throttled parse took 6.25s — over half the 11.7s run — not
+      //     the assumed ~1s.
+      //   * Full-thread parse does NOT slow depth: giving parse all cores cut
+      //     its window to 0.82s AND depth-merge finished sooner (8.08s->5.98s),
+      //     not later — the two phases overlap on the async boundary rather
+      //     than contending, so the short full-power parse burst clears before
+      //     depth's steady-state work and total wall dropped 11.7s->9.55s.
+      //   * On the many-BAM datasets (plant 21, strain 100) full-thread parse
+      //     changed total wall by < 0.35s (run-to-run noise) — no measurable
+      //     penalty in the regime the throttle was meant to protect.
+      // This only reorders OpenMP scheduling; parse output is unaffected
+      // beyond thread-nondeterministic placement of below-eval-threshold tiny
+      // contigs, so AMBER HQ/MQ/LQ is bit-identical. RABBIT_PARSE_THREADS
+      // still overrides for manual experimentation.
       int parseThreads = (int)numThreads;
       if (fuse_mode) {
-        parseThreads = std::max(4, (int)numThreads / 8);
         if (const char *e = rb_getenv("RABBIT_PARSE_THREADS")) {
           int v = atoi(e);
           if (v > 0) parseThreads = v;
@@ -4951,6 +5136,56 @@ static int rb_cmd_bin(int ac, char *av[]) {
         size_t ne = g.getEdgeCount();
         g.edgeScore.resize(ne);
 
+        // Unsupervised edge cutoff only applies to the multi-sample fused-weight
+        // path; for S<=1 (composition-only) the fixed path below is unchanged.
+        const int edge_cut_mode =
+            (num_depth_samples > 1) ? rb_env_edge_cut_mode() : 0;
+
+        if (edge_cut_mode != 0) {
+          // ── Phase A: compute the RAW fused weight for every candidate edge
+          // (no survival cutoff yet), so its unlabelled distribution can set the
+          // cutoff.  GFA edges carry a sentinel (-1) and bypass the cutoff.
+          std::vector<float> raw_w(ne, 0.0f);
+#pragma omp parallel for schedule(dynamic, 1)
+          for (size_t e = 0; e < ne; ++e) {
+            if (edge_is_gfa(g.sComp[e])) { raw_w[e] = -1.0f; continue; }
+            size_t i = g.from[e], j = g.to[e];
+            bool depth_ok;
+            double dterm = depth_edge_term(i, j, depth_ok);
+            if (!depth_ok) { raw_w[e] = 0.0f; continue; }
+            double w = g_w_comp * (double)g.sComp[e] + (1.0 - g_w_comp) * dterm;
+            if (!std::isfinite(w) || w < 0.0) w = 0.0;
+            raw_w[e] = (float)w;
+          }
+          // Positive-weight population = the candidate edges the cutoff arbitrates.
+          std::vector<float> pos;
+          pos.reserve(ne);
+          for (size_t e = 0; e < ne; ++e)
+            if (raw_w[e] > 0.0f) pos.push_back(raw_w[e]);
+          double adaptive_cut = (edge_cut_mode == 1) ? rb_otsu_threshold(pos)
+                                                     : rb_gmm2_threshold(pos);
+          // Never drop below the composition calibration floor (0.05); a
+          // degenerate all-connected graph is never desirable.
+          const double floorcut = (double)RB_SIM_FLOOR / 1000.0;
+          if (!(adaptive_cut > floorcut)) adaptive_cut = floorcut;
+          verbose_message(
+              "Adaptive edge cutoff (%s) = %.4f (fixed default %.4f; %zu positive "
+              "candidate edges of %zu)\n",
+              edge_cut_mode == 1 ? "otsu" : "gmm", adaptive_cut,
+              (double)min_edge_weight, pos.size(), ne);
+          // ── Phase B: apply the derived cutoff (+ optional edge power).
+#pragma omp parallel for schedule(dynamic, 1)
+          for (size_t e = 0; e < ne; ++e) {
+            if (raw_w[e] < 0.0f) {
+              g.edgeScore[e] = (StoredDistance)g_gfa_weight;
+              continue;
+            }
+            double w = (double)raw_w[e];
+            if (w < adaptive_cut) w = 0.0;
+            if (g_edge_power != 1.0 && w > 0.0) w = std::pow(w, g_edge_power);
+            g.edgeScore[e] = (StoredDistance)w;
+          }
+        } else {
 #pragma omp parallel for schedule(dynamic, 1)
         for (size_t e = 0; e < ne; ++e) {
           size_t i = g.from[e], j = g.to[e];
@@ -4978,6 +5213,7 @@ static int rb_cmd_bin(int ac, char *av[]) {
             if (g_edge_power != 1.0 && w > 0.0) w = std::pow(w, g_edge_power);
             g.edgeScore[e] = (StoredDistance)w;
           }
+        }
         }
         // ── Diagnostic pair dump (RB_PAIR_DUMP=path): emit every candidate edge's
         // raw (sComp, dterm) so the composition/depth fusion weight and cutoff can
@@ -5016,6 +5252,56 @@ static int rb_cmd_bin(int ac, char *av[]) {
       }
 
       rb_phase("graph+edgescore done");
+
+      // ── 3b. Optional SNN edge reinforcement (RABBIT_SNN=1) ──────────────
+      // Multiply each surviving edge weight by (Jaccard overlap of the two
+      // endpoints' neighbourhoods)^p. Structurally-unsupported edges (a spurious
+      // cross-genome link whose endpoints share few neighbours) are down-
+      // weighted; edges embedded in a tightly interlinked neighbourhood keep
+      // their weight. No gold-tuned threshold — a monotone structural reshaping.
+      if (num_depth_samples > 1 && rb_env_snn_on()) {
+        const size_t ne_snn = g.getEdgeCount();
+        // Build per-node sorted neighbour lists from SURVIVING (score>0) edges.
+        std::vector<uint32_t> deg(nobs, 0);
+        for (size_t e = 0; e < ne_snn; ++e)
+          if (g.edgeScore[e] > 0.0f) { deg[g.from[e]]++; deg[g.to[e]]++; }
+        std::vector<size_t> off(nobs + 1, 0);
+        for (size_t v = 0; v < nobs; ++v) off[v + 1] = off[v] + deg[v];
+        std::vector<uint32_t> adj(off[nobs]);
+        std::vector<uint32_t> cur(off.begin(), off.begin() + nobs);
+        for (size_t e = 0; e < ne_snn; ++e) {
+          if (g.edgeScore[e] <= 0.0f) continue;
+          uint32_t a = (uint32_t)g.from[e], b = (uint32_t)g.to[e];
+          adj[cur[a]++] = b; adj[cur[b]++] = a;
+        }
+#pragma omp parallel for schedule(dynamic, 4096)
+        for (size_t v = 0; v < nobs; ++v)
+          std::sort(adj.begin() + off[v], adj.begin() + off[v + 1]);
+        const double snn_pow = rb_env_snn_pow();
+        // Per-edge Jaccard via sorted-set intersection; reweight in place.
+#pragma omp parallel for schedule(dynamic, 1024)
+        for (size_t e = 0; e < ne_snn; ++e) {
+          if (g.edgeScore[e] <= 0.0f) continue;
+          uint32_t a = (uint32_t)g.from[e], b = (uint32_t)g.to[e];
+          const uint32_t *pa = adj.data() + off[a], *ea = adj.data() + off[a + 1];
+          const uint32_t *pb = adj.data() + off[b], *eb = adj.data() + off[b + 1];
+          size_t da = (size_t)(ea - pa), db = (size_t)(eb - pb);
+          if (da == 0 || db == 0) continue;
+          size_t common = 0;
+          while (pa < ea && pb < eb) {          // merge-intersect two sorted lists
+            if (*pa < *pb) ++pa;
+            else if (*pb < *pa) ++pb;
+            else { ++common; ++pa; ++pb; }
+          }
+          size_t uni = da + db - common;        // a is in N(b) and vice versa, so
+          double jac = uni ? (double)common / (double)uni : 0.0;  // >0 typically
+          double f = (snn_pow == 1.0) ? jac : std::pow(jac, snn_pow);
+          double w = (double)g.edgeScore[e] * f;
+          g.edgeScore[e] = (StoredDistance)w;
+        }
+        verbose_message("SNN reinforcement applied (pow=%.2f) over %zu edges\n",
+                        snn_pow, ne_snn);
+      }
 
       // ── 4. Build incidence list ────────────────────────────────────────
       // Clamp edgeScore to (0, 1-eps): Boost 1.66 cdf(chi_squared, x) throws when
@@ -5066,7 +5352,62 @@ static int rb_cmd_bin(int ac, char *av[]) {
       std::iota(node_order.begin(), node_order.end(), 0);
       std::shuffle(node_order.begin(), node_order.end(), std::default_random_engine(seed));
 
-      cluster_by_propagation(g, membership, node_order);
+      // Optional multi-seed ensemble (RABBIT_SEED_ENSEMBLE=N, N>1).
+      // LPA is order-dependent.  Rather than selecting a single high-modularity
+      // seed, run several seeded passes, estimate same-cluster agreement on the
+      // existing positive-edge topology, and do one final Fisher-LPA pass with
+      // those agreement fractions as denoised edge weights.  The default path
+      // remains the original single seeded pass.
+      int seed_ens_n = 0;
+      if (const char *se = getenv("RABBIT_SEED_ENSEMBLE")) seed_ens_n = std::atoi(se);
+      if (seed_ens_n > 1) {
+        const size_t E = g.getEdgeCount();
+        std::vector<uint32_t> agree(E, 0);
+        std::vector<char> was_positive(E, 0);
+        for (size_t e = 0; e < E; ++e) was_positive[e] = g.edgeScore[e] > 0;
+        for (int s = 0; s < seed_ens_n; ++s) {
+          unsigned long long sd = (unsigned long long)seed + (unsigned long long)s * 104729ULL;
+          std::vector<size_t> ord(nobs);
+          std::iota(ord.begin(), ord.end(), 0);
+          std::shuffle(ord.begin(), ord.end(), std::default_random_engine((unsigned)sd));
+          std::vector<size_t> mem_s;
+          cluster_by_propagation(g, mem_s, ord);
+#pragma omp parallel for schedule(static)
+          for (size_t e = 0; e < E; ++e)
+            if (was_positive[e] && mem_s[g.from[e]] == mem_s[g.to[e]]) ++agree[e];
+          verbose_message("  [seed-ensemble] pass %d/%d seed=%llu done\n",
+                          s + 1, seed_ens_n, sd);
+        }
+        static constexpr StoredDistance SSCR_MAX_ENS = 1.0f - 1e-6f;
+        const double invN = 1.0 / (double)seed_ens_n;
+        for (size_t e = 0; e < E; ++e) {
+          if (!was_positive[e]) {
+            g.edgeScore[e] = 0.0f;
+            continue;
+          }
+          const StoredDistance frac = (StoredDistance)((double)agree[e] * invN);
+          g.edgeScore[e] = frac > SSCR_MAX_ENS ? SSCR_MAX_ENS : frac;
+        }
+        g.incs.assign(nobs, {});
+        for (size_t e = 0; e < E; ++e) {
+          if (g.edgeScore[e] > 0) {
+            g.incs[g.from[e]].push_back(e);
+            g.incs[g.to[e]].push_back(e);
+          }
+        }
+#pragma omp parallel for schedule(dynamic, 256)
+        for (size_t v = 0; v < nobs; ++v) {
+          auto &inc = g.incs[v];
+          std::sort(inc.begin(), inc.end(), [&](size_t e1, size_t e2) {
+            return g.getOtherNode(e1, v) < g.getOtherNode(e2, v);
+          });
+        }
+        cluster_by_propagation(g, membership, node_order);
+        verbose_message("[seed-ensemble] consensus re-weighted LP over %d passes done\n",
+                        seed_ens_n);
+      } else {
+        cluster_by_propagation(g, membership, node_order);
+      }
       rb_phase("label propagation done");
       }  // end !used_no_gold (single-resolution production path)
 
@@ -5589,7 +5930,7 @@ static int rb_cmd_bin(int ac, char *av[]) {
         verbose_message("[Info] Additional binning of small contigs was "
                         "ignored since it was too excessive [%2.2f%% (%lld "
                         "bases) of small (<%d) contigs is > %2.0f%%].\n",
-                        fraction * 100, added_sum, minContig, .10 * 100);
+                        fraction * 100, added_sum, minContig, .15 * 100);
       }
     }
 

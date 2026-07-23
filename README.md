@@ -1,16 +1,15 @@
 # RabbitBin
 
-Fast, sketch-based metagenome binning. RabbitBin clusters assembly contigs into
-genome bins (MAGs) from a composition–abundance similarity graph, with optional
-abundance-guided bin splitting. It ships as a single binary with these commands:
+Fast, sketch-based metagenome binning. The default RabbitBin pipeline uses
+4-mer weighted ProbMinHash (PMH) sketches to construct a mutual-nearest-neighbour
+candidate graph, weights candidate edges by Spearman abundance correlation, and
+clusters the graph with Fisher label propagation.
 
 | Command | What it does |
 |---------|--------------|
 | `rabbitbin bin`   | Bin contigs into genomes (the main pipeline) |
 | `rabbitbin depth` | Turn sorted BAM(s) into a MetaBAT/JGI depth TSV |
 | `rabbitbin amber` | Fast, multithreaded AMBER-compatible binning evaluation |
-| `rabbitbin qc`    | Reference-free bin quality (SCG completeness/contamination) |
-| `rabbitbin refine`| DAS Tool-style SCG consensus over multiple binnings |
 
 `rabbitbin bin` is the default: a bare `rabbitbin -a contigs.fa -o out` still works.
 
@@ -20,7 +19,6 @@ abundance-guided bin splitting. It ships as a single binary with these commands:
 - **CMake** ≥ 3.5
 - **Boost** ≥ 1.66 (`program_options filesystem system graph serialization iostreams`)
 - **zlib** ≥ 1.2.11 and **HTSlib** ≥ 1.13 — auto-downloaded if not found on the system
-- *(optional, only for `qc` / `--auto`)* **Prodigal** and **HMMER** (`hmmsearch`) on `PATH` to build the SCG marker map
 
 ## Build
 
@@ -69,23 +67,7 @@ rabbitbin depth --bam-list bams.txt --out depth.tsv --threads 64
 rabbitbin depth --fasta contigs.fa --bam s1.bam s2.bam -o depth.tsv
 ```
 
-### 4. Fast re-binning with a cache
-
-Build the expensive feature graph once, then sweep cheap parameters in seconds.
-`--load-cache` skips FASTA parse / sketch / depth / graph build; only lightweight
-parameters (`--min-bin-size`, `--split-silhouette`, `--min-edge-score`, recruit…)
-take effect.
-
-```bash
-# Build once
-rabbitbin bin --fasta contigs.fa --depth depth.tsv --save-cache run.cache -o tmp
-
-# Re-bin instantly under different criteria
-rabbitbin bin --load-cache run.cache --min-bin-size 200000 -o out_200k
-rabbitbin bin --load-cache run.cache --split-silhouette 0.7 -o out_sil07
-```
-
-### 5. Evaluate against a gold standard (AMBER-compatible)
+### 4. Evaluate against a gold standard (AMBER-compatible)
 
 ```bash
 rabbitbin amber \
@@ -95,85 +77,22 @@ rabbitbin amber \
   --threads 64
 ```
 
-### 6. Reference-free bin quality (no gold standard needed)
+## Default algorithm
 
-Build the single-copy-gene (SCG) marker map once per assembly (Prodigal +
-hmmsearch; the expensive step), then score any binning in milliseconds:
+RabbitBin's default binning path contains five stages:
 
-```bash
-# once per assembly
-scripts/rabbitbin_markers.sh contigs.fa contigs.markers.tsv 64
-
-# score a binning (completeness / contamination, MIMAG HQ/MQ tiers)
-rabbitbin qc \
-  --members results/out.members.tsv \
-  --markers contigs.markers.tsv \
-  --marker-set-size 111 \
-  --output qc_per_bin.tsv
-```
-
-### 7. QC-guided auto parameter selection
-
-`--auto` builds the feature graph once, sweeps configs, and keeps the partition
-with the most near-complete bins (by SCG quality) — no ground truth needed.
-Pairs naturally with the cache:
-
-```bash
-rabbitbin bin --fasta contigs.fa --depth depth.tsv --save-cache run.cache -o tmp
-rabbitbin bin --load-cache run.cache --auto --markers contigs.markers.tsv -o out_auto
-```
-
-### 8. Consensus over several binners (fast DAS Tool)
-
-Fuse the bins from independent tools into a non-redundant, higher-quality set by
-iteratively keeping the best SCG-scored bins (completeness − contamination):
-
-```bash
-rabbitbin refine \
-  --markers contigs.markers.tsv \
-  --output consensus \
-  -i rabbitbin.members.tsv \
-  -i metabat2.binning \
-  -i maxbin2.binning
-# writes consensus.members.tsv + consensus.qc.tsv
-```
-
-On CAMI3 (RabbitBin + MetaBAT2) this lifts SCG high-quality MAGs from 120/136
-(inputs) to 154 (consensus) in ~0.04 s. Note `refine` optimises the SCG/CheckM
-metric (what you see without a gold standard), not gold-genome recovery.
-
-### 9. Production MAG run (quality-annotated, purified, labelled)
-
-```bash
-rabbitbin bin \
-  --fasta contigs.fa --depth depth.tsv -t 64 \
-  --markers contigs.markers.tsv \
-  --qc \                 # completeness/contamination columns in bins.tsv
-  --purify \             # drop SCG-duplicate depth-outlier contigs
-  --taxonomy contig2lineage.tsv \   # per-bin majority lineage (optional)
-  --bioboxes \           # also emit <prefix>.binning
-  --bin-fasta \
-  --output mags
-```
-
-### 10. Long-read and CRAM input
-
-```bash
-# Nanopore/PacBio BAMs (lower identity threshold)
-rabbitbin bin --fasta contigs.fa --bam ont1.bam ont2.bam --long-read -o out
-
-# CRAM input (needs the reference)
-rabbitbin bin --fasta contigs.fa --bam s1.cram --reference contigs.fa -o out
-rabbitbin depth --bam s1.cram --reference contigs.fa -o depth.tsv
-```
-
-### 11. Multiple resolutions from one graph
-
-```bash
-rabbitbin bin --fasta contigs.fa --depth depth.tsv \
-  --resolutions "strict:200000:0.80,relaxed:20000:0.60" -o out
-# writes out.strict.* and out.relaxed.*  (name:min-bin-bp:split-silhouette)
-```
+1. **4-mer PMH sketching.** Each contig is represented by a weighted
+   ProbMinHash sketch over canonical 4-mer counts.
+2. **500-register signatures.** Each PMH sketch contains 500 registers.
+3. **Mutual top-N candidate graph.** PMH similarity retrieves at most 200
+   neighbours per contig. An undirected candidate edge is retained only when
+   the neighbour relation is mutual.
+4. **Spearman edge weighting.** For multi-sample data, PMH is used only for
+   candidate generation. Surviving edges are weighted by the Spearman
+   correlation between contig abundance profiles.
+5. **Fisher label propagation.** Label propagation combines the evidence from
+   edges incident to each candidate label using Fisher's method and iterates
+   until the partition converges.
 
 ## Outputs (`bin`)
 
@@ -194,26 +113,12 @@ rabbitbin bin --fasta contigs.fa --depth depth.tsv \
 | `--bam` / `--bam-list` | — | Sorted BAM input (compute depth in-process) |
 | `-t, --threads` | 0 (all) | Worker threads |
 | `-m, --min-contig` | 2500 | Minimum contig length (≥1500) |
-| `-s, --min-bin-size` | 200000 | Minimum output bin size (bp) — *cheap, cache-friendly* |
-| `--min-edge-score` | 60 | Minimum graph edge weight (1–99) — *cheap, cache-friendly* |
-| `--split-silhouette` | env | Abundance-split silhouette threshold — *cheap, cache-friendly* |
-| `--no-split` | off | Disable abundance bin splitting |
-| `--no-recruit` | off | Disable small-contig recruiting |
-| `--sim-cutoff` | 0 (auto) | Composition similarity cutoff (×100) |
-| `--sketch-k` / `--sketch-m` | 8 / 500 | Sketch k-mer size / ProbMinHash registers |
+| `-s, --min-bin-size` | 200000 | Minimum output bin size (bp) |
+| `--min-edge-score` | 70 | Minimum Spearman edge weight (1–99) |
+| `--max-edges` | 200 | Maximum PMH neighbours per contig before mutual filtering |
+| `--sketch-m` | 500 | Number of ProbMinHash registers |
 | `--percent-identity` | 97 | Min read identity when reading BAMs |
-| `--save-cache` / `--load-cache` | — | Write / re-bin from a feature-graph cache |
-| `--markers` | — | Contig→marker map (from `rabbitbin_markers.sh`); enables `--auto`/`--autotune`/`--qc`/`--purify` |
-| `--auto` | off | Sweep α/edge-power, auto-select best by SCG quality |
-| `--autotune` | off | Self-tune α × edge-power × split-silhouette by SCG quality |
-| `--qc` | off | Annotate `bins.tsv` with completeness/contamination + MIMAG tier |
-| `--keep-hq-only` | off | Output only high-quality bins (comp>90, cont<5) |
-| `--purify` | off | Drop depth-outlier contigs carrying duplicated single-copy markers |
-| `--taxonomy` | — | Contig→lineage TSV; tag each bin with its majority lineage |
 | `--bioboxes` | off | Also write a CAMI bioboxes `<prefix>.binning` |
-| `--resolutions` | — | Emit several bin sets from one graph, e.g. `strict:200000:0.80,relaxed:20000:0.60` |
-| `--long-read` | off | Long-read (ONT/PacBio) coverage preset for `--bam` |
-| `--reference` | — | Reference FASTA for CRAM `--bam` input |
 | `--bin-fasta` | off | Also write per-bin FASTA files |
 | `--unbinned` | off | Write unbinned contigs to FASTA |
 
@@ -242,38 +147,6 @@ Run `rabbitbin <command> --help` for the full option list.
 | `-o, --output` | — | Per-bin metrics TSV (optional) |
 | `--min-length` | 0 | Ignore GS contigs shorter than this |
 | `-q, --quiet` | off | Print only the summary |
-
-## Key options (`qc`)
-
-| Option | Default | Meaning |
-|--------|---------|---------|
-| `-i, --binning` / `--members` | — | Binning to score (bioboxes/2-col, or members.tsv) |
-| `-k, --markers` | — | Contig→marker map from `rabbitbin_markers.sh` |
-| `--marker-set-size` | auto | Total markers G (auto: header comment or distinct seen) |
-| `-o, --output` | — | Per-bin completeness/contamination TSV |
-| `--hq-completeness` / `--hq-contamination` | 90 / 5 | MIMAG high-quality thresholds (%) |
-| `--mq-completeness` / `--mq-contamination` | 50 / 10 | MIMAG medium-quality thresholds (%) |
-
-## Key options (`refine`)
-
-| Option | Default | Meaning |
-|--------|---------|---------|
-| `-i, --binning` | — | Input binning(s); repeat for each tool (bioboxes/2-col/members) |
-| `-k, --markers` | — | Contig→marker map from `rabbitbin_markers.sh` |
-| `-o, --output` | — | Output prefix (`.members.tsv` + `.qc.tsv`) |
-| `--min-completeness` | 50 | Keep consensus bins with completeness ≥ this (%) |
-| `--max-contamination` | 10 | Keep consensus bins with contamination ≤ this (%) |
-| `--contamination-weight` | 5 | Ranking score = completeness − weight·contamination |
-| `--marker-set-size` | auto | Total markers G |
-
-## Environment variables (advanced tuning)
-
-- `RABBIT_PMH` — weighted ProbMinHash graph (default on)
-- `RABBIT_MUTUAL_KNN` — mutual k-NN graph (default on)
-- `RABBIT_GC_NORM` — GC normalization mode
-- `RABBIT_W_COMP` — composition vs. abundance edge weight
-- `RABBIT_NEG_DEPTH` — negative depth-correlation filter (default −0.3)
-- `RABBIT_SPLIT_SIL` — default silhouette split threshold
 
 ## Pipeline wrapper
 
