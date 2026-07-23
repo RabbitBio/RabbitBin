@@ -197,7 +197,7 @@ static int estimate_bin_strains(const ContigVector &cluster,
   return std::min(1 + kept, g_strain_max_k);
 }
 
-// ── Validation dump (env RABBIT_SNV_TRAJ_DUMP=path): per large-contig dominant
+// ── Diagnostic dump (env RABBIT_SNV_TRAJ_DUMP=path): per large-contig dominant
 // SNV allele-frequency trajectory across samples.  For each contig we build the
 // same per-site mean-centred unit trajectories as estimate_bin_strains, then
 // sign-fold them onto the contig's strongest direction and average -> one S-dim

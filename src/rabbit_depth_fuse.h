@@ -94,9 +94,8 @@ struct DepthMatrixOut {
   // collectPELink is requested.  Each entry is (compact_row_a, compact_row_b,
   // count) with a<b, summed over all BAMs.  compact_row_* indexes the same
   // dense contig order as names/lens/means above, so the caller maps a row to a
-  // contig by names[row].  A read pair with mates on two different kept contigs
-  // is a physical adjacency signal (insert-size scale) — empirically ~98% of
-  // such links are intra-genome, so it is a high-precision "same genome" gate.
+  // contig by names[row]. A read pair with mates on two different kept contigs
+  // provides a physical adjacency signal at insert-size scale.
   std::vector<std::tuple<int32_t, int32_t, uint32_t>> pe_links;
 };
 

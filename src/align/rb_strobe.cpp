@@ -57,9 +57,9 @@ struct StrobeMapper {
 };
 
 // Parallel FASTA loader: build strobealign's References from a (.gz ok) FASTA
-// using all cores. The single-threaded References::from_fasta does line-by-line
-// getline over millions of contigs (~20s on the 6.1M-contig CAMI3 reference);
-// here the file is read once, contig-start offsets located, and each contig
+// using all cores. The single-threaded References::from_fasta performs
+// line-by-line input over every contig; here the file is read once,
+// contig-start offsets are located, and each contig
 // parsed in parallel. Contig ORDER is preserved (ref_id == BAM tid == @SQ order),
 // and sequences are uppercased exactly as from_fasta does.
 static References build_references_parallel(const std::string &fasta,

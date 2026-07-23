@@ -264,13 +264,10 @@ static void abundance_guided_split(BinMap &cls) {
   struct BinResult { std::vector<ContigVector> emit; int kind = 1; };
   std::vector<BinResult> results(nbins);
 
-  // ── Largest-bin-first scheduling order (perf only, zero effect on output) ──
+  // ── Largest-bin-first scheduling order ────────────────────────────────────
   // split_bin's cost is dominated by uncapped KMeans over the bin's OWN contig
-  // count n (the "few hundred, microseconds" comment does not hold on datasets
-  // with LPA megaclusters — e.g. CAMI2 plant_associated has a 7838-contig bin
-  // vs marine's 993 max). Under schedule(dynamic,1) in bi-ascending order, a
-  // straggler megabin can end up starting late (after smaller bins are already
-  // drained), leaving 63 cores idle while one thread finishes it alone. Visiting
+  // count. Under schedule(dynamic,1), a straggler megabin can start after smaller
+  // bins are drained and leave other workers idle. Visiting
   // bins largest-first lets that bin start at t=0 and run concurrently with the
   // small-bin sweep, hiding most of its cost. `order` only changes ITERATION
   // ORDER: `bi` (used for both `results[bi]` and the per-bin RNG seed below) is
@@ -288,9 +285,7 @@ static void abundance_guided_split(BinMap &cls) {
     const ContigVector &contigs = *binList[bi];
     BinResult &res = results[bi];
 
-    // ── MAIN PATH — IDENTICAL to the historical behaviour for >=min_bin_bp ──
-    // bins.  This guarantees confidently-sized bins (the only ones that matter
-    // on CAMI1/2) are byte-for-byte unchanged, so recovery there cannot drop.
+    // Confidently sized bins follow the regular split path.
     if (bin_bp(contigs) < min_bin_bp) {
       // Historically dropped (contigs lost).  With the coherence gate, capture
       // them for an independent purification pass instead of discarding.
@@ -360,8 +355,7 @@ static void abundance_guided_split(BinMap &cls) {
   // Each captured <min_bin_bp bin is independently KMeans-split (separating any
   // co-binned small genomes), then each resulting piece (or the whole bin) is
   // kept iff it is internally at least as coherent as the bar.  Because these
-  // bins were going to be discarded, every retained piece is a pure addition —
-  // it cannot lower recovery on datasets where such bins are rare (CAMI1/2).
+  // bins were going to be discarded, every retained piece is additive.
   std::vector<size_t> captured;
   for (size_t bi = 0; bi < nbins; ++bi)
     if (results[bi].kind == 0) captured.push_back(bi);
@@ -499,9 +493,9 @@ static void abundance_guided_split(BinMap &cls) {
 // (coverage sub-clusters, or separate LPA communities).  Each fragment is then
 // individually < min_bin_bp, so the academic ">=200kb bin" protocol discards the
 // genome even though the UNION of its fragments is a high-quality MAG.  This pass
-// agglomerates such bins using PAIRED-END read linkage (mates aligned to two
-// different contigs) as the decisive same-genome signal — a physical, ~98%-
-// intra-genome adjacency from the same BAM, orthogonal to composition/abundance.
+// agglomerates such bins using paired-end read linkage (mates aligned to two
+// different contigs) as a physical same-genome signal orthogonal to
+// composition and abundance.
 // A cheap depth-centroid correlation is an additional abundance sanity check.
 // Safety: a merge requires PE evidence; never fuses two independent >=floor
 // cores; with fragment-only mode it cannot touch any >=floor bin at all.
@@ -516,9 +510,9 @@ static void consolidate_bins(BinMap &cls, size_t floor) {
   const size_t B = bp.size();
   if (B < 2) return;
 
-  // GAIN-ONLY guard: only sub-floor fragments may participate in a merge.  A bin
-  // that is already >= floor (a potential HQ MAG) is never touched, so the >=200kb
-  // recovery count is monotone — merging can only CREATE new >=floor bins by
+  // GAIN-ONLY guard: only sub-floor fragments may participate in a merge. A bin
+  // already above the floor is not modified, so size-filtered recovery is
+  // monotone: merging can only create new above-floor bins by
   // uniting a genome's scattered fragments, never break an existing good bin.
   auto bin_bp = [&](size_t b) -> size_t {
     size_t s = 0;
@@ -527,10 +521,9 @@ static void consolidate_bins(BinMap &cls, size_t floor) {
   };
   // Fragment-only mode (RABBIT_BIN_MERGE_FRAGONLY=1) forbids touching any
   // >=floor bin (strictly monotone, can only build new bins from fragments).
-  // Default OFF: with the paired-end gate (~98% precise) a fragment may also be
-  // merged INTO a >=floor core to COMPLETE it, which is where the real >=200kb HQ
-  // gain is; PE prevents the cross-genome contamination that sank the TNF+depth-
-  // only attempt.  A merge still requires at least one participant to be a
+  // When fragment-only mode is disabled, a fragment may also be merged into an
+  // above-floor core. Paired-end evidence protects against cross-genome merges.
+  // A merge still requires at least one participant to be a
   // fragment, so two independent >=floor cores are never fused.
   const bool frag_only = [] { const char *e = getenv("RABBIT_BIN_MERGE_FRAGONLY");
                               return e && e[0] != '0'; }();
@@ -603,11 +596,10 @@ static void consolidate_bins(BinMap &cls, size_t floor) {
     }
   }
 
-  // Cross-bin gate: the PHYSICAL paired-end linkage (pe_pair) is the decisive
-  // ~98%-precise same-genome signal; the depth-centroid correlation is only a
+  // Cross-bin gate: physical paired-end linkage is the decisive same-genome
+  // signal; depth-centroid correlation is an
   // cheap abundance sanity check (a covarying but distinct genome is still
-  // rejected by the absence of read-pair linkage).  No composition/TNF term:
-  // empirically it never changed the >=200kb HQ count once PE was required.
+  // rejected by the absence of read-pair linkage).
   double dbar = 0.50;
   if (const char *e = getenv("RABBIT_BIN_MERGE_DCORR")) dbar = atof(e);
 
@@ -715,8 +707,8 @@ static void decontaminate_bins(BinMap &cls, size_t floor) {
   // Only decontaminate a bin that is OTHERWISE tight: its members' mean depth-
   // correlation to the centroid is >= mu_min.  In such a bin a member sitting
   // below abs_thr is clearly foreign (the rest agree strongly).  A uniformly
-  // low-coverage bin (mean < mu_min, e.g. CAMI2 plant's fragmented genomes) is
-  // skipped entirely, so legitimate noisy contigs are never gutted.  This
+  // low-coverage bin (mean < mu_min) is skipped entirely, so legitimate noisy
+  // contigs are not removed. This
   // tightness gate (not a per-dataset threshold) is what keeps the rule general.
   double abs_thr = 0.80;   // a member below this corr is a removal candidate
   double mu_min  = 0.82;   // only clean bins whose mean member corr is >= this
@@ -809,8 +801,7 @@ static void decontaminate_bins(BinMap &cls, size_t floor) {
 // ═══════════════════════════════════════════════════════════════════════════
 // Composition+depth recruit — attach UNBINNED contigs to the core they belong to
 // ═══════════════════════════════════════════════════════════════════════════
-// ~38% of large contigs end up unbinned, and the missing mass of near-complete
-// MAGs is mostly such unbinned contigs.  For each unbinned large contig, attach
+// For each unbinned large contig, attach
 // it to the >=floor core it matches on BOTH tetranucleotide composition (cosine)
 // AND abundance (depth-corr to the core centroid) — a CONJUNCTIVE gate (rejects a
 // contaminant that matches only one signal) plus a margin over the 2nd-best core

@@ -87,8 +87,8 @@ static inline void numa_interleave_buffer(void *ptr, size_t bytes) {
 }
 
 // ── Sketch global parameters ────────────────────────────────────────────────
-static int      sketch_kmer_size  = 8;     // k-mer size for sketching (8 gives best coverage)
-static uint32_t sketch_size = 500;  // PMH registers (--sketch-m; CAMI-high default)
+static int      sketch_kmer_size  = 8;     // k-mer size for sketching
+static uint32_t sketch_size = 500;  // PMH registers (--sketch-m)
 static uint32_t sketch_bits        = 2;    // bits per OPH bucket (bit-planes)
 
 // ── Marker-guided bin splitting (Phase 2; --marker-seed <file>) ─────────────
@@ -104,112 +104,50 @@ static int         splitMinContigs  = 6;  // min contigs in a bin to consider
 // Splits internally multi-modal bins using only the multi-sample abundance
 // already computed (no gene prediction / HMM / seed file).  A bin is split
 // into k sub-clusters (k chosen by silhouette over k=2..splitMaxK) when the
-// best silhouette >= g_split_sil.  Recovers the marker-guided split accuracy
-// at zero extra cost (fits the ~4s binning budget).
+// best silhouette >= g_split_sil.
 static bool        g_split_abundance      = true;  // ON by default; --noAbdSplit disables
 static bool        g_no_split_abundance   = false; // --noAbdSplit
 static double      g_split_sil      = 0.70;  // silhouette threshold (RABBIT_SPLIT_SIL)
 static size_t      g_sil_sample_cap = 600;   // sample cap for O(n^2) silhouette
-// Content-conserving retention of sub-min_bin_bp bins (RABBIT_SPLIT_KEEP_COHERENT,
-// default ON).  The split phase used to DISCARD every bin below min_bin_bp, which
-// silently deletes recoverable genome content.  That is harmless on datasets whose
-// genomes are large (CAMI1/2: such bins are rare) but devastating on communities
-// with many fragmented / low-abundance genomes (CAMI3 toy: 5k+ bins, real genomes
-// contributing <200kb of >=2500bp contig).  Instead of an absolute-bp discard, keep
-// a small bin iff it is internally coherent — its mean intra-bin depth correlation
-// is at least the MEDIAN coherence of the confidently-sized (>=min_bin_bp) bins.
-// The bar is self-calibrated from the same run (no per-dataset constant), so the
-// rule is identical across CAMI1/2/3.  Big bins are untouched (rec is monotone in
-// added bins), so this cannot lower CAMI1/2 recovery.
+// Content-conserving retention of sub-min_bin_bp bins. A small bin is retained
+// only when its mean intra-bin depth correlation passes a data-derived coherence
+// bar estimated from confidently sized bins.
 static bool        g_split_keep_coherent = true;
 // Percentile of confident-bin coherences used as the retention bar (0..100).
 // A small bin is kept iff its coherence >= this percentile of the >=min_bin_bp
 // bins' coherences.  Lower = keep more partial-genome bins.  Default 10: "at
 // least as internally coherent as the bottom decile of confidently-sized bins".
 static double      g_split_coh_pct  = 10.0;
-// Conservative split guard (RABBIT_SPLIT_GUARD, default ON).  A large, internally
-// coherent bin is usually ONE near-complete genome.  The plain silhouette split
-// will happily cut it into two equally-coherent halves (silhouette only measures
-// separability, not whether the pieces are different GENOMES), dropping both
-// halves below the HQ completeness bar — a net loss of a near-complete MAG.  The
-// guard vetoes a proposed split of a >= g_split_guard_bp bin UNLESS the split
-// genuinely IMPROVES coherence: min(child_coh) >= parent_coh + g_split_guard_margin.
-// Separating two co-binned genomes makes the children tighter than the mixed
-// parent (passes); cutting one genome in half leaves children ~= parent (vetoed).
-// Data-agnostic: the bar is the bin's OWN coherence, not a per-dataset constant;
-// g_split_guard_bp is a genome-scale prior (bacterial genomes are Mb-scale).
-//
-// DEFAULT OFF.  Empirically (CAMI3 toy, 20 samples) the default abundance split
-// is already strongly net-beneficial (no-split 221 HQ → split 233 HQ), and this
-// guard HURTS (228 HQ): depth coherence cannot tell a beneficial STRAIN split
-// from a harmful genome halving — co-binned strains share near-identical depth
-// profiles, so the parent stays coherent and the (correct) strain split is
-// wrongly vetoed.  The "shattered large genomes" that motivated this were a
-// min-bin-size=42 artifact; in the default 200k config those genomes are already
-// recovered.  Kept as an opt-in knob (RABBIT_SPLIT_GUARD=1) for experimentation;
-// a useful version would need a COMPOSITION (k-mer) criterion, not depth.
+// Optional conservative split guard. A proposed split of a large coherent bin
+// is accepted only when the least-coherent child improves on the parent by the
+// requested margin.
 static bool        g_split_guard       = false;
 static size_t      g_split_guard_bp    = 1000000;  // only guard bins >= 1 Mb
 static double      g_split_guard_margin = 0.05;     // required coherence gain
-// Sub-floor fragment consolidation (RABBIT_CONSOLIDATE, default ON).  The
-// coherence-retention pass above keeps purified <min_bin_bp fragments as their
-// OWN tiny bins.  That maximises *unfiltered* genome recovery, but the academic
-// "drop bins <200kb" protocol then discards a near-complete genome whose tail
-// contigs ended up in such fragments — the >=200kb core stays stuck just below
-// 90% completeness.  Diagnosis (CAMI2 marine real BAM): 81% of the missing mass
-// of the near-complete-but-incomplete pure cores sits in exactly these mergeable
-// fragments.  So: before emitting a recovered fragment as its own bin, attach it
-// to the retained >=min_bin_bp core whose depth profile it matches best, iff the
-// mean cross-bin depth correlation is >= the self-calibrated coherence bar (the
-// SAME bar used for retention — no per-dataset constant).  A true distinct small
-// genome will not correlate with any large core's coverage, so it is still kept
-// separate; only same-genome tails are merged.  Purity-safe (high-corr gate),
-// recovery-monotone for the >=200kb metric, and near-free (centroid match reuses
-// the precomputed unit-rank vectors).  DEFAULT OFF: with depth-only matching the
-// merge is at best neutral on the >=200kb HQ count (it cannot uniquely identify a
-// genome's own tail among covarying genomes), so it is kept as an opt-in knob.
+// Optional sub-floor fragment consolidation. A retained fragment may be attached
+// to the best-matching confidently sized core when their cross-bin depth
+// correlation passes the same data-derived coherence bar used for retention.
 static bool        g_split_consolidate     = false;
 // Extra correlation margin required ABOVE the retention bar before a fragment is
 // merged into a core (RABBIT_CONSOLIDATE_DELTA).  0 = merge at the bar.
 static double      g_split_consolidate_delta = 0.0;
-// ── Composition+depth bin merge (RABBIT_BIN_MERGE, default ON) ─────────────
-// Label propagation / abundance split can fragment ONE genome into several pure
-// bins (a genome shattered into coverage sub-clusters or LPA communities).  Under
-// the academic "drop bins <200kb" protocol each fragment is then individually too
-// small, so the genome is lost even though its UNION would be a >=90%-complete,
-// >=95%-pure, >=200kb MAG.  This pass agglomerates bins that are the SAME genome,
-// gated by BOTH (a) high depth-centroid correlation AND (b) high k-mer (sketch)
-// Jaccard.  The composition term is the discriminator a depth-only merge lacks:
-// distinct genomes that merely covary across samples pass the depth gate but FAIL
-// the composition gate, so they are not merged.  Both bars are self-calibrated
-// percentiles of the per-bin internal coherence (no per-dataset constant), so the
-// rule is identical across datasets.  Bin-level aggregation denoises both signals
-// relative to the per-contig graph, which is why this recovers genomes the
-// first-pass clustering scattered.  Purity-safe (joint gate) and bounded.
-// DEFAULT ON (BAM path): the paired-end gate makes the fragment merge safe and
-// net-positive (marine 253->254); needs PE linkage so it is a no-op on the
-// --depth path.  Disable with RABBIT_BIN_MERGE=0.
+// ── Paired-end-supported bin merge ─────────────────────────────────────────
+// Agglomerates compatible fragments using paired-end linkage as the decisive
+// physical signal and depth-centroid agreement as a consistency check.
 static bool        g_bin_merge        = true;
-// Marker-free decontamination (RABBIT_BIN_DECONTAM, default OFF): drop a contig
+// Marker-free decontamination: drop a contig
 // from a >=floor bin when it is a depth-abundance outlier vs the bin centroid AND
 // has NO paired-end link to any other bin member.  PE is a PROTECT signal (a
 // physical link proves co-membership, so the contig is never removed), so this
 // only sheds contigs that look foreign by BOTH abundance and physical linkage —
-// raising purity (pushing complete-but-impure bins over 95%) without touching the
-// main genome's completeness.  Only tight (high-coherence) bins are cleaned, so
-// uniformly low-coverage bins are never gutted.  DEFAULT ON (BAM path): marine
-// 253->260, plant/strain neutral; needs PE so it is a no-op on --depth.  Disable
-// with RABBIT_BIN_DECONTAM=0.  Subtraction-only (never enlarges a bin).
+// raising purity without touching physically supported members. Only coherent
+// bins are cleaned; the operation is subtraction-only.
 static bool        g_bin_decontam     = true;
-// Composition+depth recruit of UNBINNED contigs into cores (RABBIT_BIN_RECRUIT,
-// default ON, BAM path): ~38% of large contigs end up unbinned, and the missing
-// mass of near-complete cores is mostly such unbinned contigs.  For each unbinned
-// large contig, attach it to the >=floor core it matches on BOTH tetranucleotide
+// Composition+depth recruitment of unbinned contigs into cores. For each
+// unbinned large contig, attach it to the core it matches on both tetranucleotide
 // composition (cosine) AND abundance (depth-corr) — a conjunctive gate (a
 // contaminant that matches on only one signal is rejected) with an unambiguity
-// margin over the 2nd-best core.  Completes pure-but-incomplete MAGs.  Needs TNF
-// (re-derived from the resident sequences) — only when this is on.  Disable with
-// RABBIT_BIN_RECRUIT=0.
+// margin over the second-best core.
 static bool        g_bin_recruit      = true;
 // Raw per-sample mean depths of small contigs, snapshotted BEFORE small_depth_matrix is
 // rank-transformed in place during recruitment, so marker_guided_split sees the
@@ -226,16 +164,12 @@ static std::vector<float> g_large_means;  // nobs  × num_depth_samples (means, 
 // rank-transformed in place; required by the wjac path.  g_depth_colnorm[i] =
 // per-sample scaling (1/mean_i) so unequal library sizes don't dominate the
 // weighted Jaccard (RABBIT_DEPTH_WJAC_NORM=1, default ON).
-// Default = fuse: min(corr, wjac) conjunctive depth weight.  Universally >= corr
-// on real benchmarks (CAMI-high +10~16, human_gut +22~28, marine/plant/
-// strain_madness tie) at no measurable runtime cost.  Set RABBIT_DEPTH_SIM=corr
-// to restore the legacy Spearman-only metric.
+// Default = fuse: min(corr, wjac) conjunctive depth weight.
 static int                g_depth_sim       = 2;   // 0=corr, 1=wjac, 2=fuse
 // Fusion combiner (RABBIT_DEPTH_FUSE): how the pattern term (max(corr,0)) and the
 // magnitude term (wjac) are combined into one depth weight. All are conjunctive
 // ("edge supported only if BOTH shape and magnitude agree"), a dataset-agnostic
-// principle: 1=min(c,w) [default, most universal], 0=geomean sqrt(c·w), 2=product.
-// min is the most robust empirically: >= corr on every real benchmark tested.
+// principle: 1=min(c,w), 0=geomean sqrt(c·w), 2=product.
 static int                g_depth_fuse      = 1;
 static bool               g_depth_wjac_norm = true;
 // Dissimilarity hard-cut for the wjac path (RABBIT_DEPTH_WJAC_CUT, default 0=off):
@@ -323,7 +257,7 @@ static inline uint16_t fold_win16(uint32_t w) {
 // nearly the same k-mer universe, so unrelated contigs already collide on a
 // large fraction b0 of registers (the "globally common" winners).  This packs
 // every real composition difference into the narrow band [b0, 1], crushing the
-// dynamic range that label propagation needs.  We estimate b0 empirically (the
+// dynamic range that label propagation needs.  We estimate b0 from the
 // median winner-match over random — i.e. mostly unrelated — pairs) and rescale
 //   s' = (s - b0) / (1 - b0)
 // so the unrelated mode maps to ~0 and identical composition to ~1.
@@ -339,7 +273,7 @@ static double g_inv_one_minus_b0 = 1.0;   // 1.0 / (1.0 - g_pmh_baseline)
 //   w = alpha*sComp + (1-alpha)*corr     (alpha = RABBIT_W_COMP, default 0.5)
 static double g_w_comp = 0.5;
 
-// Graph precision (CAMI-high tuned defaults; override via env):
+// Graph precision controls:
 //   RABBIT_MUTUAL_KNN     default on (RABBIT_MUTUAL_KNN=0 disables)
 //   RABBIT_NEG_DEPTH      default -0.3 (set <-0.99 to disable depth gate)
 //   RABBIT_EDGE_POWER=<p> raise composite edge weight to power p before LPA
@@ -420,12 +354,12 @@ static int    g_strain_max_k     = 4;    // --strain-max-k (cap on reported stra
 static std::vector<std::vector<SnvSite>> g_snv_sites;
 
 // ── SNV-aware edge signal (strain fingerprint recovery) ─────────────────────
-// For near-identical strains, BWA scatters the 91% MAPQ=0 reads arbitrarily, so
+// For near-identical strains, low-MAPQ reads can be scattered across strains, so
 // the per-contig COVERAGE fingerprint (what the abundance graph normally uses)
 // collapses — different strains end up with similar depth and get merged (purity
 // crashes).  The strain signal survives in the SNVs each read carries: a
-// contig's per-sample allele-frequency TRAJECTORY is a strain fingerprint
-// (validated: same-genome |cos|≈0.25 vs cross-genome ≈0.03, ~7×).  g_snv_traj
+// contig's per-sample allele-frequency trajectory is a strain fingerprint.
+// g_snv_traj
 // holds each large contig's L2-normalised S-dim trajectory (zeros if none); the
 // depth edge term consults it to GATE edges whose trajectories strongly disagree
 // (different strains) and reward agreement.  Opt-in via RABBIT_SNV_EDGE (default
@@ -491,7 +425,7 @@ static std::string g_add_depth_file;   // --add-depth PATH ("" = disabled)
 static int    g_gc_norm     = 1;    // RABBIT_GC_NORM: 0=off, 1=per-base, 2=dinucleotide
 static double g_gc_norm_cap = 20.0;
 
-// Env helpers: CAMI-high best (C_w050_mut). Unset = default; *=0 disables when noted.
+// Environment-variable helpers.
 static const char *rb_getenv(const char *key) {
   const char *e = getenv(key);
   return (e && e[0]) ? e : nullptr;
@@ -526,52 +460,27 @@ static double rb_env_w_comp() {
 // RabbitBin's edge model is TWO-STAGE:
 //   • composition (PMH sketch)  = candidate generation (top-k recall)
 //   • depth (coverage corr)     = LPA edge weight (discrimination / precision)
-// Pair statistics on CAMI2 (conditioned on being a composition top-k neighbour)
-// show sComp is non-discriminative there (AUC≈0.40) while depth is dominant once
-// it can be estimated.  The fusion is therefore WINNER-TAKE-ALL by channel
-// discriminability, and the deciding factor is a statistical DOF argument, not a
-// tuned curve:
+// The channel choice follows the statistical degrees of freedom of correlation:
 //   depth = Spearman/Pearson correlation over `num_samples` coverage columns.
 //   A correlation coefficient with n≤2 paired observations is deterministically
 //   ±1 (degrees of freedom = n−2 ≤ 0) — it carries ZERO information.  It becomes
-//   non-degenerate, and empirically dominant, at n≥3.
+//   non-degenerate at n≥3.
 // Hence:
 //   S ≤ 2 : g_w_comp = 1.0  (composition-only; depth correlation is degenerate)
 //   S ≥ 3 : g_w_comp = 0.0  (depth-driven LPA; sketch = candidate filter only)
-// Validation (marine coverage sub-sampled to S columns — end-to-end HQ MAGs and
-// gold-labelled pair AUC agree exactly):
-//   S=2: composition 115 vs depth 95  (a*_gold=1) → composition wins
-//   S=4: composition 137 vs depth 159 (a*_gold=0) → depth wins
-//   S=6: composition 128 vs depth 184 (a*_gold=0) → depth wins
-//   S≥10 (full): depth lifts marine 270→~289, plant 81→83.
-// The n≤2 boundary is derived from correlation DOF, not from staring at HQ curves.
 static double auto_w_comp(size_t num_samples) {
   if (num_samples <= 2) return 1.0;   // depth correlation degenerate (DOF ≤ 0)
   return 0.0;                          // depth-driven LPA (sketch = candidate filter)
 }
 
 // ── Shared-Nearest-Neighbour (SNN) edge reinforcement ────────────────────────
-// The scalar depth-correlation edge weight cannot separate co-varying-depth but
-// distinct organisms (e.g. strains): on strain_madness only 27% of the edges
-// that survive the depth gate are same-genome. Gold-labelled analysis of the
-// candidate graph shows the STRUCTURE carries complementary signal the scalar
-// weight lacks: the Jaccard overlap of two contigs' neighbour sets (SNN) has a
-// same/cross AUC of ~0.81 on its own, and multiplying it into the depth weight
-// lifts the combined AUC from 0.854 (depth alone) to 0.876, and the surviving-
-// edge same-genome precision from 27% to ~33-37% as the SNN floor rises — a real
-// second, independent axis. The intuition is classical (Jarvis-Patrick / SNN
-// clustering, and the same idea behind shared-k-NN graph sparsification): a TRUE
-// same-genome edge sits inside a tightly interlinked neighbourhood (its two
-// endpoints share many common neighbours), whereas a spurious cross-genome edge
-// that merely co-varies in depth does not.
-//
+// Shared-nearest-neighbour reinforcement uses local graph structure as an
+// independent support signal for an edge.
 // RABBIT_SNN=1 reweights each surviving edge by w' = w * (jaccard(N_i,N_j))^p
 // where N are the endpoints' neighbour sets on the SURVIVING (post-cutoff) graph
 // and p = RABBIT_SNN_POW (default 0.5, a geometric-mean-style blend). This has
-// NO gold-tuned threshold: it is a monotone reshaping of the existing weights by
-// a structural quantity computed from the graph itself. It only DOWN-weights
-// structurally-unsupported edges (jaccard<=1), so it cannot invent evidence.
-// Default OFF pending the standard no-regression validation on CAMI2.
+// It is a monotone reshaping of existing weights by a quantity computed from the
+// graph itself and only down-weights structurally unsupported edges.
 static bool rb_env_snn_on() {
   const char *e = rb_getenv("RABBIT_SNN");
   return e && e[0] != '0';
@@ -582,57 +491,17 @@ static double rb_env_snn_pow() {
   return v < 0.0 ? 0.0 : v;
 }
 
-// ── Unsupervised, data-derived edge-weight cutoff ────────────────────────────
-// The fused edge weight w (= depth correlation for S>=3) is filtered by a single
-// survival cutoff before LPA.  Historically that cutoff was a hand-set constant
-// (min_edge_score, 0.70).  RABBIT_EDGE_CUT lets that cutoff instead EMERGE from
-// the unlabelled distribution of candidate-edge weights of THIS run, so it
-// adapts per-dataset with no gold-standard tuning and no magic number:
-//   fixed (default) : keep the hand-set min_edge_score
+// ── Optional data-derived edge-weight cutoff ────────────────────────────────
+// RABBIT_EDGE_CUT can derive a cutoff from the unlabelled candidate-edge weight
+// distribution:
+//   fixed (default) : use min_edge_score
 //   otsu            : Otsu's method — the split that maximises between-class
 //                     variance of the positive edge-weight histogram (a
 //                     textbook, parameter-free bimodal separator; Otsu 1979)
 //   gmm             : 2-component 1D Gaussian mixture (EM), cut at the posterior
 //                     crossover of the low- vs high-weight components
-// Both interpret the edge-weight distribution as a mixture of "spurious"
-// (low-correlation) and "same-genome" (high-correlation) candidate edges and
-// place the boundary between them.
-//
-// A/B result on CAMI2 (144 threads, direct rebuild + AMBER, no gold tuning):
-//   marine  HQ  fixed 287 | otsu 281 | gmm 273
-//   plant   HQ  fixed  83 | otsu  83 | gmm  81
-//   strain  HQ  fixed  31 | otsu  27 | gmm  30
-// Both unsupervised splits land BELOW the hand-set 0.70 and therefore admit
-// more low-correlation edges, which over-merges and drops HQ on marine/strain.
-// On CAMI2 the depth-correlation cutoff is in a "higher-is-better" regime, so
-// a bimodal split of the weight histogram is not the right objective here. Kept
-// as an OPT-IN knob (default "fixed"): it removes a hand-set constant and adapts
-// per dataset, which is the correct behaviour on assemblies where 0.70 is wrong,
-// but it must not be the default because it regresses the validated CAMI2 datasets.
-//
-// WHY no cutoff (and no LPA-combination change) helps strain_madness — a
-// gold-labelled edge-error analysis (RB_PAIR_DUMP, 785k candidate edges):
-//   * The graph handed to LPA is already dominated by FALSE-POSITIVE edges:
-//     among edges surviving the 0.70 depth gate, only 27% are same-genome
-//     (53k same vs 141k cross). The error is over-merge, not missing edges.
-//   * Depth alone separates same/cross at AUC 0.854, BUT near-identical strains
-//     genuinely co-vary in abundance, so cross-genome edges have a large
-//     high-correlation tail (p90=0.85). No depth cutoff escapes this: even at
-//     0.95, surviving-edge precision is only 66% and same-genome recall
-//     collapses to 18%. There is no cutoff that is simultaneously clean and
-//     complete — a scalar depth threshold cannot solve it.
-//   * Composition cannot rescue it: among candidate edges, sComp AUC is 0.10
-//     (INVERSELY informative — cross-genome pairs have HIGHER k-mer similarity,
-//     because same-species strains share composition and the candidate graph is
-//     already composition-top-k). This is why g_w_comp=0 is correct and why any
-//     composition re-rank/gate fails.
-//   Because the true same/cross signal is absent from BOTH classical features at
-//   the strain level, no threshold-free refinement, correlation shrinkage, or
-//   size-unbiased LPA combination can close the strain gap — the ceiling is set
-//   by feature separability, not by the clustering math. Closing it requires a
-//   learned discriminative embedding (the VAMB/COMEBin/SemiBin2 route), which is
-//   out of scope for this classical pipeline. Documented here as a negative
-//   result so the dead ends are not re-explored.
+// Both methods model low- and high-weight modes and place the boundary between
+// them. They remain opt-in; the fixed mode preserves the command-line cutoff.
 static int rb_env_edge_cut_mode() {
   const char *e = rb_getenv("RABBIT_EDGE_CUT");
   if (!e) return 0;
@@ -642,7 +511,7 @@ static int rb_env_edge_cut_mode() {
 }
 
 // Otsu threshold over the positive edge weights in (0, 1]. 256 bins is a
-// conventional 8-bit discretisation, not a tuned knob. Returns the upper edge
+// conventional 8-bit discretisation. Returns the upper edge
 // of the between-class-variance-maximising bin.
 static double rb_otsu_threshold(const std::vector<float> &vals) {
   constexpr int NB = 256;
@@ -849,7 +718,7 @@ static inline double depth_corr_fast(size_t i, size_t j) {
   // Two float FMA accumulators (16 lanes each) for ILP, then one horizontal
   // reduce — same pattern as k4_cosine_sim.  Unit rows are L2-normalised so the
   // dot lies in [-1,1]; float accumulation error (~S·1e-7) is far below the
-  // edge-weight granularity.  S < 16 (e.g. CAMI-high, S=5) skips this entirely
+  // edge-weight granularity.  S < 16 skips this entirely
   // and uses the scalar double tail below, unchanged.
   __m512 acc0 = _mm512_setzero_ps(), acc1 = _mm512_setzero_ps();
   for (; k + 32 <= S; k += 32) {
@@ -1036,8 +905,8 @@ static inline void rb_fill_tnf(const char *s, size_t L, float *out) {
                  for (int i = 0; i < 256; ++i) out[i] *= inv; }
 }
 
-// Paired-end cross-contig linkage captured during the BAM depth scan, used as the
-// decisive (~98% intra-genome) "same organism" gate for the bin merge.  Stored
+// Paired-end cross-contig linkage captured during the BAM depth scan, used as a
+// high-precision physical gate for bin merging. Stored
 // first in compact depth-row space (g_pe_links_compact, with g_pe_names mapping a
 // compact row -> contig name), then converted to binning contig indices inside
 // consolidate_bins (where contig_names is available).
@@ -1184,9 +1053,7 @@ static inline void rb_phase(const char *label) {
 }
 
 // Env-gated sequence-integrity self-check: order-independent 64-bit hash over
-// every (contig name + stored sequence bytes).  Used to PROVE that a change to
-// the sequence-storage path keeps the loaded bytes identical (the partition is
-// a deterministic function of these bytes).  Prints to stderr when RB_SEQHASH.
+// every contig name and stored sequence. Prints to stderr when RB_SEQHASH is set.
 static inline void rb_seq_integrity_check(const char *label) {
   if (getenv("RB_SEQHASH") == nullptr) return;
   auto fnv = [](const char *p, size_t n, uint64_t h) {
@@ -2032,7 +1899,7 @@ static bool parse_fasta_mmap_parallel(
     // the arena and the mmap pages are never touched again, so we MADV_DONTNEED
     // the consumed range as we advance.  This collapses the parse-phase peak RSS
     // from "full mmap + arenas" to roughly "arenas only" on multi-line FASTAs
-    // (the CAMI gold-standard assemblies).  Release is disabled the moment a
+    // on multi-line assemblies. Release is disabled the moment a
     // single-line record retains a zero-copy mmap view (its pages must survive);
     // page-aligned bounds keep the boundary pages shared with neighbour threads
     // intact.  No-op for single-line assemblies (which keep using mmap views and
@@ -2078,9 +1945,8 @@ static bool parse_fasta_mmap_parallel(
       // (it includes newlines which only reduce the count after removal).
       // If even the raw byte span is below min_small_contig, the record is
       // definitely tiny — skip the inner_nl scan, multi-line copy, and name
-      // materialisation entirely.  On assemblies like CAMI2 plant (3.13M tiny
-      // contigs out of 3.44M total), this saves the dominant memchr + arena
-      // append + resize-undo for 91% of records.
+      // materialisation entirely, avoiding work for assemblies dominated by
+      // short records.
       if (!collect_tiny_arg &&
           (size_t)(seq_end - seq_region) < (size_t)min_small_contig_arg) {
         p = seq_end;
@@ -2383,12 +2249,8 @@ struct RbGzReader {
 };
 
 // ─── Streaming parallel gzip FASTA reader (large .gz) ────────────────────────
-// For .gz assemblies too large for the one-shot libdeflate path (default
-// > RABBIT_LIBDEFLATE_MAXGB compressed), the historical fallback was a single
-// threaded kseq loop: one thread inflated AND parsed AND compacted AND copied
-// AND sketched every record, so throughput collapsed to a single core on
-// hundred-GB assemblies.
-//
+// For .gz assemblies too large for the one-shot libdeflate path, keep inflation
+// sequential while parallelising downstream parsing and sketching.
 // A single gzip stream's inflate is inherently sequential, so it stays on ONE
 // dedicated producer thread; everything else (FASTA parsing, newline removal,
 // sequence storage, PMH sketching) moves onto N worker threads.  The producer
@@ -2401,7 +2263,7 @@ struct RbGzReader {
 // PMH sketches inline.  Per-block results are stored by block id and merged in
 // file order, so the resulting contig indexing is byte-for-byte identical to
 // the serial kseq path — and therefore so is every downstream result.  This
-// touches NEITHER the <threshold libdeflate path (used by CAMI-scale .gz) NOR
+// touches neither the <threshold libdeflate path nor
 // the uncompressed mmap path, so their behaviour and results are unchanged.
 //
 // Output shape mirrors parse_fasta_mmap_parallel() so the caller can share the
@@ -2844,9 +2706,8 @@ struct RawDepthEntry {
 // parse_depth_async – reads depth_file and returns a name→RawDepthEntry map.
 // Called via std::async before FASTA decompression starts.
 //
-// Parallel mmap parser: the depth matrix can be huge (e.g. 244 MB, 1.47 M rows
-// × 43 float columns for CAMI human_gut) and the old line-by-line stringstream
-// + stod-with-exceptions path was a ~4 s SERIAL bottleneck. We now mmap the
+// Parallel mmap parser: depth matrices can be large, and a line-by-line
+// stringstream parser is a serial bottleneck. We mmap the
 // file, split it into per-thread line-aligned chunks, and parse each field with
 // strtof (no stringstream, no exceptions, no locale). Field separators are tabs;
 // strtof stops cleanly at the tab/newline that follows each number.
@@ -2918,8 +2779,7 @@ parse_depth_buf(const char* buf, size_t fsz, bool cvExt, int num_depth_samples,
       // contigLen may be written in float / scientific notation (jgi depth files
       // emit megabase lengths as e.g. "2.52094e+06").  strtod consumes the whole
       // field (ep == tabp) where strtoul would stop at the '.' and wrongly drop
-      // the row — silently discarding the longest contigs (often near-complete
-      // genomes), which is why CAMI-high regressed.  strtod fixes that while
+      // the row — silently discarding long contigs. strtod fixes that while
       // keeping the "entire field consumed" malformed-row guard.
       double contig_len_d = strtod(c, &ep);
       if (ep != tabp) continue;
@@ -3176,7 +3036,7 @@ static int rb_cmd_bin(int ac, char *av[]) {
       ("min-contig,m", po::value<size_t>(&minContig)->default_value(2500), "Minimum contig length (>=1500)")
       ("min-small-contig", po::value<size_t>(&min_small_contig)->default_value(1000), "Min length for small-contig recruiting")
       ("max-posterior", po::value<Similarity>(&calib_connected_pct)->default_value(95), "Well-connected contig percent for calibration")
-      ("min-edge-score", po::value<Similarity>(&min_edge_weight)->default_value(70), "Minimum edge weight (1-99); higher keeps only confident edges -> purer bins. Default 70. For multi-sample data (S>=3) the LPA edge weight is the depth rank-correlation, so this is effectively a 'connect only if coverage correlation >= 0.70' cutoff; it sits on a flat 0.66-0.74 plateau (marine depth-only HQ 285/287/289 at 66/70/72).")
+      ("min-edge-score", po::value<Similarity>(&min_edge_weight)->default_value(70), "Minimum edge weight (1-99); higher keeps only confident edges. Default 70.")
       ("gfa", po::value<std::string>(&g_gfa_file), "Assembly graph (GFA) whose L-links/P-paths are injected as high-weight same-genome edges")
       ("gfa-weight", po::value<double>(&g_gfa_weight)->default_value(0.90), "Edge weight assigned to GFA links (0,1)")
       ("confidence", po::value<bool>(&g_emit_confidence)->zero_tokens(), "Emit per-contig assignment confidence (members.tsv column + <prefix>.confidence.tsv soft assignment)")
@@ -3224,7 +3084,7 @@ static int rb_cmd_bin(int ac, char *av[]) {
       ("split-silhouette", po::value<double>(&g_split_sil)->default_value(rb_env_split_sil()), "Silhouette split threshold")
       ("auto", po::value<bool>(&g_auto_select)->zero_tokens(), "Build the graph once, sweep configs, and auto-select the partition with the most near-complete bins (needs --markers)")
       ("autotune", po::value<bool>(&g_autotune)->zero_tokens(), "Self-tuning: search alpha x edge-power x split-silhouette by SCG quality and use the best (needs --markers)")
-      ("ensemble", po::value<bool>(&g_ensemble)->zero_tokens(), "[experimental] Consensus over the swept configs: greedily keep the highest-quality non-overlapping bins (needs --markers). Note: the swept configs share one graph and are highly correlated, so on well-tuned data this rarely beats --auto; intended for diverse/independent partitions.")
+      ("ensemble", po::value<bool>(&g_ensemble)->zero_tokens(), "[experimental] Consensus over the swept configs: greedily keep the highest-quality non-overlapping bins (needs --markers). The swept configs share one graph and are highly correlated; intended for diverse/independent partitions.")
       ("markers", po::value<std::string>(&g_markers_file), "Contig->marker map for --auto/--autotune/--qc/--purify (from scripts/rabbitbin_markers.sh)")
       ("qc", po::value<bool>(&g_qc_annotate)->zero_tokens(), "Annotate bins.tsv with SCG completeness/contamination + MIMAG tier (needs --markers)")
       ("keep-hq-only", po::value<bool>(&g_keep_hq_only)->zero_tokens(), "Only output high-quality bins (comp>90,cont<5) (implies --qc; needs --markers)")
@@ -3475,13 +3335,12 @@ static int rb_cmd_bin(int ac, char *av[]) {
     // unique-read (MAPQ>=q) depth block as extra "samples".  The unique-read
     // coverage is the same BAM's clean signal — cross-mapped (low-MAPQ) reads
     // are excluded — so the Spearman edge metric estimates over richer, cleaner
-    // dimensions.  Validated: marine 299->309, plant 110->111 (same BAMs, no
-    // mapping change, no per-dataset tuning).  Doubles the depth columns.
+    // dimensions. Doubles the depth columns.
     // Dual coverage (default ON, q=5 via --dual-depth): append a unique-read
     // depth block as extra abundance dimensions, computed in the SAME BAM scan.
     // The SNV pass (--strain) forces its own depth scan and disables dual, so
     // only double the columns when dual will actually run. Env RABBIT_DUAL_DEPTH
-    // overrides the CLI value (experiment hook); set either to 0 to disable.
+    // overrides the CLI value; set either to 0 to disable.
     int dualReq = fuse_dual_depth;
     if (const char *e = getenv("RABBIT_DUAL_DEPTH")) dualReq = atoi(e);
     if (dualReq > 0 && !g_strain_scan) { g_dual_q = dualReq; num_depth_samples *= 2; }
@@ -3737,7 +3596,7 @@ static int rb_cmd_bin(int ac, char *av[]) {
     //   • large .gz (above the libdeflate one-shot threshold) →
     //     parse_fasta_stream_parallel (1 inflate producer + N parse workers).
     //     This replaces the old single-threaded kseq fallback for big gzip
-    //     assemblies while leaving the <threshold libdeflate path (CAMI-scale)
+    //     assemblies while leaving the <threshold libdeflate path
     //     and the uncompressed mmap path untouched.
     if (!parsed_ok) {
       const bool stream_pmh_mmap = rb_env_pmh_on();
@@ -3769,30 +3628,9 @@ static int rb_cmd_bin(int ac, char *av[]) {
 
       if (no_store_seqs_mmap) onlyLabel = true;
 
-      // FASTA parse always requests the full thread count, including in
-      // fuse_mode where BAM->depth runs concurrently on a background
-      // std::async thread.
-      //
-      // A previous version throttled parse to numThreads/8 in fuse_mode, on
-      // the assumption that parse is trivially short (~1s) while the
-      // concurrent depth scan dominates, so parse stealing cores would only
-      // slow depth via oversubscription. Direct phase timing (RB_TIMING,
-      // 144 threads, CAMI2) disproved both halves of that assumption:
-      //   * Parse is NOT trivial when throttled: on marine (~113k contigs)
-      //     the throttled parse took 6.25s — over half the 11.7s run — not
-      //     the assumed ~1s.
-      //   * Full-thread parse does NOT slow depth: giving parse all cores cut
-      //     its window to 0.82s AND depth-merge finished sooner (8.08s->5.98s),
-      //     not later — the two phases overlap on the async boundary rather
-      //     than contending, so the short full-power parse burst clears before
-      //     depth's steady-state work and total wall dropped 11.7s->9.55s.
-      //   * On the many-BAM datasets (plant 21, strain 100) full-thread parse
-      //     changed total wall by < 0.35s (run-to-run noise) — no measurable
-      //     penalty in the regime the throttle was meant to protect.
-      // This only reorders OpenMP scheduling; parse output is unaffected
-      // beyond thread-nondeterministic placement of below-eval-threshold tiny
-      // contigs, so AMBER HQ/MQ/LQ is bit-identical. RABBIT_PARSE_THREADS
-      // still overrides for manual experimentation.
+      // FASTA parsing uses the requested thread count, including while fused
+      // BAM-to-depth work runs asynchronously. RABBIT_PARSE_THREADS can cap the
+      // parser independently when required by the host.
       int parseThreads = (int)numThreads;
       if (fuse_mode) {
         if (const char *e = rb_getenv("RABBIT_PARSE_THREADS")) {
@@ -4331,7 +4169,7 @@ static int rb_cmd_bin(int ac, char *av[]) {
       if (g_strain_scan && g_snv_result.enabled) {
         materialize_snv_rows();
         // Build the per-contig SNV trajectory fingerprint when the SNV-aware
-        // edge gate is on (or when only the validation dump is requested).
+        // edge gate is on or a diagnostic dump is requested.
         const char *tp = getenv("RABBIT_SNV_TRAJ_DUMP");
         if (g_snv_edge || tp)
           build_contig_snv_traj(tp);
@@ -5011,9 +4849,9 @@ static int rb_cmd_bin(int ac, char *av[]) {
               best_nc = qc_nc[c]; best_ncsum = qc_sum[c]; best_qc_c = c;
             }
           } else if (qc_ready && g_autotune) {
-            // --autotune: also sweep split-silhouette and score POST-split bins
-            // (where most HQ bins come from). Pick (alpha,edge_power,split_sil)
-            // maximising near-complete bins. Reuses g_contig_marker_ids (large).
+            // --autotune: also sweep split-silhouette and score post-split bins.
+            // Pick (alpha,edge_power,split_sil) by the SCG objective. Reuses
+            // g_contig_marker_ids (large).
             static const double sil_grid[] = {0.60, 0.70, 0.80};
             const double invG = (g_marker_set_size > 0) ? 100.0 / g_marker_set_size : 0.0;
             const size_t saved_min = min_bin_bp;
@@ -5063,7 +4901,7 @@ static int rb_cmd_bin(int ac, char *av[]) {
         // exactly the chosen partition. membership is the selected LP labelling.
         if (qc_ready) best_c = best_qc_c;
         if (qc_ready && g_autotune) {
-          g_split_sil = g_autotune_best_sil;     // lock in the tuned split threshold
+          g_split_sil = g_autotune_best_sil;     // retain the selected split threshold
           fprintf(stderr, "[REUSE] autotune: best split-silhouette=%.2f\n",
                   g_autotune_best_sil);
         }
@@ -5215,10 +5053,8 @@ static int rb_cmd_bin(int ac, char *av[]) {
           }
         }
         }
-        // ── Diagnostic pair dump (RB_PAIR_DUMP=path): emit every candidate edge's
-        // raw (sComp, dterm) so the composition/depth fusion weight and cutoff can
-        // be derived offline as a Fisher/logistic boundary vs a gold label.  Pure
-        // observation: runs after edgeScore, changes nothing in the pipeline. ──
+        // Optional diagnostic pair dump: emits raw candidate-edge features after
+        // scoring without changing the graph.
         if (num_depth_samples > 1) {
           const char *dpath = rb_getenv("RB_PAIR_DUMP");
           if (dpath && *dpath) {
@@ -5258,7 +5094,7 @@ static int rb_cmd_bin(int ac, char *av[]) {
       // endpoints' neighbourhoods)^p. Structurally-unsupported edges (a spurious
       // cross-genome link whose endpoints share few neighbours) are down-
       // weighted; edges embedded in a tightly interlinked neighbourhood keep
-      // their weight. No gold-tuned threshold — a monotone structural reshaping.
+      // their weight through a monotone structural reshaping.
       if (num_depth_samples > 1 && rb_env_snn_on()) {
         const size_t ne_snn = g.getEdgeCount();
         // Build per-node sorted neighbour lists from SURVIVING (score>0) edges.

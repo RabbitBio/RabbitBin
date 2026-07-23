@@ -1287,8 +1287,8 @@ std::string compute_depth_tsv_inmem(const StringVector &bamFilePaths,
   // Compact-index mode: when emitting the structured matrix without SNV, keep
   // depth only for contigs that pass the length filter (the only ones ever
   // output), shrinking each per-bam array from n_targets to n_kept.  With
-  // millions of tiny contigs this turns ~num_bams×n_targets×8 B into a small
-  // fraction (e.g. CAMI3: 982 MB → ~13 MB; 100-sample sets scale far worse).
+  // millions of tiny contigs this reduces memory to a small fraction of the
+  // full num_bams×n_targets allocation.
   const bool compactMode = (outCols != nullptr) && (snv == nullptr);
   std::vector<int32_t> tid2compact;
   int32_t n_kept = header->n_targets;
