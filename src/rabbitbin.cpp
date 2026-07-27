@@ -2946,24 +2946,69 @@ static int apply_incremental_depth(const std::string &add_file) {
 // Lightweight dependency-free KMeans (k-means++ init, Lloyd iterations, a few
 // restarts, best inertia). Features are small (n ≤ few hundred, dim = num_depth_samples,
 // k ≤ splitMaxK) so this is microseconds per bin.
-static std::vector<int> rb_kmeans(const std::vector<std::vector<float>> &X,
+// X is a flat row-major n*d matrix.  It used to be a vector<vector<float>>, i.e.
+// one 80-byte heap block per contig scattered across memory, which put a pointer
+// chase in front of every distance evaluation and stopped the d-loop from
+// vectorising -- and this is the pipeline's second-hottest loop after BGZF
+// inflate.  The per-iteration scratch (centroid sums / counts) is hoisted out of
+// the Lloyd loop for the same reason: it used to be k+1 fresh allocations per
+// iteration, times 10 restarts, times every k in the sweep.  Arithmetic, RNG
+// draw order and convergence tests are untouched, so labels are bit-identical.
+// RB_KM_PROF diagnostic: where split_bin's time goes, and how much of the
+// 200-iteration Lloyd budget is actually spent -- i.e. whether the cost is
+// convergence or a failure to converge.
+static const bool g_km_prof = getenv("RB_KM_PROF") != nullptr;
+static const bool g_small_prof = getenv("RB_SMALL_PROF") != nullptr;
+static std::array<std::atomic<uint64_t>, 3> g_small_ncand;
+static std::atomic<uint64_t> g_km_restarts{0}, g_km_iters{0}, g_km_capped{0};
+
+// Squared Euclidean distance, the innermost operation of the whole split stage.
+// The obvious single-accumulator loop is a floating-point reduction, so without
+// -ffast-math the compiler must keep it strictly sequential: d dependent double
+// adds at ~4 cycles each, latency-bound and unvectorised. Four independent
+// partial sums break that chain and let the d-loop vectorise. This reassociates
+// the sum, so distances can differ from the sequential version in the last bit;
+// see RB_KM_STRICT below for the exact-order fallback.
+static const bool g_km_strict = getenv("RB_KM_STRICT") != nullptr;
+static inline double rb_sqdist(const float *a, const float *b, size_t d) {
+  if (__builtin_expect(g_km_strict, 0)) {
+    double s = 0;
+    for (size_t i = 0; i < d; ++i) { double t = a[i] - b[i]; s += t * t; }
+    return s;
+  }
+  double s0 = 0, s1 = 0, s2 = 0, s3 = 0;
+  size_t i = 0;
+  for (; i + 4 <= d; i += 4) {
+    double t0 = a[i] - b[i], t1 = a[i+1] - b[i+1];
+    double t2 = a[i+2] - b[i+2], t3 = a[i+3] - b[i+3];
+    s0 += t0 * t0; s1 += t1 * t1; s2 += t2 * t2; s3 += t3 * t3;
+  }
+  double s = (s0 + s1) + (s2 + s3);
+  for (; i < d; ++i) { double t = a[i] - b[i]; s += t * t; }
+  return s;
+}
+
+static std::vector<int> rb_kmeans(const float *X, size_t n, size_t d,
                                     int k, std::mt19937 &rng) {
-  const size_t n = X.size();
-  const size_t d = X.empty() ? 0 : X[0].size();
   std::vector<int> best_labels(n, 0);
   double best_inertia = std::numeric_limits<double>::infinity();
   if (n == 0 || d == 0 || k <= 1) return best_labels;
 
+  std::vector<float>  cent((size_t)k * d);
+  std::vector<double> d2(n);
+  std::vector<int>    labels(n);
+  std::vector<double> csum((size_t)k * d);
+  std::vector<int>    ccnt(k);
+
   for (int init = 0; init < 10; ++init) {
     // ── k-means++ seeding ──
-    std::vector<std::vector<float>> cent(k);
     std::uniform_int_distribution<size_t> u0(0, n - 1);
-    cent[0] = X[u0(rng)];
-    std::vector<double> d2(n, std::numeric_limits<double>::infinity());
+    std::copy_n(X + u0(rng) * d, d, cent.begin());
+    std::fill(d2.begin(), d2.end(), std::numeric_limits<double>::infinity());
     for (int c = 1; c < k; ++c) {
+      const float *prev = cent.data() + (size_t)(c - 1) * d;
       for (size_t r = 0; r < n; ++r) {
-        double s = 0;
-        for (size_t i = 0; i < d; ++i) { double t = X[r][i] - cent[c-1][i]; s += t*t; }
+        double s = rb_sqdist(X + r * d, prev, d);
         if (s < d2[r]) d2[r] = s;
       }
       double sum = 0; for (double v : d2) sum += v;
@@ -2975,37 +3020,46 @@ static std::vector<int> rb_kmeans(const std::vector<std::vector<float>> &X,
       } else {
         pick = u0(rng);
       }
-      cent[c] = X[pick];
+      std::copy_n(X + pick * d, d, cent.begin() + (size_t)c * d);
     }
     // ── Lloyd iterations ──
-    std::vector<int> labels(n, 0);
-    for (int iter = 0; iter < 200; ++iter) {
+    std::fill(labels.begin(), labels.end(), 0);
+    int iter = 0;
+    for (; iter < 200; ++iter) {
       bool changed = false;
       for (size_t r = 0; r < n; ++r) {
+        const float *xr = X + r * d;
         double bd = std::numeric_limits<double>::infinity(); int bl = 0;
         for (int c = 0; c < k; ++c) {
-          double s = 0;
-          for (size_t i = 0; i < d; ++i) { double t = X[r][i] - cent[c][i]; s += t*t; }
+          double s = rb_sqdist(xr, cent.data() + (size_t)c * d, d);
           if (s < bd) { bd = s; bl = c; }
         }
         if (labels[r] != bl) { labels[r] = bl; changed = true; }
       }
-      std::vector<std::vector<double>> sum(k, std::vector<double>(d, 0.0));
-      std::vector<int> cnt(k, 0);
+      std::fill(csum.begin(), csum.end(), 0.0);
+      std::fill(ccnt.begin(), ccnt.end(), 0);
       for (size_t r = 0; r < n; ++r) {
-        cnt[labels[r]]++;
-        for (size_t i = 0; i < d; ++i) sum[labels[r]][i] += X[r][i];
+        const float *xr = X + r * d;
+        double *sc = csum.data() + (size_t)labels[r] * d;
+        ccnt[labels[r]]++;
+        for (size_t i = 0; i < d; ++i) sc[i] += xr[i];
       }
       for (int c = 0; c < k; ++c)
-        if (cnt[c]) for (size_t i = 0; i < d; ++i) cent[c][i] = (float)(sum[c][i] / cnt[c]);
+        if (ccnt[c]) {
+          float *cc = cent.data() + (size_t)c * d;
+          const double *sc = csum.data() + (size_t)c * d;
+          for (size_t i = 0; i < d; ++i) cc[i] = (float)(sc[i] / ccnt[c]);
+        }
       if (!changed) break;
     }
-    double inertia = 0;
-    for (size_t r = 0; r < n; ++r) {
-      double s = 0;
-      for (size_t i = 0; i < d; ++i) { double t = X[r][i] - cent[labels[r]][i]; s += t*t; }
-      inertia += s;
+    if (g_km_prof) {
+      g_km_restarts.fetch_add(1, std::memory_order_relaxed);
+      g_km_iters.fetch_add((uint64_t)iter + 1, std::memory_order_relaxed);
+      if (iter >= 200) g_km_capped.fetch_add(1, std::memory_order_relaxed);
     }
+    double inertia = 0;
+    for (size_t r = 0; r < n; ++r)
+      inertia += rb_sqdist(X + r * d, cent.data() + (size_t)labels[r] * d, d);
     if (inertia < best_inertia) { best_inertia = inertia; best_labels = labels; }
   }
   return best_labels;
@@ -3104,9 +3158,12 @@ static int rb_cmd_bin(int ac, char *av[]) {
        "File with one sorted-BAM path per line (appended to --bam)")
       ("percent-identity", po::value<int>(&fuse_pctid)->default_value(97),
        "[--bam] Min mapped-read percent identity")
-      ("min-contig-length", po::value<int>(&fuse_min_contig_len)->default_value(1000),
-       "[--bam] Min contig length emitted into depth; left unset it tracks "
-       "--min-small-contig, the shortest contig binning can actually use")
+      ("min-contig-length", po::value<int>(&fuse_min_contig_len)->default_value(1),
+       "[--bam] Min contig length emitted into depth (rabbitbin applies its own "
+       "--min-contig / small-contig filters downstream). Raising it to "
+       "--min-small-contig lets the BAM scan skip reads on contigs binning "
+       "cannot use, which pays off only when the assembly actually holds many "
+       "sub-kb fragments")
       ("min-contig-depth", po::value<double>(&fuse_min_contig_depth)->default_value(0.0),
        "[--bam] Min contig depth emitted into depth (rabbit_depth default)")
       ("max-edge-bases", po::value<int>(&fuse_max_edge)->default_value(75),
@@ -3405,22 +3462,13 @@ static int rb_cmd_bin(int ac, char *av[]) {
       std::vector<std::string> bams = fuse_bams;
       if (g_long_read && fuse_pctid == 97) fuse_pctid = 80;   // long-read preset
       float pctid = (float)fuse_pctid / 100.0f;
-      // Every depth row below min_small_contig is dropped again right after the
-      // BAM pass (the prefilter in the lambda below), so pushing that same bound
-      // into the scan is output-identical -- but it is what actually arms the
-      // compact contig index: emit every contig in the header and the per-bam
-      // depth arrays stay at n_targets and a shard cannot skip a read before
-      // caldepth. On assemblies with millions of sub-kb fragments that is ~1 GB
-      // of depth arrays plus one std::string + one std::vector per contig, all
-      // of it discarded moments later.
-      //
-      // The default tracks min_small_contig rather than repeating its literal
-      // value, because min_small_contig is itself tunable down to 500: pinning
-      // this to 1000 would silently starve --min-small-contig 500 of the depth
-      // rows it needs. An explicit --min-contig-length is honoured verbatim.
+      // Raising this to min_small_contig arms the compact contig index, letting a
+      // shard drop a read before caldepth instead of accumulating depth rows that
+      // the prefilter discards moments later.  It is output-identical either way,
+      // but it only wins when the assembly really carries sub-kb fragments: on an
+      // assembly already filtered at 1 kb the index removes nothing and the extra
+      // per-read indirection cost 27 s of a 4:34 run.  So it stays opt-in.
       int mcl = fuse_min_contig_len;
-      if (vm["min-contig-length"].defaulted())
-        mcl = rb_env_depth_prefilter_on() ? (int)min_small_contig : 1;
       double mcd = fuse_min_contig_depth;
       int medge = fuse_max_edge;
       bool fH = fullHeader;
@@ -4401,7 +4449,12 @@ static int rb_cmd_bin(int ac, char *av[]) {
                     sig_stride * sizeof(uint64_t));                   // bits_[]→g_sig_flat
         // The inverted-index graph build re-derives keys via getKeys() (reads
         // reg_[]) at graph time, so keep reg_[] alive when indexing.
-        if (!build_index) g_sketches[r]->freeRegisters();             // free reg_[]
+        // Composition-based recruiting (--recruit-cutoff) likewise needs reg_[]
+        // later: it copy-constructs and merge()s these sketches into per-bin
+        // centroids, and both read reg_ directly, so freeing here left the
+        // centroid build copying from a null register array.
+        if (!build_index && recruitSimFactor <= 0.0)
+          g_sketches[r]->freeRegisters();                             // free reg_[]
       }
 
       // ── Weighted ProbMinHash4 winners (RABBIT_PMH=1): frequency-weighted,
@@ -5640,6 +5693,10 @@ static int rb_cmd_bin(int ac, char *av[]) {
     // ── Recruit small contigs ─────────────────────────────────────────────
     BinMap cls_small;
     if (nobs1 > 0) {
+      // Recruiting needs EXACTLY ONE eligible bin over threshold, so a zero
+      // yield is ambiguous between "no bin cleared" and "too many cleared";
+      // RB_SMALL_PROF histograms the two apart.
+      for (auto &a : g_small_ncand) a.store(0, std::memory_order_relaxed);
       verbose_message("Binning %d small contigs...                              "
                       "         \n", nobs1);
 
@@ -5697,6 +5754,7 @@ static int rb_cmd_bin(int ac, char *av[]) {
             }
           }
           for (size_t t = 0; t < nb; ++t) {
+            if (g_small_prof) g_small_ncand[ncand[t]].fetch_add(1, std::memory_order_relaxed);
             if (ncand[t] == 1) {
 #pragma omp critical(ADD_SMALL_CONTIGS)
               cls_small[best[t]].push_back((s0 + t) + nobs);
@@ -5753,6 +5811,19 @@ static int rb_cmd_bin(int ac, char *av[]) {
           cls_small[best_cls].push_back(s + nobs);
         }
       }
+      if (g_small_prof) {
+        const uint64_t n0 = g_small_ncand[0].load(), n1 = g_small_ncand[1].load(),
+                       n2 = g_small_ncand[2].load();
+        const uint64_t tt = n0 + n1 + n2;
+        if (tt)
+          fprintf(stderr,
+                  "[RB_SMALL_PROF] %llu small contigs: no bin cleared %llu "
+                  "(%.1f%%), exactly one %llu (%.1f%%), ambiguous(>=2) %llu "
+                  "(%.1f%%)\n",
+                  (unsigned long long)tt, (unsigned long long)n0,
+                  100.0 * n0 / tt, (unsigned long long)n1, 100.0 * n1 / tt,
+                  (unsigned long long)n2, 100.0 * n2 / tt);
+      }
     }
 
     // Apply leftover recruits.  Both recruit loops above append under a critical
@@ -5808,6 +5879,7 @@ static int rb_cmd_bin(int ac, char *av[]) {
 
   verbose_message("Rescuing singleton large contigs\n");
   promote_singleton_bins(cls);
+  rb_phase("  promote singletons");
 
   // ── Output-time annotations: load SCG markers / taxonomy if requested ─────
   if (g_keep_hq_only) g_qc_annotate = true;
@@ -5829,12 +5901,17 @@ static int rb_cmd_bin(int ac, char *av[]) {
       verbose_message("Abundance-guided bin splitting (marker-free)...\n");
       abundance_guided_split(c);
     }
+    rb_phase("  split: abundance");
     if (g_bin_merge) consolidate_bins(c, merge_floor);     // unite same-genome fragments
+    rb_phase("  split: consolidate");
     if (g_bin_recruit) recruit_unbinned_to_cores(c, merge_floor); // attach unbinned tails
+    rb_phase("  split: bin-recruit");
     if (g_bin_decontam) decontaminate_bins(c, merge_floor); // shed foreign contigs
+    rb_phase("  split: decontam");
     if (g_purify) {
       verbose_message("Contamination-aware purification...\n");
       rb_purify_bins(c);
+      rb_phase("  split: purify");
     }
   };
 

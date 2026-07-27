@@ -89,11 +89,11 @@ static void marker_guided_split(BinMap &cls) {
     }
     int k = std::min((int)contigs.size(), std::min(mult, splitMaxK));
     const size_t n = contigs.size();
-    std::vector<std::vector<float>> X(n, std::vector<float>(num_depth_samples));
+    std::vector<float> X(n * num_depth_samples);
     for (size_t r = 0; r < n; ++r)
       for (size_t i = 0; i < num_depth_samples; ++i)
-        X[r][i] = (float)std::log(depth_at(contigs[r], i) + 1.0);
-    std::vector<int> labels = rb_kmeans(X, k, rng);
+        X[r * num_depth_samples + i] = (float)std::log(depth_at(contigs[r], i) + 1.0);
+    std::vector<int> labels = rb_kmeans(X.data(), n, num_depth_samples, k, rng);
     std::vector<ContigVector> sub(k);
     for (size_t r = 0; r < n; ++r) sub[labels[r]].push_back(contigs[r]);
     for (int t = 0; t < k; ++t)
@@ -112,12 +112,21 @@ static void marker_guided_split(BinMap &cls) {
 // ═══════════════════════════════════════════════════════════════════════════
 // Marker-FREE bin splitting (Phase 2; --split-bins) — abundance multimodality
 // ═══════════════════════════════════════════════════════════════════════════
+// RB_KM_PROF accumulators: which part of split_bin the time actually goes to.
+static std::atomic<double> g_ms_feat{0}, g_ms_kmeans{0}, g_ms_sil{0}, g_ms_coh{0};
+static inline void rb_prof_add(std::atomic<double> &a,
+                               std::chrono::steady_clock::time_point t0) {
+  const double v = std::chrono::duration<double, std::milli>(
+                       std::chrono::steady_clock::now() - t0).count();
+  double cur = a.load(std::memory_order_relaxed);
+  while (!a.compare_exchange_weak(cur, cur + v, std::memory_order_relaxed)) {}
+}
+
 // Mean silhouette of a labeling over feature rows X (Euclidean).  O(n^2 d); for
 // large bins we sample up to g_sil_sample_cap rows so this stays cheap.
-static double fkmv_silhouette(const std::vector<std::vector<float>> &X,
+static double fkmv_silhouette(const float *X, size_t n, size_t d,
                               const std::vector<int> &labels, int k,
                               std::mt19937 &rng) {
-  const size_t n = X.size();
   if (n < 3 || k < 2) return -1.0;
   // sample indices if too large
   std::vector<size_t> idx;
@@ -131,22 +140,20 @@ static double fkmv_silhouette(const std::vector<std::vector<float>> &X,
     for (size_t i = 0; i < n; ++i) idx[i] = i;
   }
   const size_t m = idx.size();
-  const size_t d = X[0].size();
   auto dist = [&](size_t a, size_t b) -> double {
-    double s = 0;
-    for (size_t i = 0; i < d; ++i) { double t = X[a][i] - X[b][i]; s += t * t; }
-    return std::sqrt(s);
+    return std::sqrt(rb_sqdist(X + a * d, X + b * d, d));
   };
   // per-cluster sizes within the sample
   std::vector<int> csz(k, 0);
   for (size_t a : idx) csz[labels[a]]++;
   double sil_sum = 0;
   size_t cnt = 0;
+  std::vector<double> sumd(k);   // hoisted: was one allocation per sampled row
   for (size_t ii = 0; ii < m; ++ii) {
     size_t a = idx[ii];
     int la = labels[a];
     if (csz[la] <= 1) continue;  // singleton cluster: s=0, skip
-    std::vector<double> sumd(k, 0.0);
+    std::fill(sumd.begin(), sumd.end(), 0.0);
     for (size_t jj = 0; jj < m; ++jj) {
       if (jj == ii) continue;
       sumd[labels[idx[jj]]] += dist(a, idx[jj]);
@@ -223,19 +230,26 @@ static void abundance_guided_split(BinMap &cls) {
                        std::vector<ContigVector> &sub) -> bool {
     const size_t n = contigs.size();
     if ((int)n < splitMinContigs) return false;
-    std::vector<std::vector<float>> X(n, std::vector<float>(num_depth_samples));
+    const size_t sd = (size_t)num_depth_samples;
+    auto tk0 = std::chrono::steady_clock::now();
+    std::vector<float> X(n * sd);
     for (size_t r = 0; r < n; ++r)
-      for (size_t i = 0; i < (size_t)num_depth_samples; ++i)
-        X[r][i] = (float)std::log(depth_at(contigs[r], i) + 1.0);
+      for (size_t i = 0; i < sd; ++i)
+        X[r * sd + i] = (float)std::log(depth_at(contigs[r], i) + 1.0);
+    if (g_km_prof) rb_prof_add(g_ms_feat, tk0);
     std::mt19937 rng((unsigned)((seed ? (uint64_t)seed : 1ULL)
                                 + bi * 2654435761ULL));
     int best_k = 1; double best_sil = -1.0; std::vector<int> best_labels;
     int kmax = std::min((int)n - 1, splitMaxK);
     for (int k = 2; k <= kmax; ++k) {
-      std::vector<int> lab = rb_kmeans(X, k, rng);
+      tk0 = std::chrono::steady_clock::now();
+      std::vector<int> lab = rb_kmeans(X.data(), n, sd, k, rng);
+      if (g_km_prof) rb_prof_add(g_ms_kmeans, tk0);
       int seen = 0; { std::vector<char> u(k, 0); for (int l : lab) if (!u[l]) { u[l] = 1; ++seen; } }
       if (seen < 2) continue;
-      double s = fkmv_silhouette(X, lab, k, rng);
+      tk0 = std::chrono::steady_clock::now();
+      double s = fkmv_silhouette(X.data(), n, sd, lab, k, rng);
+      if (g_km_prof) rb_prof_add(g_ms_sil, tk0);
       if (s > best_sil) { best_sil = s; best_k = k; best_labels = std::move(lab); }
     }
     if (best_k <= 1 || best_sil < g_split_sil) return false;
@@ -279,11 +293,27 @@ static void abundance_guided_split(BinMap &cls) {
     return binList[a]->size() > binList[b]->size();
   });
 
+  // RB_TIMING diagnostic: per-bin wall time, so the sum (total work) can be
+  // compared against the loop's wall time (critical path) to tell a genuinely
+  // saturated loop apart from one straggler bin holding 63 threads idle.
+  const bool prof_bins = getenv("RB_SPLIT_PROF") != nullptr;
+  std::vector<double> bin_ms(prof_bins ? nbins : 0, 0.0);
+
 #pragma omp parallel for schedule(dynamic, 1) num_threads(numThreads)
   for (size_t oi = 0; oi < nbins; ++oi) {
     const size_t bi = order[oi];
     const ContigVector &contigs = *binList[bi];
     BinResult &res = results[bi];
+    const auto t_bin0 = prof_bins ? std::chrono::steady_clock::now()
+                                  : std::chrono::steady_clock::time_point{};
+    struct BinTimer {
+      const bool on; const std::chrono::steady_clock::time_point t0;
+      double *slot;
+      ~BinTimer() {
+        if (on) *slot = std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - t0).count();
+      }
+    } bin_timer{prof_bins, t_bin0, prof_bins ? &bin_ms[bi] : nullptr};
 
     // Confidently sized bins follow the regular split path.
     if (bin_bp(contigs) < min_bin_bp) {
@@ -305,6 +335,7 @@ static void abundance_guided_split(BinMap &cls) {
     // candidates only (O(64^2 * S) each), so no measurable runtime impact.
     if (do_split && g_split_guard && coh_gate &&
         bin_bp(contigs) >= g_split_guard_bp) {
+      auto tc0 = std::chrono::steady_clock::now();
       double pc = bin_coherence(contigs);
       if (pc > -1.5) {                                // parent coherence usable
         double min_child = 2.0;
@@ -315,6 +346,7 @@ static void abundance_guided_split(BinMap &cls) {
         }
         if (!(min_child >= pc + g_split_guard_margin)) do_split = false;
       }
+      if (g_km_prof) rb_prof_add(g_ms_coh, tc0);
     }
     if (do_split) {
       for (auto &s : sub) {
@@ -327,6 +359,33 @@ static void abundance_guided_split(BinMap &cls) {
     } else {
       res.kind = 1; res.emit.push_back(contigs);
     }
+  }
+
+  if (g_km_prof) {
+    fprintf(stderr,
+            "[RB_KM_PROF] split_bin CPU-ms: features=%.0f kmeans=%.0f "
+            "silhouette=%.0f coherence-guard=%.0f\n",
+            g_ms_feat.load(), g_ms_kmeans.load(), g_ms_sil.load(),
+            g_ms_coh.load());
+    const uint64_t rs = g_km_restarts.load(), it = g_km_iters.load();
+    fprintf(stderr,
+            "[RB_KM_PROF] %lu kmeans restarts, %lu Lloyd iters (avg %.1f), "
+            "%lu hit the 200 cap (%.1f%%)\n",
+            (unsigned long)rs, (unsigned long)it, rs ? (double)it / rs : 0.0,
+            (unsigned long)g_km_capped.load(),
+            rs ? 100.0 * g_km_capped.load() / rs : 0.0);
+  }
+  if (prof_bins) {
+    std::vector<size_t> byt(nbins);
+    for (size_t i = 0; i < nbins; ++i) byt[i] = i;
+    std::sort(byt.begin(), byt.end(),
+              [&](size_t a, size_t b) { return bin_ms[a] > bin_ms[b]; });
+    double tot = 0.0;
+    for (double v : bin_ms) tot += v;
+    fprintf(stderr, "[RB_SPLIT_PROF] %zu bins, total work %.1f ms\n", nbins, tot);
+    for (size_t i = 0; i < std::min<size_t>(8, nbins); ++i)
+      fprintf(stderr, "[RB_SPLIT_PROF]   #%zu contigs=%zu  %.1f ms\n", byt[i],
+              binList[byt[i]]->size(), bin_ms[byt[i]]);
   }
 
   // ── Self-calibrated coherence bar over confident (kept/split) bins ────────
