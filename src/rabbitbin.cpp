@@ -3104,9 +3104,9 @@ static int rb_cmd_bin(int ac, char *av[]) {
        "File with one sorted-BAM path per line (appended to --bam)")
       ("percent-identity", po::value<int>(&fuse_pctid)->default_value(97),
        "[--bam] Min mapped-read percent identity")
-      ("min-contig-length", po::value<int>(&fuse_min_contig_len)->default_value(1),
-       "[--bam] Min contig length emitted into depth (rabbit_depth default; "
-       "rabbitbin applies its own --min-contig / small-contig filters downstream)")
+      ("min-contig-length", po::value<int>(&fuse_min_contig_len)->default_value(1000),
+       "[--bam] Min contig length emitted into depth; left unset it tracks "
+       "--min-small-contig, the shortest contig binning can actually use")
       ("min-contig-depth", po::value<double>(&fuse_min_contig_depth)->default_value(0.0),
        "[--bam] Min contig depth emitted into depth (rabbit_depth default)")
       ("max-edge-bases", po::value<int>(&fuse_max_edge)->default_value(75),
@@ -3405,7 +3405,22 @@ static int rb_cmd_bin(int ac, char *av[]) {
       std::vector<std::string> bams = fuse_bams;
       if (g_long_read && fuse_pctid == 97) fuse_pctid = 80;   // long-read preset
       float pctid = (float)fuse_pctid / 100.0f;
+      // Every depth row below min_small_contig is dropped again right after the
+      // BAM pass (the prefilter in the lambda below), so pushing that same bound
+      // into the scan is output-identical -- but it is what actually arms the
+      // compact contig index: emit every contig in the header and the per-bam
+      // depth arrays stay at n_targets and a shard cannot skip a read before
+      // caldepth. On assemblies with millions of sub-kb fragments that is ~1 GB
+      // of depth arrays plus one std::string + one std::vector per contig, all
+      // of it discarded moments later.
+      //
+      // The default tracks min_small_contig rather than repeating its literal
+      // value, because min_small_contig is itself tunable down to 500: pinning
+      // this to 1000 would silently starve --min-small-contig 500 of the depth
+      // rows it needs. An explicit --min-contig-length is honoured verbatim.
       int mcl = fuse_min_contig_len;
+      if (vm["min-contig-length"].defaulted())
+        mcl = rb_env_depth_prefilter_on() ? (int)min_small_contig : 1;
       double mcd = fuse_min_contig_depth;
       int medge = fuse_max_edge;
       bool fH = fullHeader;
@@ -5740,10 +5755,18 @@ static int rb_cmd_bin(int ac, char *av[]) {
       }
     }
 
-    // Apply leftover recruits
+    // Apply leftover recruits.  Both recruit loops above append under a critical
+    // section, so a bin receives its recruits in thread-completion order.  The
+    // per-contig decision is deterministic, but the resulting member ORDER is
+    // not -- and the downstream k-means/silhouette split seeds off member order,
+    // which is why the same input with the same --seed used to land a handful of
+    // contigs in different bins from run to run.  Sorting by contig index costs
+    // nothing at this size and pins the partition down.
     for (auto it = cls_leftovers.begin(); it != cls_leftovers.end(); ++it) {
       size_t kk = it->first;
-      cls[kk].insert(cls[kk].end(), cls_leftovers[kk].begin(), cls_leftovers[kk].end());
+      auto &add = it->second;
+      std::sort(add.begin(), add.end());
+      cls[kk].insert(cls[kk].end(), add.begin(), add.end());
     }
 
     // Apply small contig recruits (at most 15% of total small bases)
@@ -5760,7 +5783,9 @@ static int rb_cmd_bin(int ac, char *av[]) {
       if (fraction < .15) {
         for (auto it = cls_small.begin(); it != cls_small.end(); ++it) {
           size_t kk = it->first;
-          cls[kk].insert(cls[kk].end(), cls_small[kk].begin(), cls_small[kk].end());
+          auto &add = it->second;
+          std::sort(add.begin(), add.end()); // see cls_leftovers above
+          cls[kk].insert(cls[kk].end(), add.begin(), add.end());
         }
       } else {
         verbose_message("[Info] Additional binning of small contigs was "

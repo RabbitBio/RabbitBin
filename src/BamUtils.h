@@ -244,9 +244,12 @@ private:
     // cerr << omp_get_thread_num() << ": Opening bam: " << filePath << "\n";
     samfile = getSamFileT(samopen(filePath.c_str(), "rb", 0));
     if (samfile == NULL) {
-      cerr << omp_get_thread_num() << "ERROR: Could not open bam: " << filePath
-           << "\n";
-      return;
+      // Returning here used to leave samfile NULL for the caller to dereference,
+      // so a mistyped --bam path surfaced as a SIGSEGV instead of a diagnostic.
+      // There is no recovery from an unreadable input BAM in either binary.
+      cerr << "ERROR: could not open BAM: " << filePath
+           << " (missing, unreadable, or not a BAM)\n";
+      exit(1);
     }
     size_t pos;
     if ((pos = filePath.find_last_of('/')) != string::npos) {

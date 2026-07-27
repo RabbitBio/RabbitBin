@@ -32,7 +32,12 @@ ExternalProject_Add(htslib
     #CONFIGURE_COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/contrib/htslib-prefix/src/htslib/configure"
     #CONFIGURE_COMMAND "autoheader"
     #CONFIGURE_COMMAND "autoconf"
-    CONFIGURE_COMMAND autoheader && autoconf && autoreconf --install && ./configure --disable-bz2 --disable-lzma --disable-libcurl --without-libdeflate ${HTSLIB_ZLIB_INC} ${HTSLIB_ZLIB_LIB}
+    # No --without-libdeflate: htslib's configure probes for libdeflate on its own
+    # and silently falls back to zlib when it is absent. BGZF inflate is the single
+    # hottest thing RabbitBin does -- the BAM->depth stage runs at the decompression
+    # roofline -- so forcing the zlib path here roughly halves whole-pipeline
+    # throughput on any machine that has to use this vendored build.
+    CONFIGURE_COMMAND autoheader && autoconf && autoreconf --install && ./configure --disable-bz2 --disable-lzma --disable-libcurl ${HTSLIB_ZLIB_INC} ${HTSLIB_ZLIB_LIB}
     BUILD_COMMAND ${MAKE_COMMAND} lib-static
     INSTALL_COMMAND ${MAKE_COMMAND} install prefix=${htslib_INSTALL}
     LOG_DOWNLOAD 1

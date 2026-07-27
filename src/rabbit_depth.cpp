@@ -960,7 +960,8 @@ static bool process_depth_byterange(
     uint64_t endCoff, bool needResync, float percentIdentity, int maxEdgeBases,
     bool includeEdgeBases, int avgRead, int minMapQual,
     std::vector<std::pair<int32_t, CountType>> &out,
-    std::vector<std::pair<int32_t, CountType>> *outU = nullptr, int dualQ = 0) {
+    std::vector<std::pair<int32_t, CountType>> *outU = nullptr, int dualQ = 0,
+    const int32_t *tid2compact = nullptr) {
   htsFile *fp = hts_open(bamPath.c_str(), "rb");
   if (!fp)
     return false;
@@ -1020,6 +1021,12 @@ static bool process_depth_byterange(
     int32_t pos = b->core.pos;
     if ((b->core.flag & BAM_FUNMAP) == 0 &&
         (tid < 0 || tid >= n_targets || pos < 0))
+      continue;
+    // Compact mode: the caller's merge discards every partial sum whose contig
+    // was length-filtered, so drop those reads here instead -- before the
+    // pct-id/CIGAR scan.  Mirrors the .bai path (process_depth_shard) and leaves
+    // the merged result unchanged.
+    if (tid2compact && (tid < 0 || tid >= n_targets || tid2compact[tid] < 0))
       continue;
     if ((b->core.flag & (BAM_FPAIRED | BAM_FMUNMAP)) == BAM_FPAIRED &&
         (b->core.mtid < 0 || b->core.mtid >= n_targets))
@@ -1369,7 +1376,7 @@ std::string compute_depth_tsv_inmem(const StringVector &bamFilePaths,
           bamFilePaths[sh.bamIdx], header, sh.startVoff, sh.endCoff,
           sh.needResync, percentIdentity, maxEdgeBases, includeEdgeBases,
           averageReadSize[sh.bamIdx], minMapQual, b2local[s],
-          dualOn ? &b2localU[s] : nullptr, dualMapQual);
+          dualOn ? &b2localU[s] : nullptr, dualMapQual, t2c);
       if (!ok)
         bamFailed[sh.bamIdx] = 1;
     }
@@ -1494,6 +1501,19 @@ std::string compute_depth_tsv_inmem(const StringVector &bamFilePaths,
         int32_t a = (int32_t)(kv.first >> 32);
         int32_t b = (int32_t)(kv.first & 0xFFFFFFFFu);
         outCols->pe_links.emplace_back(a, b, kv.second);
+      }
+    }
+    // Self-check hook: dump the structured matrix (name, length, per-sample
+    // means) so a run can be diffed against one taken with a different
+    // --min-contig-length.  Rows are emitted in tid order, so two dumps differ
+    // only by which contigs were kept -- the surviving rows must match exactly.
+    if (const char *dp = getenv("RABBIT_FUSE_DUMP_DEPTH")) {
+      std::ofstream f(dp);
+      f.precision(9);
+      for (size_t i = 0; i < outCols->names.size(); ++i) {
+        f << outCols->names[i] << '\t' << outCols->lens[i];
+        for (float v : outCols->means[i]) f << '\t' << v;
+        f << '\n';
       }
     }
     return std::string();
