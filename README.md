@@ -2,16 +2,21 @@
 
 Fast, sketch-based metagenome binning. The default RabbitBin pipeline uses
 4-mer weighted ProbMinHash (PMH) sketches to construct a mutual-nearest-neighbour
-candidate graph, weights candidate edges by Spearman abundance correlation, and
-clusters the graph with Fisher label propagation.
+candidate graph, weights candidate edges by contig composition and coverage
+agreement, clusters the graph with Fisher label propagation, and then recruits
+short contigs and re-splits multi-modal bins.
 
 | Command | What it does |
 |---------|--------------|
-| `rabbitbin bin`   | Bin contigs into genomes (the main pipeline) |
-| `rabbitbin depth` | Turn sorted BAM(s) into a MetaBAT/JGI depth TSV |
-| `rabbitbin amber` | Fast, multithreaded AMBER-compatible binning evaluation |
+| `rabbitbin bin`    | Bin contigs into genomes (the main pipeline) |
+| `rabbitbin depth`  | Turn sorted BAM(s)/CRAM into a MetaBAT/JGI depth TSV |
+| `rabbitbin qc`     | Score a binning by SCG completeness/contamination (no gold standard) |
+| `rabbitbin refine` | DAS Tool-style SCG consensus over several independent binnings |
+| `rabbitbin amber`  | Fast, multithreaded AMBER-compatible binning evaluation |
 
 `rabbitbin bin` is the default: a bare `rabbitbin -a contigs.fa -o out` still works.
+Read-mapping subcommands (`map`, `bwa`, `sortbam`, `bai`) exist only in builds
+configured with `-DRABBITBIN_ENABLE_MAP=ON`.
 
 ## Requirements
 
@@ -34,6 +39,27 @@ After pulling new changes, rebuild from a clean tree:
 ```bash
 rm -rf build && mkdir build && cd build && cmake .. && make -j
 ```
+
+## Input modes
+
+`rabbitbin bin` accepts coverage in one of two forms, or none at all. The mode
+is inferred from the flags and echoed in the log line beginning `Fusion:`.
+
+| Mode | Flags | Edge weight | Abundance stages |
+|------|-------|-------------|------------------|
+| BAM/CRAM | `--fasta` + `--bam`/`--bam-list` | composition + coverage (depth computed in-process) | enabled |
+| Precomputed depth | `--assembly` + `--depth` | composition + coverage | enabled |
+| Sequence-only | `--assembly` alone | composition only | **disabled** |
+
+With one or two coverage samples, edge weights fall back to composition alone,
+but the coverage values still drive recruitment and bin splitting. From three
+samples on, coverage drives the edge weights (see *Edge weighting* below).
+
+**Sequence-only mode runs, but it is not the configuration used for the reported
+benchmarks.** Without coverage there is no abundance signal, so contig
+recruitment and abundance-guided bin splitting are both skipped and edges are
+weighted by PMH composition similarity alone. Use it only for assemblies with no
+reads available; expect materially lower bin quality on multi-sample datasets.
 
 ## Usage
 
@@ -60,14 +86,20 @@ rabbitbin bin \
   --threads 32
 ```
 
-### 3. BAM(s) → depth TSV
+### 3. Bin from the assembly alone (sequence-only)
+
+```bash
+rabbitbin bin --assembly contigs.fa --output results/out --threads 32
+```
+
+### 4. BAM(s) → depth TSV
 
 ```bash
 rabbitbin depth --bam-list bams.txt --out depth.tsv --threads 64
 rabbitbin depth --fasta contigs.fa --bam s1.bam s2.bam -o depth.tsv
 ```
 
-### 4. Evaluate against a gold standard (AMBER-compatible)
+### 5. Evaluate against a gold standard (AMBER-compatible)
 
 ```bash
 rabbitbin amber \
@@ -77,22 +109,80 @@ rabbitbin amber \
   --threads 64
 ```
 
-## Default algorithm
+## Default pipeline
 
-RabbitBin's default binning path contains five stages:
+Every stage below runs by default. Stages marked *(needs coverage)* are skipped
+in sequence-only mode.
 
-1. **4-mer PMH sketching.** Each contig is represented by a weighted
-   ProbMinHash sketch over canonical 4-mer counts.
-2. **500-register signatures.** Each PMH sketch contains 500 registers.
-3. **Mutual top-N candidate graph.** PMH similarity retrieves at most 200
-   neighbours per contig. An undirected candidate edge is retained only when
-   the neighbour relation is mutual.
-4. **Spearman edge weighting.** For multi-sample data, PMH is used only for
-   candidate generation. Surviving edges are weighted by the Spearman
-   correlation between contig abundance profiles.
-5. **Fisher label propagation.** Label propagation combines the evidence from
-   edges incident to each candidate label using Fisher's method and iterates
-   until the partition converges.
+**Contig partitioning**
+
+Contigs are split by length into three groups:
+
+| Group | Length | Role |
+|-------|--------|------|
+| large | ≥ `--min-contig` (default 2500) | sketched, graphed, clustered |
+| small | ≥ `--min-small-contig` and < `--min-contig` (default 1000–2499) | held back, recruited into finished bins |
+| discarded | < `--min-small-contig` | dropped at parse time |
+
+Both bounds are user-settable: `--min-contig` accepts any value ≥ 1500 and
+`--min-small-contig` any value ≥ 500, so the recruitment window is
+`[--min-small-contig, --min-contig)` and is 1000–2500 bp at the defaults.
+
+**Graph construction**
+
+1. **4-mer PMH sketching.** Each large contig is represented by a weighted
+   ProbMinHash sketch over canonical 4-mer counts, with `--sketch-m`
+   (default 500) registers.
+2. **Mutual top-N candidate graph.** PMH similarity retrieves at most
+   `--max-edges` (default 200) neighbours per contig; an undirected candidate
+   edge is retained only when the neighbour relation is mutual.
+3. **Edge weighting.** Surviving edges get
+   `w = α · s_comp + (1 − α) · d`, and edges below `--min-edge-score`
+   (default 0.70) are dropped. `s_comp` is the PMH composition similarity.
+   `d` *(needs coverage)* is the conjunctive `min` of the Spearman rank
+   correlation and the weighted Jaccard similarity of the two coverage
+   profiles, with a hard cut on strongly negative correlation. `α` is chosen
+   from the number of coverage samples `S`: `α = 1` for `S ≤ 2`, because a
+   correlation over ≤ 2 paired observations has ≤ 0 degrees of freedom and
+   carries no information, and `α = 0` for `S ≥ 3`, where PMH acts purely as a
+   candidate filter. Override with `RABBIT_W_COMP`.
+
+**Clustering**
+
+4. **Fisher label propagation.** Each contig moves to the label whose incident
+   edges carry the most aggregated support, combined by a Fisher-style
+   nonlinear transform of the edge weights. Contigs are visited in a fixed
+   order; a contig that returns to a label it has held before is frozen, and
+   iteration stops once the number of first-time label moves has not reached a
+   new minimum for 10 rounds.
+
+**Post-processing**
+
+5. **Contig recruitment** *(needs coverage)*. Unbinned large contigs, then
+   small contigs, are attached to a bin when exactly one bin's mean within-bin
+   abundance correlation is cleared. Small-contig recruits are dropped as a
+   whole if they would add more than 15 % of the total small-contig bases.
+   Disable with `--no-recruit`.
+6. **Singleton rescue.** Large contigs left unbinned are promoted to their own
+   single-contig bins, subject to the output size filter.
+7. **Abundance-guided bin splitting** *(needs coverage)*. Bins that are
+   multi-modal in per-sample log-abundance are re-split by k-means, with `k`
+   chosen by mean silhouette over `k = 2 … --split-max-k` (default 6) and the
+   split accepted only when the best silhouette ≥ `--split-silhouette`
+   (default 0.70). Disable with `--no-split`. Supplying `--marker-seed`
+   replaces this with marker-guided splitting.
+8. **Consolidate / recruit / decontaminate** *(needs coverage)*. Same-genome
+   fragments are merged, unbinned tails are attached to bin cores, and
+   depth-outlier contigs are shed. Disable individually with
+   `RABBIT_BIN_MERGE=0`, `RABBIT_BIN_RECRUIT=0`, `RABBIT_BIN_DECONTAM=0`.
+9. **Output size filter.** Bins smaller than `--min-bin-size` (default
+   200 000 bp) are not emitted.
+
+Off by default, all requiring an explicit flag: SCG quality annotation
+(`--qc`), purification (`--purify`), HQ-only output (`--keep-hq-only`),
+composition-based recruitment (`--recruit-cutoff`), parameter search
+(`--auto`, `--autotune`), consensus (`--ensemble`), and multi-resolution
+output (`--resolutions`).
 
 ## Outputs (`bin`)
 
@@ -112,17 +202,26 @@ RabbitBin's default binning path contains five stages:
 | `-d, --depth` | — | Coverage depth TSV (MetaBAT/JGI format) |
 | `--bam` / `--bam-list` | — | Sorted BAM input (compute depth in-process) |
 | `-t, --threads` | 0 (all) | Worker threads |
-| `-m, --min-contig` | 2500 | Minimum contig length (≥1500) |
+| `-m, --min-contig` | 2500 | Minimum length of a clustered contig (must be ≥1500) |
+| `--min-small-contig` | 1000 | Minimum length of a recruitable short contig (must be ≥500); shorter contigs are discarded |
 | `-s, --min-bin-size` | 200000 | Minimum output bin size (bp) |
-| `--min-edge-score` | 70 | Minimum Spearman edge weight (1–99) |
+| `--min-edge-score` | 70 | Minimum edge weight, percent (1–99) |
 | `--max-edges` | 200 | Maximum PMH neighbours per contig before mutual filtering |
 | `--sketch-m` | 500 | Number of ProbMinHash registers |
+| `--no-recruit` | off | Disable leftover/short-contig recruitment |
+| `--no-split` | off | Disable abundance-guided bin splitting |
+| `--split-silhouette` | 0.70 | Minimum mean silhouette to accept a split |
+| `--split-max-k` | 6 | Maximum sub-clusters per split bin |
 | `--percent-identity` | 97 | Min read identity when reading BAMs |
+| `--markers` | — | Contig→marker map, required by `--qc`/`--purify`/`--auto`/`--autotune` |
+| `--qc` | off | Annotate `bins.tsv` with SCG completeness/contamination + MIMAG tier |
 | `--bioboxes` | off | Also write a CAMI bioboxes `<prefix>.binning` |
 | `--bin-fasta` | off | Also write per-bin FASTA files |
 | `--unbinned` | off | Write unbinned contigs to FASTA |
+| `--save-cache` / `--load-cache` | — | Cache the graph for fast re-binning |
 
-Run `rabbitbin <command> --help` for the full option list.
+Run `rabbitbin <command> --help` for the full option list, including the `qc`
+and `refine` subcommands.
 
 ## Key options (`depth`)
 
@@ -147,6 +246,22 @@ Run `rabbitbin <command> --help` for the full option list.
 | `-o, --output` | — | Per-bin metrics TSV (optional) |
 | `--min-length` | 0 | Ignore GS contigs shorter than this |
 | `-q, --quiet` | off | Print only the summary |
+
+## Reproducibility
+
+`--seed` defaults to `0`, which seeds the RNG from the wall clock. The k-means
+restarts in the bin-splitting stage consume that RNG, so two runs on identical
+input can differ by a small number of contigs. Pass an explicit `--seed` for any
+run you intend to report:
+
+```bash
+rabbitbin bin --assembly contigs.fa --depth depth.tsv \
+              --output results/out --threads 64 --seed 1
+```
+
+Everything else in the *Default pipeline* section above is deterministic given
+the input files and thread count. No other flags were used for the published
+benchmarks.
 
 ## Pipeline wrapper
 
