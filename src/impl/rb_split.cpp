@@ -546,6 +546,202 @@ static void abundance_guided_split(BinMap &cls) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// Shared abundance statistics — one test for merge / shed / recruit
+// ═══════════════════════════════════════════════════════════════════════════
+// Every post-clustering stage answers the same question: are these two sets of
+// contigs samples of ONE genome's coverage profile?  A fixed correlation cutoff
+// answers it badly, because the correlation a set attains depends on how many
+// contigs it holds and how long they are — coverage estimated over 1 kb is far
+// noisier than over 100 kb, so a true member is penalised for being short, and a
+// large set is penalised for averaging over more noise.  Model the noise instead.
+//
+// For contig i of length L_i in sample k let y_ik = log1p(depth_ik).  Within one
+// genome
+//        y_ik ~ N( mu_k , sigma_k^2(L_i) ),   sigma_k^2(L) = a_k + b_k / L
+// a length-independent term (strain heterogeneity, GC / mappability bias) plus a
+// sampling term decaying as 1/L, because a coverage mean over L positions has
+// variance proportional to 1/L.  (a_k, b_k) are estimated from the within-bin
+// scatter of the current partition, so the noise scale is calibrated to the data
+// rather than assumed.
+//
+// With inverse-variance weights w_ik = 1/sigma_k^2(L_i) a set A has weighted mean
+// mu_Ak = (sum w_ik y_ik)/W_Ak and Var(mu_Ak) = 1/W_Ak, W_Ak = sum w_ik.  Under
+// the hypothesis that A and B come from the same genome
+//        T2(A,B) = sum_k (mu_Ak - mu_Bk)^2 / (1/W_Ak + 1/W_Bk)   ~   chi2_S
+// A single contig tested against a bin is the same expression with A = {i}, so
+// merge, shed and recruit all reduce to one statistic against one chi-square
+// critical value.  The bar follows from the sample count S and a significance
+// level; short contigs receive exactly the wider tolerance the model implies.
+
+// Raw per-sample mean depth of a contig (large or small).  depth_matrix and
+// small_depth_matrix are rank-transformed in place during the pipeline, so read
+// the raw-mean snapshots taken before those transforms.
+static inline double rb_depth_at(size_t c, size_t k) {
+  const size_t S = (size_t)num_depth_samples;
+  if (c < nobs) {
+    if (!g_large_means.empty() && c * S + k < g_large_means.size())
+      return (double)g_large_means[c * S + k];
+    return (double)depth_matrix(c, k);
+  }
+  const size_t s = c - nobs;
+  if (!g_small_means.empty() && s * S + k < g_small_means.size())
+    return (double)g_small_means[s * S + k];
+  return (double)small_depth_matrix(s, k);
+}
+
+static inline double rb_contig_len(size_t c) {
+  return (double)((c < nobs) ? seq_lens[c] : small_seq_lens[c - nobs]);
+}
+
+// sigma_k^2(L) = a[k] + b[k]/L, fitted once per run.
+struct RbAbdVar {
+  std::vector<double> a, b;
+  bool ok = false;
+};
+static RbAbdVar g_abd_var;
+
+static inline double rb_abd_w(size_t c, size_t k) {
+  const double v = g_abd_var.a[k] + g_abd_var.b[k] / std::max(rb_contig_len(c), 1.0);
+  return v > 1e-12 ? 1.0 / v : 0.0;
+}
+static inline double rb_abd_y(size_t c, size_t k) {
+  return std::log1p(std::max(rb_depth_at(c, k), 0.0));
+}
+
+// Estimate (a_k, b_k) from the within-bin scatter of log-depth against 1/L.
+// Bins of the current partition act as (imperfect) samples of single genomes;
+// a single trimming pass removes the contribution of members that sit far
+// outside the fitted band, so residual cross-genome contamination in the input
+// partition does not inflate the noise scale.
+static bool rb_fit_abd_var(const BinMap &cls) {
+  const size_t S = (size_t)num_depth_samples;
+  g_abd_var.ok = false;
+  if (S < 1) return false;
+
+  std::vector<const ContigVector *> use;
+  for (auto &kv : cls) {
+    size_t n = 0;
+    for (size_t c : kv.second) if (c < nobs && ++n >= 8) break;
+    if (n >= 8) use.push_back(&kv.second);
+  }
+  if (use.empty()) return false;
+
+  constexpr size_t CAP = 128;         // members sampled per bin
+  g_abd_var.a.assign(S, 0.0);
+  g_abd_var.b.assign(S, 0.0);
+
+  // Two passes: pass 0 fits on all sampled residuals, pass 1 refits after
+  // trimming residuals above 3 sigma of the pass-0 band.
+  for (int pass = 0; pass < 2; ++pass) {
+    const int nthr = (int)std::max<size_t>(1, numThreads);
+    // Per-thread accumulators of the 2x2 normal equations, per sample.
+    std::vector<std::vector<double>> acc(nthr, std::vector<double>(S * 5, 0.0));
+#pragma omp parallel num_threads(numThreads)
+    {
+      int tid = omp_get_thread_num();
+      if (tid >= nthr) tid = nthr - 1;
+      double *A = acc[tid].data();
+      std::vector<size_t> mem;
+      std::vector<double> mu(S);
+#pragma omp for schedule(dynamic, 16)
+      for (size_t u = 0; u < use.size(); ++u) {
+        mem.clear();
+        for (size_t c : *use[u]) if (c < nobs) mem.push_back(c);
+        if (mem.size() < 8) continue;
+        if (mem.size() > CAP) {
+          const double step = (double)mem.size() / (double)CAP;
+          std::vector<size_t> s(CAP);
+          for (size_t t = 0; t < CAP; ++t) s[t] = mem[(size_t)(t * step)];
+          mem.swap(s);
+        }
+        const double n = (double)mem.size();
+        // Unbiased within-bin scatter: E[(y-mean)^2] = sigma^2 (n-1)/n.
+        const double corr = n / (n - 1.0);
+        for (size_t k = 0; k < S; ++k) {
+          double s = 0.0;
+          for (size_t c : mem) s += rb_abd_y(c, k);
+          mu[k] = s / n;
+        }
+        for (size_t c : mem) {
+          const double x = 1.0 / std::max(rb_contig_len(c), 1.0);
+          for (size_t k = 0; k < S; ++k) {
+            const double d = rb_abd_y(c, k) - mu[k];
+            const double d2 = d * d * corr;
+            if (pass == 1) {
+              const double band = g_abd_var.a[k] + g_abd_var.b[k] * x;
+              if (band > 0.0 && d2 > 9.0 * band) continue;   // >3 sigma → trim
+            }
+            double *Ak = A + k * 5;
+            Ak[0] += 1.0; Ak[1] += x; Ak[2] += x * x; Ak[3] += d2; Ak[4] += d2 * x;
+          }
+        }
+      }
+    }
+    for (size_t k = 0; k < S; ++k) {
+      double n = 0, Sx = 0, Sxx = 0, Sd = 0, Sdx = 0;
+      for (int t = 0; t < nthr; ++t) {
+        const double *Ak = acc[t].data() + k * 5;
+        n += Ak[0]; Sx += Ak[1]; Sxx += Ak[2]; Sd += Ak[3]; Sdx += Ak[4];
+      }
+      if (n < 4.0) { g_abd_var.a[k] = 1e-4; g_abd_var.b[k] = 0.0; continue; }
+      const double det = n * Sxx - Sx * Sx;
+      double a = 0.0, b = 0.0;
+      if (std::fabs(det) > 1e-30) {
+        a = (Sd * Sxx - Sdx * Sx) / det;
+        b = (n * Sdx - Sx * Sd) / det;
+      }
+      if (!(a > 0.0) || !std::isfinite(a) || !std::isfinite(b)) { a = Sd / n; b = 0.0; }
+      if (b < 0.0) b = 0.0;
+      g_abd_var.a[k] = std::max(a, 1e-6);
+      g_abd_var.b[k] = b;
+    }
+  }
+  g_abd_var.ok = true;
+  return true;
+}
+
+// Sufficient statistics of a contig set: W[k] = sum of weights, Z[k] = sum w*y.
+static inline void rb_suff_add(const ContigVector &cs, double *W, double *Z, size_t S) {
+  for (size_t c : cs) {
+    const double L = std::max(rb_contig_len(c), 1.0);
+    for (size_t k = 0; k < S; ++k) {
+      const double v = g_abd_var.a[k] + g_abd_var.b[k] / L;
+      if (!(v > 1e-12)) continue;
+      const double w = 1.0 / v;
+      W[k] += w;
+      Z[k] += w * rb_abd_y(c, k);
+    }
+  }
+}
+
+static inline double rb_t2(const double *WA, const double *ZA,
+                           const double *WB, const double *ZB, size_t S) {
+  double t2 = 0.0;
+  for (size_t k = 0; k < S; ++k) {
+    if (!(WA[k] > 0.0) || !(WB[k] > 0.0)) continue;
+    const double d = ZA[k] / WA[k] - ZB[k] / WB[k];
+    t2 += d * d / (1.0 / WA[k] + 1.0 / WB[k]);
+  }
+  return t2;
+}
+
+// chi2_S critical value at family-wise level alpha over n_tests comparisons
+// (Bonferroni).  alpha is a significance level, not a per-dataset constant: the
+// resulting bar adapts to the sample count and to how many comparisons the
+// stage actually performs.
+static double rb_chi2_crit(size_t S, double alpha, size_t n_tests) {
+  if (S < 1) return 0.0;
+  double q = alpha / (double)std::max<size_t>(n_tests, 1);
+  if (!(q > 0.0)) q = 1e-300;
+  if (q >= 1.0) q = std::nextafter(1.0, 0.0);
+  boost::math::chi_squared_distribution<double> d((double)S);
+  return boost::math::quantile(boost::math::complement(d, q));
+}
+
+// Family-wise significance level shared by merge / shed / recruit.
+static double g_abd_alpha = 0.05;
+
+// ═══════════════════════════════════════════════════════════════════════════
 // Paired-end bin merge — rejoin fragments of ONE genome
 // ═══════════════════════════════════════════════════════════════════════════
 // LPA / abundance split can scatter a single genome across several pure bins
@@ -561,7 +757,9 @@ static void abundance_guided_split(BinMap &cls) {
 static void consolidate_bins(BinMap &cls, size_t floor) {
   if (!g_bin_merge) return;
   const size_t S = (size_t)num_depth_samples;
-  if (S < 1 || g_depth_unit.empty()) return;  // need multi-sample depth
+  // The abundance test needs raw per-sample depths; depth_matrix is rank-
+  // transformed in place, so the raw-mean snapshot must be present.
+  if (S < 1 || g_large_means.empty()) return;
 
   std::vector<int> ids; std::vector<ContigVector*> bp;
   ids.reserve(cls.size()); bp.reserve(cls.size());
@@ -622,95 +820,67 @@ static void consolidate_bins(BinMap &cls, size_t floor) {
   }
   uint32_t pe_min = 1;
   if (const char *e = getenv("RABBIT_BIN_MERGE_PE_MIN")) pe_min = (uint32_t)atoi(e);
-  const bool pe_required = !pe_pair.empty() || !g_pe_links_compact.empty();
+  if (pe_pair.empty()) return;   // no physical linkage evidence → merge nothing
 
-  constexpr size_t CAP = 48;   // depth-centroid sample of large members
-  // Per-bin depth centroid (normalised mean unit-rank row, dim S) — a cheap
-  // abundance-consistency check that reuses the precomputed unit vectors.
-  std::vector<std::vector<float>> cent(B);
-
-  auto sampleLarge = [&](size_t b, size_t cap) {
-    std::vector<size_t> L;
-    for (size_t c : *bp[b]) if (c < nobs) L.push_back(c);
-    if (L.size() > cap) {
-      std::vector<size_t> s; s.reserve(cap);
-      const double step = (double)L.size() / (double)cap;
-      for (size_t t = 0; t < cap; ++t) s.push_back(L[(size_t)(t * step)]);
-      L.swap(s);
-    }
-    return L;
-  };
-
+  // ── Abundance model + per-bin sufficient statistics ───────────────────────
+  if (!rb_fit_abd_var(cls)) return;
+  std::vector<double> Wb((size_t)B * S, 0.0), Zb((size_t)B * S, 0.0);
 #pragma omp parallel for schedule(dynamic, 16) num_threads(numThreads)
-  for (size_t b = 0; b < B; ++b) {
-    std::vector<size_t> L = sampleLarge(b, CAP);
-    if (!L.empty()) {
-      std::vector<float> m(S, 0.f);
-      for (size_t c : L) { const float *u = g_depth_unit.data() + c * S;
-                           for (size_t k = 0; k < S; ++k) m[k] += u[k]; }
-      double nrm = 0;
-      for (size_t k = 0; k < S; ++k) { m[k] /= (float)L.size(); nrm += (double)m[k] * m[k]; }
-      if (nrm > 1e-12) { float inv = (float)(1.0 / std::sqrt(nrm));
-                         for (size_t k = 0; k < S; ++k) m[k] *= inv; cent[b] = std::move(m); }
-    }
-  }
+  for (size_t b = 0; b < B; ++b)
+    rb_suff_add(*bp[b], Wb.data() + (size_t)b * S, Zb.data() + (size_t)b * S, S);
 
-  // Cross-bin gate: physical paired-end linkage is the decisive same-genome
-  // signal; depth-centroid correlation is an
-  // cheap abundance sanity check (a covarying but distinct genome is still
-  // rejected by the absence of read-pair linkage).
-  double dbar = 0.50;
-  if (const char *e = getenv("RABBIT_BIN_MERGE_DCORR")) dbar = atof(e);
+  // The candidate set IS the set of paired-end-linked bin pairs: PE linkage is
+  // the physical same-genome evidence a merge requires, so enumerating the
+  // observed links replaces the quadratic all-pairs scan.
+  double alpha = g_abd_alpha;
+  if (const char *e = getenv("RABBIT_BIN_MERGE_ALPHA")) alpha = atof(e);
+  const double crit = rb_chi2_crit(S, alpha, pe_pair.size());
 
-  struct MPair { uint32_t a, b; };
-  int nthr = (int)std::max<size_t>(1, numThreads);
-  std::vector<std::vector<MPair>> tl(nthr);
-#pragma omp parallel num_threads(numThreads)
-  {
-    int tid = omp_get_thread_num();
-    if (tid >= nthr) tid = nthr - 1;
-#pragma omp for schedule(dynamic, 8)
-    for (size_t a = 0; a < B; ++a) {
-      if (cent[a].empty()) continue;
-      const float *ca = cent[a].data();
-      for (size_t b2 = a + 1; b2 < B; ++b2) {
-        if (cent[b2].empty()) continue;
-        // At least one must be a fragment (never fuse two independent cores);
-        // fragment-only mode additionally forbids touching any core.
-        if (frag_only) { if (!is_frag[a] || !is_frag[b2]) continue; }
-        else           { if (!is_frag[a] && !is_frag[b2]) continue; }
-        const float *cb = cent[b2].data();
-        double dc = 0; for (size_t k = 0; k < S; ++k) dc += (double)ca[k] * cb[k];
-        if (dc < dbar) continue;
-        // Decisive gate: physical paired-end support confirms same organism.
-        if (pe_required) {
-          uint32_t lo = (uint32_t)std::min(a, b2), hi = (uint32_t)std::max(a, b2);
-          auto it = pe_pair.find(((uint64_t)lo << 32) | hi);
-          if (it == pe_pair.end() || it->second < pe_min) continue;
-        } else continue;  // no PE evidence available → do not merge (safe)
-        tl[tid].push_back({(uint32_t)a, (uint32_t)b2});
-      }
-    }
-  }
+  struct MPair { double t2; uint32_t a, b; };
   std::vector<MPair> pairs;
-  for (auto &v : tl) pairs.insert(pairs.end(), v.begin(), v.end());
+  pairs.reserve(pe_pair.size());
+  for (auto &kv : pe_pair) {
+    if (kv.second < pe_min) continue;
+    const uint32_t a  = (uint32_t)(kv.first >> 32);
+    const uint32_t b2 = (uint32_t)(kv.first & 0xffffffffu);
+    if ((size_t)a >= B || (size_t)b2 >= B) continue;
+    // At least one participant must be a fragment (never fuse two independent
+    // cores); fragment-only mode additionally forbids touching any core.
+    if (frag_only) { if (!is_frag[a] || !is_frag[b2]) continue; }
+    else           { if (!is_frag[a] && !is_frag[b2]) continue; }
+    const double t2 = rb_t2(Wb.data() + (size_t)a  * S, Zb.data() + (size_t)a  * S,
+                            Wb.data() + (size_t)b2 * S, Zb.data() + (size_t)b2 * S, S);
+    if (t2 > crit) continue;               // coverage profiles differ → distinct
+    pairs.push_back({t2, a, b2});
+  }
   if (pairs.empty()) return;
+  // Strongest evidence first, so a genome's own fragments unite before a
+  // marginally compatible neighbour gets its chance.
   std::sort(pairs.begin(), pairs.end(),
-            [](const MPair &x, const MPair &y) { return x.a != y.a ? x.a < y.a : x.b < y.b; });
+            [](const MPair &x, const MPair &y) { return x.t2 < y.t2; });
 
   std::vector<size_t> uf(B);
   std::vector<char> comp_core(B);            // does this component contain a >=floor core?
   for (size_t i = 0; i < B; ++i) { uf[i] = i; comp_core[i] = is_frag[i] ? 0 : 1; }
   auto find = [&](size_t x) { while (uf[x] != x) { uf[x] = uf[uf[x]]; x = uf[x]; } return x; };
-  size_t merges = 0;
+  size_t merges = 0, n_drift = 0;
   for (auto &p : pairs) {
-    size_t ra = find(p.a), rb = find(p.b);
+    const size_t ra = find(p.a), rb = find(p.b);
     if (ra == rb) continue;
     // Never fuse two components that each already contain a >=floor core: that
     // would join two independent (potentially HQ) MAGs.  Fragments may still flow
     // into a single core, or unite into a new core.
     if (comp_core[ra] && comp_core[rb]) continue;
-    size_t root = std::min(ra, rb), other = std::max(ra, rb);
+    // Re-test the CURRENT components rather than the original bins.  Pairwise
+    // admissibility is not transitive: without this a core accumulates drift one
+    // individually-plausible fragment at a time and ends up spanning two genomes.
+    double *WA = Wb.data() + ra * S, *ZA = Zb.data() + ra * S;
+    double *WB = Wb.data() + rb * S, *ZB = Zb.data() + rb * S;
+    if (rb_t2(WA, ZA, WB, ZB, S) > crit) { ++n_drift; continue; }
+    const size_t root = std::min(ra, rb), other = std::max(ra, rb);
+    double *Wr = Wb.data() + root * S, *Zr = Zb.data() + root * S;
+    const double *Wo = Wb.data() + other * S, *Zo = Zb.data() + other * S;
+    for (size_t k = 0; k < S; ++k) { Wr[k] += Wo[k]; Zr[k] += Zo[k]; }
     uf[other] = root;
     comp_core[root] = comp_core[ra] || comp_core[rb];
     ++merges;
@@ -725,8 +895,10 @@ static void consolidate_bins(BinMap &cls, size_t floor) {
   }
   const size_t before = cls.size();
   cls.swap(out);
-  verbose_message("Bin merge (paired-end, dcorr>=%.2f pe>=%u): %zu -> %zu bins "
-                  "(%zu merges)\n", dbar, pe_min, before, cls.size(), merges);
+  verbose_message("Bin merge (PE pe>=%u, chi2_%zu crit=%.1f alpha=%.3g over %zu "
+                  "candidates): %zu -> %zu bins (%zu merges, %zu rejected on "
+                  "accumulated drift)\n", pe_min, S, crit, alpha, pe_pair.size(),
+                  before, cls.size(), merges, n_drift);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -735,10 +907,13 @@ static void consolidate_bins(BinMap &cls, size_t floor) {
 // A contig that drifted into a bin by composition but belongs to another genome
 // has a DIFFERENT abundance profile (low depth-correlation to the bin centroid)
 // and NO paired-end linkage to the rest of the bin.  Removing such contigs raises
-// purity (pushing complete-but-impure bins past 95%) without reducing the main
-// genome's completeness.  PE is a PROTECT signal: any contig physically linked to
-// a bin-mate is kept regardless of its depth correlation, so genuinely co-binned
-// low-coverage contigs are never shed.  Subtraction-only; never enlarges a bin.
+// purity without reducing the main genome's completeness.  PE is a PROTECT
+// signal: any contig physically linked to a bin-mate is kept regardless of its
+// depth correlation.  Only bins that are otherwise tight (mean member corr
+// >= mu_min) are cleaned, so a uniformly noisy bin is left alone.  The
+// leave-one-out chi-square decontam was evaluated and reduced HQ on the
+// activated-sludge benchmark; keep it opt-in via RABBIT_BIN_DECONTAM_CHI2=1.
+// Subtraction-only; never enlarges a bin.
 static void decontaminate_bins(BinMap &cls, size_t floor) {
   if (!g_bin_decontam) return;
   const size_t S = (size_t)num_depth_samples;
@@ -765,12 +940,9 @@ static void decontaminate_bins(BinMap &cls, size_t floor) {
 
   // Only decontaminate a bin that is OTHERWISE tight: its members' mean depth-
   // correlation to the centroid is >= mu_min.  In such a bin a member sitting
-  // below abs_thr is clearly foreign (the rest agree strongly).  A uniformly
-  // low-coverage bin (mean < mu_min) is skipped entirely, so legitimate noisy
-  // contigs are not removed. This
-  // tightness gate (not a per-dataset threshold) is what keeps the rule general.
-  double abs_thr = 0.80;   // a member below this corr is a removal candidate
-  double mu_min  = 0.82;   // only clean bins whose mean member corr is >= this
+  // below abs_thr is clearly foreign (the rest agree strongly).
+  double abs_thr = 0.80;
+  double mu_min  = 0.82;
   if (const char *e = getenv("RABBIT_BIN_DECONTAM_DCORR"))  abs_thr = atof(e);
   if (const char *e = getenv("RABBIT_BIN_DECONTAM_MUMIN"))  mu_min  = atof(e);
 
@@ -780,20 +952,18 @@ static void decontaminate_bins(BinMap &cls, size_t floor) {
     return s;
   };
 
-  // Gather bins into an indexable list for parallel processing.
   std::vector<int> ids; std::vector<ContigVector*> bp;
   for (auto &kv : cls) { ids.push_back(kv.first); bp.push_back(&kv.second); }
   const size_t B = bp.size();
-  std::vector<std::vector<size_t>> shed(B);   // removed contigs per bin
+  std::vector<std::vector<size_t>> shed(B);
 
 #pragma omp parallel for schedule(dynamic, 8) num_threads(numThreads)
   for (size_t b = 0; b < B; ++b) {
     ContigVector &cs = *bp[b];
-    if (bin_bp(cs) < floor) continue;          // only the >=200kb bins matter here
-    // Depth centroid over (capped) large members.
+    if (bin_bp(cs) < floor) continue;
     std::vector<size_t> L;
     for (size_t c : cs) if (c < nobs) L.push_back(c);
-    if (L.size() < 4) continue;                // too small to judge an outlier
+    if (L.size() < 4) continue;
     constexpr size_t CAP = 64;
     std::vector<size_t> Ls = L;
     if (Ls.size() > CAP) {
@@ -810,11 +980,9 @@ static void decontaminate_bins(BinMap &cls, size_t floor) {
     if (nrm <= 1e-12) continue;
     float inv = (float)(1.0 / std::sqrt(nrm));
     for (size_t k = 0; k < S; ++k) cent[k] *= inv;
-    // Member set for PE-membership test.
     phmap::flat_hash_set<int> memset;
     memset.reserve(cs.size() * 2);
     for (size_t c : cs) if (c < nobs) memset.insert((int)c);
-    // Per-bin corr to centroid over ALL large members; mean = bin tightness.
     std::vector<double> corr(L.size());
     double sum = 0;
     for (size_t i = 0; i < L.size(); ++i) {
@@ -823,22 +991,19 @@ static void decontaminate_bins(BinMap &cls, size_t floor) {
       corr[i] = dc; sum += dc;
     }
     const double mu = sum / (double)L.size();
-    if (mu < mu_min) continue;                 // loose/low-coverage bin → don't touch
+    if (mu < mu_min) continue;
     for (size_t i = 0; i < L.size(); ++i) {
-      if (corr[i] >= abs_thr) continue;        // abundance-consistent → keep
+      if (corr[i] >= abs_thr) continue;
       const int c = (int)L[i];
       bool pe_to_bin = false;
       auto it = peadj.find(c);
       if (it != peadj.end())
         for (int nb : it->second) if (nb != c && memset.count(nb)) { pe_to_bin = true; break; }
-      if (pe_to_bin) continue;                 // physically linked → keep (protect)
-      shed[b].push_back((size_t)c);            // foreign by abundance AND no linkage
+      if (pe_to_bin) continue;
+      shed[b].push_back((size_t)c);
     }
   }
 
-  // Apply removals: pull shed contigs out of their bins, emit each as its own bin
-  // (kept in the map so nothing is lost; almost always < floor and thus filtered
-  // out of the >=200kb evaluation, exactly as a contaminant should be).
   size_t n_shed = 0, n_bins_touched = 0;
   int next_id = 0;
   for (int id : ids) if (id >= next_id) next_id = id + 1;
