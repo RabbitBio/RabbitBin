@@ -9,13 +9,80 @@
 // boost's general incomplete-gamma evaluation (called tens of millions of times
 // in label propagation) with a handful of multiplies.  Mathematically identical
 // to boost::math::cdf(chi_squared(2m), x) up to floating-point ULPs.
-static inline double chi2_2dof_cdf(int m, double x) {
+static inline double chi2_2dof_sf(int m, double x) {   // upper tail Q
   const double u = 0.5 * x;
   double p = std::exp(-u);   // p_0
   double Q = p;
   for (int i = 1; i < m; ++i) { p *= u / (double)i; Q += p; }
-  double v = 1.0 - Q;
+  return Q;
+}
+static inline double chi2_2dof_cdf(int m, double x) {
+  double v = 1.0 - chi2_2dof_sf(m, x);
   return v < 0.0 ? 0.0 : v;
+}
+
+// ── Label-score rule (ablation switch) ───────────────────────────────────────
+// Propagation must reduce the edges joining v to one candidate label into a
+// single comparable number.  The default reduction is a Fisher-style combination
+// of the per-edge quantities log(1-w), read through a chi-squared CDF -- which
+// treats w as if 1-w were a calibrated, independent p-value.  It is not: w is a
+// Spearman correlation already thresholded at --min-edge-score, and incident
+// edges are plainly dependent.  RABBIT_LPA_SCORE swaps the reduction so the
+// aggregation rule can be ablated against an otherwise identical graph:
+//   fisher (default)  chi2_{2m} CDF of -2*Sum log(1-w)   (saturates at 1.0)
+//   tail              same ordering via the upper tail Q, which does not
+//                     saturate: 1-Q is indistinguishable from 1.0 once Q drops
+//                     below ~1e-16, while Q itself stays comparable to ~1e-308
+//   logsum            Sum of -log(1-w)                   (same evidence, no CDF)
+//   sum               Sum of w                            (standard weighted LPA)
+//   mean              Sum of w / m
+//   max               max w
+enum class LpaScore { Fisher, Tail, LogSum, Sum, Mean, Max };
+static LpaScore rb_lpa_score_init() {
+  const char *e = getenv("RABBIT_LPA_SCORE");
+  if (!e || !*e) return LpaScore::Fisher;
+  if (std::strcmp(e, "sum") == 0)    return LpaScore::Sum;
+  if (std::strcmp(e, "mean") == 0)   return LpaScore::Mean;
+  if (std::strcmp(e, "max") == 0)    return LpaScore::Max;
+  if (std::strcmp(e, "logsum") == 0) return LpaScore::LogSum;
+  if (std::strcmp(e, "tail") == 0)   return LpaScore::Tail;
+  return LpaScore::Fisher;
+}
+static const LpaScore g_lpa_score = rb_lpa_score_init();
+// sum/mean/max reduce the raw weight; fisher/logsum reduce log(1-w).
+static const bool g_lpa_raw_w = g_lpa_score == LpaScore::Sum ||
+                                g_lpa_score == LpaScore::Mean ||
+                                g_lpa_score == LpaScore::Max;
+static inline void lpa_accumulate(double &dst, double x) {
+  if (g_lpa_score == LpaScore::Max) { if (x > dst) dst = x; }
+  else dst += x;
+}
+static inline double lpa_combine(int m, double acc) {
+  switch (g_lpa_score) {
+    case LpaScore::Fisher: return chi2_2dof_cdf(m, -2.0 * acc);
+    // Maximising -Q is the same ordering as maximising the CDF 1-Q, but stays
+    // discriminative in the range where 1-Q has already rounded to 1.0.
+    case LpaScore::Tail:   return -chi2_2dof_sf(m, -2.0 * acc);
+    case LpaScore::LogSum: return -acc;                      // acc <= 0
+    case LpaScore::Mean:   return m > 0 ? acc / (double)m : 0.0;
+    default:               return acc;                       // Sum, Max
+  }
+}
+// RB_LPA_PROF: how often does the chi-squared CDF comparison actually lose
+// information?  Counts decisions whose winning score has already rounded to 1.0,
+// and among those, decisions where two or more candidate labels are tied there --
+// those are settled by incidence order (first-max), not by evidence.
+static const bool g_lpa_prof = getenv("RB_LPA_PROF") != nullptr;
+static std::array<std::atomic<uint64_t>, 3> g_lpa_dec;  // total, saturated, tied
+static const char *lpa_score_name() {
+  switch (g_lpa_score) {
+    case LpaScore::Tail:   return "tail(-chi2 sf)";
+    case LpaScore::LogSum: return "logsum(-log(1-w))";
+    case LpaScore::Sum:    return "sum(w)";
+    case LpaScore::Mean:   return "mean(w)";
+    case LpaScore::Max:    return "max(w)";
+    default:               return "fisher(chi2 cdf)";
+  }
 }
 
 // ── Alternative clustering: weighted multilevel modularity (Louvain) ─────────
@@ -335,12 +402,17 @@ int cluster_by_propagation(Graph &g, std::vector<size_t> &membership,
   std::unordered_map<size_t, std::unordered_set<size_t>> visited;
   std::unordered_set<size_t> blacklist;
 
-  // Precompute LOG(1 - edgeScore) per edge once: it is invariant across the (many)
-  // label-propagation rounds and across every incidence visit of the edge, so
-  // hoisting it out of the hot loop removes ~10²·|E| redundant log() calls.
+  // Precompute the per-edge quantity the propagation accumulates: LOG(1 - score)
+  // for the fisher/logsum rules, the raw score for sum/mean/max.  It is invariant
+  // across the (many) label-propagation rounds and across every incidence visit
+  // of the edge, so hoisting it out of the hot loop removes ~10²·|E| redundant
+  // log() calls.
   std::vector<StoredDistance> logsscr(no_of_edges);
   for (size_t e = 0; e < no_of_edges; ++e)
-    logsscr[e] = (StoredDistance)LOG(1. - g.edgeScore[e]);
+    logsscr[e] = g_lpa_raw_w ? g.edgeScore[e]
+                             : (StoredDistance)LOG(1. - g.edgeScore[e]);
+  if (g_lpa_score != LpaScore::Fisher)
+    cerr << "[LPA] label score = " << lpa_score_name() << endl;
 
   // ── Optional parallel (Jacobi) label propagation ─────────────────────────
   // RABBIT_PAR_LPA=1 switches from the default order-dependent (Gauss-Seidel)
@@ -388,14 +460,14 @@ int cluster_by_propagation(Graph &g, std::vector<size_t> &membership,
             size_t edgeID = ineis[j];
             size_t k = membership[g.getOtherNode(edgeID, v1)];
             if (ncount[k] == 0) touched.push_back(k);
-            nscore[k] += logsscr[edgeID];
+            lpa_accumulate(nscore[k], logsscr[edgeID]);
             ncount[k]++;
           }
           if (touched.empty()) { prop_set[v1] = 0; continue; }
           double best_val = -std::numeric_limits<double>::infinity();
           size_t best_k = touched[0];
           for (size_t k : touched) {
-            double val = chi2_2dof_cdf((int)ncount[k], -2.0 * nscore[k]);
+            double val = lpa_combine((int)ncount[k], nscore[k]);
             if (val > best_val) { best_val = val; best_k = k; }
             nscore[k] = 0.0; ncount[k] = 0;
           }
@@ -482,20 +554,26 @@ int cluster_by_propagation(Graph &g, std::vector<size_t> &membership,
             edgeID, v1)]; // community membership of a neighbor (connected by j)
 
         if (ncount[k] == 0) touched.push_back(k);
-        nscore[k] += logsscr[edgeID]; // as p-value (precomputed)
+        lpa_accumulate(nscore[k], logsscr[edgeID]);  // precomputed per edge
         ncount[k]++;
       }
 
       if (!touched.empty()) {
-        // Fisher's method: combine the per-cluster p-values and keep the
-        // most significant cluster (max chi-squared cdf).  Equivalent to the
-        // previous max_element over the hash map; first-max wins on ties.
+        // Reduce each candidate label's incident edges to one score (rule set by
+        // RABBIT_LPA_SCORE) and keep the best.  First-max wins on ties.
         double best_val = -std::numeric_limits<double>::infinity();
         size_t best_k = touched[0];
+        int n_at_one = 0;
         for (size_t k : touched) {
-          double val = chi2_2dof_cdf((int)ncount[k], -2.0 * nscore[k]);
+          double val = lpa_combine((int)ncount[k], nscore[k]);
+          if (g_lpa_prof && val >= 1.0) ++n_at_one;
           if (val > best_val) { best_val = val; best_k = k; }
           nscore[k] = 0.0; ncount[k] = 0;   // reset for the next node
+        }
+        if (g_lpa_prof) {
+          g_lpa_dec[0].fetch_add(1, std::memory_order_relaxed);
+          if (n_at_one >= 1) g_lpa_dec[1].fetch_add(1, std::memory_order_relaxed);
+          if (n_at_one >= 2) g_lpa_dec[2].fetch_add(1, std::memory_order_relaxed);
         }
 
         // however, if there was a clique (loop) out of >2 nodes
@@ -538,8 +616,25 @@ int cluster_by_propagation(Graph &g, std::vector<size_t> &membership,
 
   // Multilevel merge phase (opt-in): conservatively merge same-genome fragments
   // the level-0 LPA left split, using the same Fisher statistic + a high gate.
-  if (do_mlpa)
+  // Its tau gate is calibrated on the chi-squared CDF, so it needs the log(1-w)
+  // accumuland even when the propagation above was ablated onto another rule.
+  if (do_mlpa) {
+    if (g_lpa_raw_w)
+      for (size_t e = 0; e < no_of_edges; ++e)
+        logsscr[e] = (StoredDistance)LOG(1. - g.edgeScore[e]);
     fisher_super_merge(g, membership, logsscr, mlpa_tau, mlpa_min_count);
+  }
+
+  if (g_lpa_prof) {
+    const uint64_t tot = g_lpa_dec[0].load(), sat = g_lpa_dec[1].load(),
+                   tie = g_lpa_dec[2].load();
+    if (tot)
+      fprintf(stderr,
+              "[RB_LPA_PROF] %llu label decisions: winner already 1.0 in %llu "
+              "(%.1f%%), >=2 labels tied at 1.0 in %llu (%.1f%%)\n",
+              (unsigned long long)tot, (unsigned long long)sat,
+              100.0 * sat / tot, (unsigned long long)tie, 100.0 * tie / tot);
+  }
 
   return 0;
 }
