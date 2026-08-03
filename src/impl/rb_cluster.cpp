@@ -68,10 +68,17 @@ static inline double lpa_combine(int m, double acc) {
     default:               return acc;                       // Sum, Max
   }
 }
+
+// Retain the current label when its score is tied with the best candidate up
+// to floating-point noise.  Besides making ties deterministic, this prevents
+// score-equivalent labels from generating spurious updates and lets the main
+// propagation loop stop on a full sweep with zero actual label changes.
+static constexpr double LPA_SCORE_EPS = 1e-12;
 // RB_LPA_PROF: how often does the chi-squared CDF comparison actually lose
 // information?  Counts decisions whose winning score has already rounded to 1.0,
 // and among those, decisions where two or more candidate labels are tied there --
-// those are settled by incidence order (first-max), not by evidence.
+// those retain the current label when available, otherwise incidence-order
+// first-max breaks the tie.
 static const bool g_lpa_prof = getenv("RB_LPA_PROF") != nullptr;
 static std::array<std::atomic<uint64_t>, 3> g_lpa_dec;  // total, saturated, tied
 static const char *lpa_score_name() {
@@ -286,11 +293,8 @@ static void fisher_super_merge(Graph &g, std::vector<size_t> &membership,
   std::unordered_map<int, std::unordered_set<int>> visited;
   std::unordered_set<int> blacklist;
   std::vector<char> active(C, 1);
-  size_t nLeftMin = INT_MAX, attempt = 0;
-  bool running = true;
-  while (running) {
-    running = false;
-    size_t nLeft = 0;
+  while (true) {
+    size_t changed = 0;
     for (int v = 0; v < C; ++v) {
       if (!active[v]) continue;
       active[v] = 0;
@@ -317,14 +321,14 @@ static void fisher_super_merge(Graph &g, std::vector<size_t> &membership,
       int prev = comm[v];
       if (prev != best_k && blacklist.find(v) == blacklist.end()) {
         comm[v] = best_k;
+        ++changed;
         for (const auto &kv : sadj[v]) active[kv.first] = 1;
-        if (visited[v].find(best_k) == visited[v].end()) { nLeft++; running = true; }
-        else blacklist.insert(v);
-        visited[v].insert(best_k);
+        auto &seen = visited[v];
+        if (seen.empty()) seen.insert(prev);
+        if (!seen.insert(best_k).second) blacklist.insert(v);
       }
     }
-    if (nLeft < nLeftMin) { nLeftMin = nLeft; attempt = 0; }
-    else { attempt++; if (attempt >= 10) break; }
+    if (changed == 0) break;
   }
   for (size_t i = 0; i < n; ++i) membership[i] = (size_t)comm[comm0[i]];
 }
@@ -399,9 +403,6 @@ int cluster_by_propagation(Graph &g, std::vector<size_t> &membership,
     exit(1);
   }
 
-  std::unordered_map<size_t, std::unordered_set<size_t>> visited;
-  std::unordered_set<size_t> blacklist;
-
   // Precompute the per-edge quantity the propagation accumulates: LOG(1 - score)
   // for the fisher/logsum rules, the raw score for sum/mean/max.  It is invariant
   // across the (many) label-propagation rounds and across every incidence visit
@@ -414,6 +415,8 @@ int cluster_by_propagation(Graph &g, std::vector<size_t> &membership,
   if (g_lpa_score != LpaScore::Fisher)
     cerr << "[LPA] label score = " << lpa_score_name() << endl;
 
+  const bool lpa_trace = getenv("RB_LPA_TRACE") != nullptr;
+
   // ── Optional parallel (Jacobi) label propagation ─────────────────────────
   // RABBIT_PAR_LPA=1 switches from the default order-dependent (Gauss-Seidel)
   // sweep to a synchronous one: every active node recomputes its best cluster
@@ -423,8 +426,8 @@ int cluster_by_propagation(Graph &g, std::vector<size_t> &membership,
   // mid-round, the converged labelling differs from the sequential baseline,
   // so this path is opt-in. The
   // commit is serial and in node_order, so a given thread count + flag is fully
-  // deterministic, and the visited/blacklist oscillation guard + attempt-based
-  // stop criterion are preserved verbatim.
+  // deterministic. Both paths retain the current label on score ties and stop
+  // after a complete round with zero actual label changes.
   if (getenv("RABBIT_PAR_LPA") != nullptr) {
     const int nthreads = omp_get_max_threads();
     std::vector<std::vector<double>>  tl_nscore(nthreads, std::vector<double>(no_of_nodes, 0.0));
@@ -433,15 +436,12 @@ int cluster_by_propagation(Graph &g, std::vector<size_t> &membership,
     std::vector<size_t> prop_k(no_of_nodes);     // proposed best cluster per node
     std::vector<char>   prop_set(no_of_nodes, 0); // 1 if node was evaluated this round
     std::vector<char>   active(no_of_nodes, 1), next_active(no_of_nodes, 0);
-
     std::unordered_map<size_t, std::unordered_set<size_t>> visited;
     std::unordered_set<size_t> blacklist;
 
-    size_t nLeftMin = INT_MAX, attempt = 0;
-    bool running = true;
-    while (running) {
-      running = false;
-      size_t nLeft = 0;
+    size_t round = 0;
+    while (true) {
+      ++round;
 
 #pragma omp parallel
       {
@@ -464,47 +464,58 @@ int cluster_by_propagation(Graph &g, std::vector<size_t> &membership,
             ncount[k]++;
           }
           if (touched.empty()) { prop_set[v1] = 0; continue; }
+          const size_t current_k = membership[v1];
+          bool current_is_candidate = false;
+          double current_val = -std::numeric_limits<double>::infinity();
           double best_val = -std::numeric_limits<double>::infinity();
           size_t best_k = touched[0];
           for (size_t k : touched) {
             double val = lpa_combine((int)ncount[k], nscore[k]);
+            if (k == current_k) {
+              current_is_candidate = true;
+              current_val = val;
+            }
             if (val > best_val) { best_val = val; best_k = k; }
             nscore[k] = 0.0; ncount[k] = 0;
           }
+          if (current_is_candidate &&
+              current_val >= best_val - LPA_SCORE_EPS)
+            best_k = current_k;
           prop_k[v1] = best_k;
           prop_set[v1] = 1;
         }
       }
 
-      // Serial commit in node_order (deterministic; preserves the oscillation
-      // guard and re-activation semantics of the sequential variant).
+      // Serial commit in node_order preserves deterministic re-activation and
+      // applies the same repeated-label cycle guard as the sequential path.
       std::fill(active.begin(), active.end(), 0);
+      size_t changed = 0;
+      size_t frozen = 0;
       for (size_t i = 0; i < node_order.size(); i++) {
         size_t v1 = node_order[i];
         if (!prop_set[v1]) continue;
         size_t best_k = prop_k[v1];
-        int kPrev = membership[v1];
-        if (kPrev != (int)best_k && blacklist.find(v1) == blacklist.end()) {
+        size_t kPrev = membership[v1];
+        if (kPrev != best_k && blacklist.find(v1) == blacklist.end()) {
           membership[v1] = best_k;
+          ++changed;
           std::vector<size_t> &ineis = g.incs[v1];
           for (size_t j = 0; j < ineis.size(); ++j)
             next_active[g.getOtherNode(ineis[j], v1)] = 1;
-          int kNext = membership[v1];
-          if (visited.find(v1) == visited.end() ||
-              visited[v1].find(kNext) == visited[v1].end()) {
-            nLeft++;
-            running = true;
-          } else {
+          auto &seen = visited[v1];
+          if (seen.empty()) seen.insert(kPrev);
+          if (!seen.insert(best_k).second) {
             blacklist.insert(v1);
+            ++frozen;
           }
-          visited[v1].insert(kNext);
         }
       }
+      if (lpa_trace)
+        fprintf(stderr, "[LPA] round=%zu changed=%zu frozen=%zu\n",
+                round, changed, frozen);
+      if (changed == 0) break;
       active.swap(next_active);
       std::fill(next_active.begin(), next_active.end(), 0);
-
-      if (nLeft < nLeftMin) { nLeftMin = nLeft; attempt = 0; }
-      else { attempt++; if (attempt >= 10) break; }
     }
     return 0;
   }
@@ -525,14 +536,14 @@ int cluster_by_propagation(Graph &g, std::vector<size_t> &membership,
   // nodes are provably no-ops) but avoids the wasted scans once most nodes have
   // stabilised — which dominates the later rounds.
   std::vector<char> active(no_of_nodes, 1);
+  std::unordered_map<size_t, std::unordered_set<size_t>> visited;
+  std::unordered_set<size_t> blacklist;
 
-  size_t nLeftMin = INT_MAX;
-  size_t attempt = 0;
-  bool running = true;
-  while (running) {
-    running = false;
-
-    size_t nLeft = 0;
+  size_t round = 0;
+  while (true) {
+    ++round;
+    size_t changed = 0;
+    size_t frozen = 0;
 
     /* In the prescribed order, loop over the vertices and reassign labels */
     for (size_t i = 0; i < node_order.size();
@@ -560,58 +571,60 @@ int cluster_by_propagation(Graph &g, std::vector<size_t> &membership,
 
       if (!touched.empty()) {
         // Reduce each candidate label's incident edges to one score (rule set by
-        // RABBIT_LPA_SCORE) and keep the best.  First-max wins on ties.
+        // RABBIT_LPA_SCORE) and keep the best. If the current label is tied for
+        // best within LPA_SCORE_EPS, retain it and avoid a meaningless update.
+        const size_t current_k = membership[v1];
+        bool current_is_candidate = false;
+        double current_val = -std::numeric_limits<double>::infinity();
         double best_val = -std::numeric_limits<double>::infinity();
         size_t best_k = touched[0];
         int n_at_one = 0;
         for (size_t k : touched) {
           double val = lpa_combine((int)ncount[k], nscore[k]);
+          if (k == current_k) {
+            current_is_candidate = true;
+            current_val = val;
+          }
           if (g_lpa_prof && val >= 1.0) ++n_at_one;
           if (val > best_val) { best_val = val; best_k = k; }
           nscore[k] = 0.0; ncount[k] = 0;   // reset for the next node
         }
+        if (current_is_candidate &&
+            current_val >= best_val - LPA_SCORE_EPS)
+          best_k = current_k;
         if (g_lpa_prof) {
           g_lpa_dec[0].fetch_add(1, std::memory_order_relaxed);
           if (n_at_one >= 1) g_lpa_dec[1].fetch_add(1, std::memory_order_relaxed);
           if (n_at_one >= 2) g_lpa_dec[2].fetch_add(1, std::memory_order_relaxed);
         }
 
-        // however, if there was a clique (loop) out of >2 nodes
-        int kPrev = membership[v1];
-        if (kPrev != (int)best_k &&
+        size_t kPrev = membership[v1];
+        if (kPrev != best_k &&
             blacklist.find(v1) == blacklist.end()) {
-
           membership[v1] = best_k;
+          ++changed;
 
           // v1 changed → its neighbours must reconsider (re-activate them).
           for (size_t j = 0; j < ineis.size(); ++j)
             active[g.getOtherNode(ineis[j], v1)] = 1;
 
-          int kNext = membership[v1];
-          if (visited.find(v1) == visited.end() ||
-              visited[v1].find(kNext) == visited[v1].end()) {
-            // not have been assigned to the cls before
-            nLeft++; //# of confirmation (that this choice is optimal) left
-            running = true;
-          } else {
-            blacklist.insert(v1); // blacklist represents nodes that change cls
-                                  // in a circular form
+          // Label retention removes score ties, but strict Fisher preferences
+          // can still form a cycle. Record every assigned label and freeze only
+          // a node that actually returns to one, guaranteeing that a later full
+          // sweep can reach changed == 0 without a patience heuristic.
+          auto &seen = visited[v1];
+          if (seen.empty()) seen.insert(kPrev);
+          if (!seen.insert(best_k).second) {
+            blacklist.insert(v1);
+            ++frozen;
           }
-          visited[v1].insert(kNext);
         }
       }
     }
-
-    if (nLeft < nLeftMin) {
-      nLeftMin = nLeft;
-      attempt = 0;
-    } else {
-      attempt++;
-      if (attempt >= 10) {
-        break;
-      }
-    }
-    // cout << "nLeft: " << nLeft << " & attempt: " << attempt << endl;
+    if (lpa_trace)
+      fprintf(stderr, "[LPA] round=%zu changed=%zu frozen=%zu\n",
+              round, changed, frozen);
+    if (changed == 0) break;
   }
 
   // Multilevel merge phase (opt-in): conservatively merge same-genome fragments
@@ -706,4 +719,3 @@ void compute_node_confidence(Graph &g,
 }
 
 StoredDistance get_element(Matrix const &m, int i, int j) { return m(i, j); }
-

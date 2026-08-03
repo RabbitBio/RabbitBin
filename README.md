@@ -152,9 +152,9 @@ Both bounds are user-settable: `--min-contig` accepts any value ≥ 1500 and
 4. **Fisher label propagation.** Each contig moves to the label whose incident
    edges carry the most aggregated support, combined by a Fisher-style
    nonlinear transform of the edge weights. Contigs are visited in a fixed
-   order; a contig that returns to a label it has held before is frozen, and
-   iteration stops once the number of first-time label moves has not reached a
-   new minimum for 10 rounds.
+   order. A contig retains its current label when it is tied for the highest
+   score; a contig that revisits an earlier label is frozen to break strict-score
+   cycles. Propagation stops after a complete round with no label changes.
 
 **Post-processing**
 
