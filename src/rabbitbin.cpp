@@ -749,9 +749,9 @@ static inline double depth_corr_fast(size_t i, size_t j) {
 // Vectorised float dot of two unit (centered+L2-normalised) rows of length S.
 // Used by the abundance-first prune in the O(N²/2) graph pass, evaluated for
 // EVERY candidate pair, so vectorising it is the single biggest pair-pass win on
-// many-sample data.  float accumulation differs from the scalar reference by
-// ~S·1e-7, far inside the prune's 1e-4 conservative safety margin, so pruning
-// decisions (and thus the graph) are unchanged.
+// many-sample data.  Float accumulation differs slightly with SIMD reduction;
+// the caller therefore keeps a 1e-4 conservative margin around the exact prune
+// bound to absorb that round-off.
 static inline float unit_dot_f(const float *__restrict__ a,
                                const float *__restrict__ b, uint32_t S) {
   uint32_t k = 0;
@@ -764,6 +764,18 @@ static inline float unit_dot_f(const float *__restrict__ a,
   }
   for (; k + 16 <= S; k += 16)
     acc0 = _mm512_fmadd_ps(_mm512_loadu_ps(a + k), _mm512_loadu_ps(b + k), acc0);
+  // The common multi-sample case is not a multiple of 16 (bench has S=46).
+  // Keep its 14-value tail in SIMD instead of dropping back to a dependency-
+  // chained scalar loop for every one of the O(N^2) candidate pairs.  Masked
+  // loads do not access beyond the row and zero inactive lanes.
+  if (k < S) {
+    const uint32_t rem = S - k;  // 1..15 (the full vectors were consumed above)
+    const __mmask16 mask = (__mmask16)((1u << rem) - 1u);
+    const __m512 va = _mm512_maskz_loadu_ps(mask, a + k);
+    const __m512 vb = _mm512_maskz_loadu_ps(mask, b + k);
+    acc0 = _mm512_fmadd_ps(va, vb, acc0);
+    k = S;
+  }
   if (k > 0) r = _mm512_reduce_add_ps(_mm512_add_ps(acc0, acc1));
 #elif defined(__AVX2__)
   __m256 acc0 = _mm256_setzero_ps(), acc1 = _mm256_setzero_ps();
@@ -5545,6 +5557,22 @@ static int rb_cmd_bin(int ac, char *av[]) {
         rb_suff_add(cls.find(recruit_clsid[e])->second,
                     binW.data() + e * ABD_Sloc, binZ.data() + e * ABD_Sloc, ABD_Sloc);
 
+      // The hot recruit loops compare millions of contigs with thousands of
+      // eligible bins.  Convert the bin sufficient statistics once instead of
+      // repeating Z/W and 1/W for every (contig, bin, sample) triple.  Reusing
+      // the two existing arrays avoids growing the working set:
+      //   binZ -> weighted mean, binW -> inverse total weight.
+#pragma omp parallel for schedule(static)
+      for (size_t q = 0; q < numElig * ABD_Sloc; ++q) {
+        const double W = binW[q];
+        if (W > 0.0) {
+          binZ[q] /= W;
+          binW[q] = 1.0 / W;
+        } else {
+          binW[q] = 0.0;
+        }
+      }
+
       double alpha = g_abd_alpha;
       if (const char *e = getenv("RABBIT_BIN_RECRUIT_ALPHA")) alpha = atof(e);
       const double crit = rb_chi2_crit(ABD_Sloc, alpha, 1);
@@ -5553,41 +5581,58 @@ static int rb_cmd_bin(int ac, char *av[]) {
                       ABD_Sloc, crit, alpha, numElig,
                       getUsedPhysMem(), getTotalPhysMem() / 1024 / 1024);
 
-      auto t2_contig_bin = [&](size_t c, size_t e) -> double {
+      // Prepare the two contig-only terms once per contig.  Previously this
+      // work (including the costly log1p) was repeated for every eligible bin.
+      auto prepare_contig = [&](size_t c, double *y, double *v) {
         const double L = std::max(rb_contig_len(c), 1.0);
-        const double *W = binW.data() + e * ABD_Sloc;
-        const double *Z = binZ.data() + e * ABD_Sloc;
+        for (size_t k = 0; k < ABD_Sloc; ++k) {
+          y[k] = rb_abd_y(c, k);
+          v[k] = g_abd_var.a[k] + g_abd_var.b[k] / L;
+        }
+      };
+      auto contig_bin_passes = [&](const double *y, const double *v,
+                                   size_t e) -> bool {
+        const double *invW = binW.data() + e * ABD_Sloc;
+        const double *mu   = binZ.data() + e * ABD_Sloc;
         double t2 = 0.0;
         for (size_t k = 0; k < ABD_Sloc; ++k) {
-          if (!(W[k] > 0.0)) continue;
-          const double v = g_abd_var.a[k] + g_abd_var.b[k] / L;
-          if (!(v > 1e-12)) continue;
-          const double d = rb_abd_y(c, k) - Z[k] / W[k];
-          t2 += d * d / (v + 1.0 / W[k]);
+          if (!(invW[k] > 0.0) || !(v[k] > 1e-12)) continue;
+          const double d = y[k] - mu[k];
+          t2 += d * d / (v[k] + invW[k]);
+          // Every term is non-negative.  Once the partial sum is over the
+          // chi-square bar this bin cannot pass, so the remaining samples are
+          // dead work.  Keep the original sample order for candidates that can
+          // pass, preserving their floating-point result exactly.
+          if (t2 > crit) return false;
         }
-        return t2;
+        return t2 <= crit;
       };
 
       verbose_message("Binning lost contigs over %d leftovers and %d bins...      "
                       "          \n",
                       leftovers.size(), cls.size());
       ProgressTracker lost_progress(leftovers.size());
-#pragma omp parallel for schedule(dynamic, 64)
-      for (size_t l = 0; l < leftovers.size(); ++l) {
-        lost_progress.track();
-        if (verbose && omp_get_thread_num() == 0 && lost_progress.isStepMarker())
-          verbose_message("Finding lost contigs %s\r", lost_progress.getProgress());
-        int n_pass = 0, best_e = -1;
-        for (size_t e = 0; e < numElig; ++e) {
-          if (t2_contig_bin(leftovers[l], e) <= crit) {
-            ++n_pass;
-            if (n_pass > 1) { best_e = -1; break; }
-            best_e = (int)e;
+#pragma omp parallel num_threads(numThreads)
+      {
+        std::vector<double> contig_y(ABD_Sloc), contig_v(ABD_Sloc);
+#pragma omp for schedule(dynamic, 64)
+        for (size_t l = 0; l < leftovers.size(); ++l) {
+          lost_progress.track();
+          if (verbose && omp_get_thread_num() == 0 && lost_progress.isStepMarker())
+            verbose_message("Finding lost contigs %s\r", lost_progress.getProgress());
+          prepare_contig(leftovers[l], contig_y.data(), contig_v.data());
+          int n_pass = 0, best_e = -1;
+          for (size_t e = 0; e < numElig; ++e) {
+            if (contig_bin_passes(contig_y.data(), contig_v.data(), e)) {
+              ++n_pass;
+              if (n_pass > 1) { best_e = -1; break; }
+              best_e = (int)e;
+            }
           }
-        }
-        if (n_pass == 1 && best_e >= 0) {
+          if (n_pass == 1 && best_e >= 0) {
 #pragma omp critical(ADD_LEFTOVER_CONTIGS)
-          cls_leftovers[recruit_clsid[best_e]].push_back(leftovers[l]);
+            cls_leftovers[recruit_clsid[best_e]].push_back(leftovers[l]);
+          }
         }
       }
 
@@ -5616,30 +5661,35 @@ static int rb_cmd_bin(int ac, char *av[]) {
 
         ProgressTracker small_progress(nobs1);
         constexpr size_t SB = 64;
-#pragma omp parallel for schedule(dynamic)
-        for (size_t s0 = 0; s0 < nobs1; s0 += SB) {
-          const size_t s1 = std::min(s0 + SB, nobs1);
-          for (size_t s = s0; s < s1; ++s) {
-            int n_pass = 0, best_e = -1;
-            for (size_t e = 0; e < numElig; ++e) {
-              if (t2_contig_bin(s + nobs, e) <= crit) {
-                ++n_pass;
-                if (n_pass == 1) best_e = (int)e;
-                else { best_e = -1; break; }
+#pragma omp parallel num_threads(numThreads)
+        {
+          std::vector<double> contig_y(ABD_Sloc), contig_v(ABD_Sloc);
+#pragma omp for schedule(dynamic)
+          for (size_t s0 = 0; s0 < nobs1; s0 += SB) {
+            const size_t s1 = std::min(s0 + SB, nobs1);
+            for (size_t s = s0; s < s1; ++s) {
+              prepare_contig(s + nobs, contig_y.data(), contig_v.data());
+              int n_pass = 0, best_e = -1;
+              for (size_t e = 0; e < numElig; ++e) {
+                if (contig_bin_passes(contig_y.data(), contig_v.data(), e)) {
+                  ++n_pass;
+                  if (n_pass == 1) best_e = (int)e;
+                  else { best_e = -1; break; }
+                }
+              }
+              if (g_small_prof) {
+                const int bucket = n_pass == 0 ? 0 : (n_pass == 1 ? 1 : 2);
+                g_small_ncand[bucket].fetch_add(1, std::memory_order_relaxed);
+              }
+              if (n_pass == 1 && best_e >= 0) {
+#pragma omp critical(ADD_SMALL_CONTIGS)
+                cls_small[recruit_clsid[best_e]].push_back(s + nobs);
               }
             }
-            if (g_small_prof) {
-              const int bucket = n_pass == 0 ? 0 : (n_pass == 1 ? 1 : 2);
-              g_small_ncand[bucket].fetch_add(1, std::memory_order_relaxed);
-            }
-            if (n_pass == 1 && best_e >= 0) {
-#pragma omp critical(ADD_SMALL_CONTIGS)
-              cls_small[recruit_clsid[best_e]].push_back(s + nobs);
-            }
+            small_progress.track(s1 - s0);
+            if (verbose && omp_get_thread_num() == 0 && small_progress.isStepMarker())
+              verbose_message("Binning small contigs %s\r", small_progress.getProgress());
           }
-          small_progress.track(s1 - s0);
-          if (verbose && omp_get_thread_num() == 0 && small_progress.isStepMarker())
-            verbose_message("Binning small contigs %s\r", small_progress.getProgress());
         }
         if (g_small_prof) {
           const uint64_t n0 = g_small_ncand[0].load(), n1 = g_small_ncand[1].load(),

@@ -140,7 +140,13 @@ if(RABBITBIN_MAP_OK)
 else()
   message(STATUS "rabbitbin: align/sort/index subcommands disabled (need htslib)")
 endif()
-target_link_libraries(rabbitbin ${ZLIB_LIBRARIES} ${Boost_LIBRARIES} ${EXTRALIBS} RabbitBin_VERSION_LIB deflate)
+target_link_libraries(rabbitbin ${ZLIB_LIBRARIES} ${Boost_LIBRARIES} ${EXTRALIBS} RabbitBin_VERSION_LIB)
+if(DEFLATE_LIB)
+  # Link the exact library resolved by find_library().  Using the bare name
+  # `deflate` loses the non-system search directory (for example a pixi/conda
+  # prefix) and makes an otherwise valid clean build fail at the final link.
+  target_link_libraries(rabbitbin ${DEFLATE_LIB})
+endif()
 if(RABBITBIN_CAN_FUSE)
   # RABBITBIN_FUSE      → rabbitbin.cpp enables the BAM input path
   # RABBIT_DEPTH_NO_MAIN→ rabbit_depth.cpp drops main() (only shared symbol)
