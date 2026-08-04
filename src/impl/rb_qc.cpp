@@ -175,7 +175,7 @@ void rb_qc_ensemble(const std::vector<std::vector<size_t>> &mems_all,
       cls_c[mem[i]].push_back(i);
     min_bin_bp = saved_min_bin_bp;
     if (g_split_abundance || !g_no_split_abundance)
-      abundance_guided_split(cls_c);
+      abundance_guided_split_current(cls_c);
     for (auto &kv : cls_c) {
       if (kv.second.size() < 2) continue;          // skip singletons
       double comp, cont;

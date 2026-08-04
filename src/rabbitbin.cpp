@@ -100,6 +100,9 @@ static uint32_t sketch_bits        = 2;    // bits per OPH bucket (bit-planes)
 static std::string marker_seed_file;
 static int         splitMaxK        = 6;  // cap on sub-clusters per split bin
 static int         splitMinContigs  = 6;  // min contigs in a bin to consider
+static size_t      splitMinSubContigs = 3; // reject a split with a smaller child
+static size_t      splitMinSubBp      = 0; // optional minimum child span (0=off)
+static int         splitKmeansRestarts = 10;
 // ── Marker-FREE Phase-2 split (--split-bins) ──────────────────────────────
 // Splits internally multi-modal bins using only the multi-sample abundance
 // already computed (no gene prediction / HMM / seed file).  A bin is split
@@ -107,6 +110,11 @@ static int         splitMinContigs  = 6;  // min contigs in a bin to consider
 // best silhouette >= g_split_sil.
 static bool        g_split_abundance      = true;  // ON by default; --noAbdSplit disables
 static bool        g_no_split_abundance   = false; // --noAbdSplit
+static bool        g_simple_refinement    = false; // evaluated split-first fixed-core path
+static bool        g_fixed_core_recruit   = false; // fixed cores + established refinement tail
+static bool        g_no_singleton_rescue  = false; // single-factor ablation control
+static bool        g_stable_split_kmeans  = false; // seed from canonical bin membership
+static bool        g_split_reject_small   = false; // apply child guards to current splitter
 static double      g_split_sil      = 0.70;  // silhouette threshold (RABBIT_SPLIT_SIL)
 static size_t      g_sil_sample_cap = 600;   // sample cap for O(n^2) silhouette
 // Content-conserving retention of sub-min_bin_bp bins. A small bin is retained
@@ -135,14 +143,6 @@ static double      g_split_consolidate_delta = 0.0;
 // Agglomerates compatible fragments using paired-end linkage as the decisive
 // physical signal and depth-centroid agreement as a consistency check.
 static bool        g_bin_merge        = true;
-// Marker-free decontamination: drop a contig
-// from a >=floor bin when it is a depth-abundance outlier vs the bin centroid AND
-// has NO paired-end link to any other bin member.  PE is a PROTECT signal (a
-// physical link proves co-membership, so the contig is never removed), so this
-// only sheds contigs that look foreign by BOTH abundance and physical linkage —
-// raising purity without touching physically supported members. Only coherent
-// bins are cleaned; the operation is subtraction-only.
-static bool        g_bin_decontam     = true;
 // Composition+depth recruitment of unbinned contigs into cores. For each
 // unbinned large contig, attach it to the core it matches on both tetranucleotide
 // composition (cosine) AND abundance (depth-corr) — a conjunctive gate (a
@@ -637,15 +637,11 @@ static double rb_env_split_consolidate_delta() {
 }
 static bool rb_env_bin_merge() {
   const char *e = rb_getenv("RABBIT_BIN_MERGE");
-  return !e || e[0] != '0';            // default ON (BAM path); RABBIT_BIN_MERGE=0 disables
-}
-static bool rb_env_bin_decontam() {
-  const char *e = rb_getenv("RABBIT_BIN_DECONTAM");
-  return !e || e[0] != '0';            // default ON (BAM path); RABBIT_BIN_DECONTAM=0 disables
+  return !e || e[0] != '0';
 }
 static bool rb_env_bin_recruit() {
   const char *e = rb_getenv("RABBIT_BIN_RECRUIT");
-  return !e || e[0] != '0';            // default ON (BAM path); RABBIT_BIN_RECRUIT=0 disables
+  return !e || e[0] != '0';
 }
 static bool rb_env_depth_prefilter_on() {
   const char *e = rb_getenv("RABBIT_DEPTH_PREFILTER");
@@ -3000,7 +2996,7 @@ static std::vector<int> rb_kmeans(const float *X, size_t n, size_t d,
   std::vector<double> csum((size_t)k * d);
   std::vector<int>    ccnt(k);
 
-  for (int init = 0; init < 10; ++init) {
+  for (int init = 0; init < splitKmeansRestarts; ++init) {
     // ── k-means++ seeding ──
     std::uniform_int_distribution<size_t> u0(0, n - 1);
     std::copy_n(X + u0(rng) * d, d, cent.begin());
@@ -3114,6 +3110,9 @@ static int rb_cmd_bin(int ac, char *av[]) {
       ("sketch-m", po::value<uint32_t>(&sketch_size)->default_value(500), "Sketch size (PMH registers)")
       ("sketch-b", po::value<uint32_t>(&sketch_bits)->default_value(2), "MinHash bucket bits")
       ("no-recruit", po::value<bool>(&no_recruit)->zero_tokens(), "Disable small-contig recruiting")
+      ("simple-refinement", po::value<bool>(&g_simple_refinement)->zero_tokens(), "Experimental split-first, frozen-core mean-Spearman recruitment")
+      ("fixed-core-recruitment", po::value<bool>(&g_fixed_core_recruit)->zero_tokens(), "Ablation: fixed-core recruitment followed by the established refinement tail")
+      ("no-singleton-rescue", po::value<bool>(&g_no_singleton_rescue)->zero_tokens(), "Ablation: do not promote unassigned long contigs to singleton bins")
       ("no_gold", po::value<bool>(&no_gold)->zero_tokens(), "Label-free multi-resolution: sweep alpha/edge_power on the reused graph, auto-select max-modularity partition (no ground truth needed)")
       ("min-recruit-cluster", po::value<size_t>(&minCS)->default_value(10), "Min cluster size for recruiting")
       ("recruit-abd-centroid", po::value<bool>(&recruit_to_depth_centroid)->default_value(false)->zero_tokens(), "Recruit using abundance centroid")
@@ -3133,6 +3132,11 @@ static int rb_cmd_bin(int ac, char *av[]) {
       ("seed", po::value<unsigned long long>(&seed)->default_value(0), "Random seed (0=time)")
       ("marker-seed", po::value<std::string>(&marker_seed_file)->default_value(""), "Optional marker seed file")
       ("split-max-k", po::value<int>(&splitMaxK)->default_value(6), "Max sub-clusters per split bin")
+      ("split-min-sub-contigs", po::value<size_t>(&splitMinSubContigs)->default_value(3), "Reject a split if any child has fewer contigs")
+      ("split-min-sub-bp", po::value<size_t>(&splitMinSubBp)->default_value(0), "Reject a split if any child is shorter than this (0=off)")
+      ("split-kmeans-restarts", po::value<int>(&splitKmeansRestarts)->default_value(10), "K-means initializations per candidate K")
+      ("stable-split-kmeans", po::value<bool>(&g_stable_split_kmeans)->zero_tokens(), "Ablation: canonical members and membership-derived K-means seed")
+      ("split-reject-small-children", po::value<bool>(&g_split_reject_small)->zero_tokens(), "Ablation: apply minimum-child guards to the established splitter")
       ("split-bins", po::value<bool>(&g_split_abundance)->zero_tokens(), "Abundance bin splitting (default ON)")
       ("no-split", po::value<bool>(&g_no_split_abundance)->zero_tokens(), "Disable abundance splitting")
       ("split-silhouette", po::value<double>(&g_split_sil)->default_value(rb_env_split_sil()), "Silhouette split threshold")
@@ -3314,6 +3318,19 @@ static int rb_cmd_bin(int ac, char *av[]) {
   if (sketch_size < 2) {
     cerr << "[Error!] --sketch-m must be >= 2\n"; return 1;
   }
+  if (splitMaxK < 2) {
+    cerr << "[Error!] --split-max-k must be >= 2\n"; return 1;
+  }
+  if (splitMinSubContigs < 1) {
+    cerr << "[Error!] --split-min-sub-contigs must be >= 1\n"; return 1;
+  }
+  if (splitKmeansRestarts < 1) {
+    cerr << "[Error!] --split-kmeans-restarts must be >= 1\n"; return 1;
+  }
+  if (g_simple_refinement && g_fixed_core_recruit) {
+    cerr << "[Error!] --simple-refinement and --fixed-core-recruitment are mutually exclusive\n";
+    return 1;
+  }
   if (g_no_split_abundance) g_split_abundance = false;  // explicit opt-out
   minCVSum = std::max(minCV, minCVSum);
 
@@ -3442,13 +3459,11 @@ static int rb_cmd_bin(int ac, char *av[]) {
                     "(abundance split/recruit disabled).\n");
   using DepthMap = phmap::flat_hash_map<std::string, RawDepthEntry>;
   std::future<DepthMap> depth_future;
-  // Resolve the merge/decontam flags BEFORE the depth/parse kickoff below: the
-  // depth async collects paired-end linkage only when one of them is on, and the
-  // rest of the env block runs only later.
-  g_bin_merge = rb_env_bin_merge();
-  g_bin_decontam = rb_env_bin_decontam();
-  g_bin_recruit = rb_env_bin_recruit();
-  g_bin_recruit = rb_env_bin_recruit();
+  // Resolve the merge flag BEFORE the depth/parse kickoff below: the depth
+  // async collects paired-end linkage only when merge is on, and the rest of
+  // the env block runs only later.
+  g_bin_merge = !g_simple_refinement && rb_env_bin_merge();
+  g_bin_recruit = !g_simple_refinement && rb_env_bin_recruit();
   {
 #ifdef RABBITBIN_FUSE
     if (fuse_mode) {
@@ -3516,10 +3531,10 @@ static int rb_cmd_bin(int ac, char *av[]) {
                                 /*intraDepthVariance=*/false, nt,
                                 snvOn ? &g_snv_result : nullptr, &cols,
                                 /*minMapQual=*/0, /*dualMapQual=*/dualQ,
-                                /*collectPELink=*/(g_bin_merge || g_bin_decontam));
-        // Stash paired-end linkage (compact-row space) for the merge/decontam
-        // passes; converted to contig indices later, once contig_names is ready.
-        if ((g_bin_merge || g_bin_decontam) && !cols.pe_links.empty()) {
+                                /*collectPELink=*/g_bin_merge);
+        // Stash paired-end linkage (compact-row space) for the merge pass;
+        // converted to contig indices later, once contig_names is ready.
+        if (g_bin_merge && !cols.pe_links.empty()) {
           g_pe_names = cols.names;
           g_pe_links_compact = std::move(cols.pe_links);
         }
@@ -4310,7 +4325,8 @@ static int rb_cmd_bin(int ac, char *av[]) {
   g_split_guard_margin = rb_env_split_guard_margin();
   g_split_consolidate = rb_env_split_consolidate();
   g_split_consolidate_delta = rb_env_split_consolidate_delta();
-  g_bin_merge = rb_env_bin_merge();
+  g_bin_merge = !g_simple_refinement && rb_env_bin_merge();
+  g_bin_recruit = !g_simple_refinement && rb_env_bin_recruit();
   g_mutual_knn  = rb_env_mutual_knn_on();
   g_neg_depth_thr = rb_env_neg_depth_thr();
   g_edge_power  = [] { const char *e = rb_getenv("RABBIT_EDGE_POWER"); double v = e ? std::atof(e) : 1.0;
@@ -4929,7 +4945,8 @@ static int rb_cmd_bin(int ac, char *av[]) {
               for (size_t i = 0; i < nobs; ++i)
                 if (!g.incs[i].empty()) c2[mems_all[c][i]].push_back(i);
               min_bin_bp = saved_min; g_split_sil = sil;
-              if (g_split_abundance || !g_no_split_abundance) abundance_guided_split(c2);
+              if (g_split_abundance || !g_no_split_abundance)
+                abundance_guided_split_current(c2);
               long nc = 0;
               for (auto &kv : c2) {
                 phmap::flat_hash_map<int, int> cnt;
@@ -5340,7 +5357,7 @@ static int rb_cmd_bin(int ac, char *av[]) {
       }
     } // graph g destroyed here
 
-    if (no_recruit) break;
+    if (g_simple_refinement || g_fixed_core_recruit || no_recruit) break;
 
     // ── 7. Recruit lost and small contigs ─────────────────────────────────
     std::vector<size_t> leftovers;
@@ -5791,7 +5808,8 @@ static int rb_cmd_bin(int ac, char *av[]) {
                       (int)minContig);
 
   } while (false);
-  rb_phase("recruit done");
+  rb_phase((g_simple_refinement || g_fixed_core_recruit)
+               ? "initial bins done" : "recruit done");
 
   // Release centroid sketches
   for (auto *p : g_centroids) delete p;
@@ -5801,9 +5819,12 @@ static int rb_cmd_bin(int ac, char *av[]) {
   for (auto *p : g_sketches) delete p;
   g_sketches.clear();
 
-  verbose_message("Rescuing singleton large contigs\n");
-  promote_singleton_bins(cls);
-  rb_phase("  promote singletons");
+  if (!g_simple_refinement && !g_fixed_core_recruit &&
+      !g_no_singleton_rescue) {
+    verbose_message("Rescuing singleton large contigs\n");
+    promote_singleton_bins(cls);
+    rb_phase("  promote singletons");
+  }
 
   // ── Output-time annotations: load SCG markers / taxonomy if requested ─────
   if (g_keep_hq_only) g_qc_annotate = true;
@@ -5816,22 +5837,48 @@ static int rb_cmd_bin(int ac, char *av[]) {
   // ── Phase 2: split contaminated/multi-modal bins (+ optional purify) ──────
   // An explicit --marker-seed takes priority (marker-guided); otherwise the
   // default marker-free abundance split runs (disable with --no-split).
-  auto do_split_purify = [&](BinMap &c) {
-    const size_t merge_floor = min_bin_bp;   // captured BEFORE the split zeroes it
+  // --simple-refinement evaluates the proposed split-first/frozen-core flow.
+  // The established refinement remains the default because the CAMI2 ablation
+  // currently shows a recovery regression for the simplified path.
+  auto do_refine = [&](BinMap &c) {
+    const size_t merge_floor = min_bin_bp;
     if (!marker_seed_file.empty()) {
       verbose_message("Marker-guided bin splitting...\n");
       marker_guided_split(c);
     } else if (g_split_abundance) {
       verbose_message("Abundance-guided bin splitting (marker-free)...\n");
-      abundance_guided_split(c);
+      if (g_simple_refinement) abundance_guided_split_simple(c);
+      else                     abundance_guided_split_current(c);
     }
     rb_phase("  split: abundance");
-    if (g_bin_merge) consolidate_bins(c, merge_floor);     // unite same-genome fragments
-    rb_phase("  split: consolidate");
-    if (g_bin_recruit) recruit_unbinned_to_cores(c, merge_floor); // attach unbinned tails
-    rb_phase("  split: bin-recruit");
-    if (g_bin_decontam) decontaminate_bins(c, merge_floor); // shed foreign contigs
-    rb_phase("  split: decontam");
+    if (g_simple_refinement) {
+      recruit_to_frozen_cores(c, merge_floor);
+      rb_phase("  recruit: fixed cores");
+      if (!g_no_singleton_rescue) {
+        verbose_message("Rescuing singleton large contigs\n");
+        promote_singleton_bins(c);
+        rb_phase("  promote singletons");
+      }
+    } else {
+      if (g_fixed_core_recruit) {
+        recruit_to_frozen_cores(c, merge_floor);
+        rb_phase("  recruit: fixed cores");
+      }
+      if (g_bin_merge) consolidate_bins(c, merge_floor);
+      rb_phase("  split: consolidate");
+      if (g_bin_recruit) recruit_unbinned_to_cores(c, merge_floor);
+      rb_phase("  split: bin-recruit");
+      // In the hybrid fixed-core ablation, leave candidates unassigned until
+      // both established recovery passes have had a chance to inspect them.
+      if (g_fixed_core_recruit && !g_no_singleton_rescue) {
+        verbose_message("Rescuing singleton large contigs\n");
+        const size_t saved_floor = min_bin_bp;
+        min_bin_bp = merge_floor;
+        promote_singleton_bins(c);
+        min_bin_bp = saved_floor;
+        rb_phase("  promote singletons");
+      }
+    }
     if (g_purify) {
       verbose_message("Contamination-aware purification...\n");
       rb_purify_bins(c);
@@ -5852,8 +5899,8 @@ static int rb_cmd_bin(int ac, char *av[]) {
   }
 
   if (g_resolutions.empty()) {
-    do_split_purify(cls);
-    rb_phase("split done");
+    do_refine(cls);
+    rb_phase("refinement done");
     verbose_message("Outputting bins\n");
     output_bins(cls);
   } else {
@@ -5887,7 +5934,7 @@ static int rb_cmd_bin(int ac, char *av[]) {
       outFile = base + "." + std::get<0>(r);
       verbose_message("[resolution %s] min-bin-bp=%zu split-sil=%.2f\n",
                       std::get<0>(r).c_str(), min_bin_bp, g_split_sil);
-      do_split_purify(c);
+      do_refine(c);
       output_bins(c);
     }
     outFile = base; min_bin_bp = saved_min; g_split_sil = saved_sil;

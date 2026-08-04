@@ -135,6 +135,7 @@ static int rb_cmd_amber(int ac, char *av[]) {
   std::string gold_path, query_path, out_path, members_path;
   size_t threads = 0;
   size_t min_length = 0;      // GS contig length filter (AMBER --min_length)
+  size_t min_bin_size = 0;    // predicted-bin size filter (bp; 0 = keep all)
   bool quiet_amber = false;
 
   po::options_description desc("rabbitbin amber options", 100, 50);
@@ -145,6 +146,8 @@ static int rb_cmd_amber(int ac, char *av[]) {
       ("members", po::value<std::string>(&members_path), "Predicted binning as rabbitbin members.tsv (BinNum<TAB>SequenceName)")
       ("output,o", po::value<std::string>(&out_path), "Write per-bin metrics TSV here (dir or file; optional)")
       ("min-length", po::value<size_t>(&min_length)->default_value(0), "Ignore GS contigs shorter than this")
+      ("min-bin-size", po::value<size_t>(&min_bin_size)->default_value(0),
+       "Ignore predicted bins whose total GS bp is below this (e.g. 200000)")
       ("threads,t", po::value<size_t>(&threads)->default_value(0), "Threads (0=all online CPUs)")
       ("quiet,q", po::value<bool>(&quiet_amber)->zero_tokens(), "Only print the summary");
 
@@ -335,10 +338,20 @@ static int rb_cmd_amber(int ac, char *av[]) {
     }
 
     // ── 5. Recovered-bin counts (AMBER strict >) + averages ─────────────────
-    long hq = 0, mq = 0, lq = 0, nonempty = 0;
+    // Optional predicted-bin size gate: drop bins whose summed GS contig length
+    // is below --min-bin-size BEFORE HQ/MQ/LQ / average purity are counted.
+    // This is independent of RabbitBin's output --min-bin-size (which may be
+    // relaxed after split/recruit) and matches the academic ">=200kb MAG" rule.
+    long hq = 0, mq = 0, lq = 0, nonempty = 0, dropped_small = 0;
     double sum_prec = 0.0, sum_tp = 0.0, sum_total = 0.0;
+    std::vector<char> bin_keep(nbins, 0);
     for (int b = 0; b < nbins; ++b) {
       if (bin_gen[b].empty()) continue;
+      if (min_bin_size > 0 && bin_total[b] < (double)min_bin_size) {
+        ++dropped_small;
+        continue;
+      }
+      bin_keep[b] = 1;
       ++nonempty;
       sum_prec += bin_prec[b];
       sum_tp += bin_tp[b];
@@ -349,9 +362,10 @@ static int rb_cmd_amber(int ac, char *av[]) {
     }
 
     // Per-genome best-bin completeness (AMBER recall_df: avg over all GS genomes).
+    // Only bins that pass the size gate contribute.
     std::vector<double> gen_best_recall(genomes.names.size(), 0.0);
     for (int b = 0; b < nbins; ++b) {
-      if (bin_gen[b].empty()) continue;
+      if (!bin_keep[b]) continue;
       for (auto &gp : bin_gen[b]) {
         double r = (gsize[gp.first] > 0.0) ? gp.second / gsize[gp.first] : 0.0;
         if (r > gen_best_recall[gp.first]) gen_best_recall[gp.first] = r;
@@ -377,7 +391,7 @@ static int rb_cmd_amber(int ac, char *av[]) {
       fputs("BINID\tmost_abundant_genome\tPurity (bp)\tCompleteness (bp)\t"
             "total_length\ttp_length\ttotal_seq_counts\n", f);
       for (int b = 0; b < nbins; ++b) {
-        if (bin_gen[b].empty()) continue;
+        if (!bin_keep[b]) continue;
         fprintf(f, "%s\t%s\t%.6f\t%.6f\t%.0f\t%.0f\t%ld\n",
                 bins.names[b].c_str(),
                 genomes.names[bin_domgen[b]].c_str(),
@@ -388,18 +402,24 @@ static int rb_cmd_amber(int ac, char *av[]) {
         fprintf(stderr, "[rabbitbin amber] wrote per-bin metrics: %s\n", fpath.c_str());
     }
 
-    if (!quiet_amber)
+    if (!quiet_amber) {
       fprintf(stderr, "[rabbitbin amber] query: %zu unique seqs (%zu not in GS, "
-                      "%zu multi-bin kept-first), %d bins in %.2fs\n",
+                      "%zu multi-bin kept-first), %d bins (%ld kept) in %.2fs\n",
               M, M - (size_t)std::count_if(uq_gen.begin(), uq_gen.end(),
                                            [](int g){ return g >= 0; }),
-              conflicts, nbins, secs(t_q));
+              conflicts, nbins, nonempty, secs(t_q));
+      if (min_bin_size > 0)
+        fprintf(stderr, "[rabbitbin amber] dropped %ld bins < min-bin-size=%zu\n",
+                dropped_small, min_bin_size);
+    }
 
     // ── Summary (stdout) ────────────────────────────────────────────────────
     double prec_weighted = (sum_total > 0.0) ? sum_tp / sum_total : 0.0;
     printf("== rabbitbin amber summary ==\n");
     printf("genomes (gold)         : %zu\n", ngen);
     printf("predicted bins         : %ld\n", nonempty);
+    if (min_bin_size > 0)
+      printf("dropped (<min-bin-size): %ld (threshold=%zu)\n", dropped_small, min_bin_size);
     printf("HQ (comp>0.90,pur>0.95): %ld\n", hq);
     printf("MQ (comp>0.70,pur>0.90): %ld\n", mq);
     printf("LQ (comp>0.50,pur>0.90): %ld\n", lq);
