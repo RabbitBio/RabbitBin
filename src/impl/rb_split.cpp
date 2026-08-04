@@ -174,7 +174,7 @@ static double fkmv_silhouette(const float *X, size_t n, size_t d,
 
 // Re-split internally multi-modal bins using per-sample log-abundance KMeans,
 // choosing k by silhouette.  No markers / gene prediction needed.
-static void abundance_guided_split(BinMap &cls) {
+static void abundance_guided_split_current(BinMap &cls) {
   if (num_depth_samples < 1) {
     verbose_message("Abundance split: needs >=1 abundance sample — skipped\n");
     return;
@@ -228,17 +228,41 @@ static void abundance_guided_split(BinMap &cls) {
   // stays byte-for-byte unchanged.
   auto split_bin = [&](const ContigVector &contigs, size_t bi,
                        std::vector<ContigVector> &sub) -> bool {
-    const size_t n = contigs.size();
+    ContigVector canonical;
+    const ContigVector *work = &contigs;
+    if (g_stable_split_kmeans) {
+      canonical = contigs;
+      std::sort(canonical.begin(), canonical.end());
+      work = &canonical;
+    }
+    const ContigVector &items = *work;
+    const size_t n = items.size();
     if ((int)n < splitMinContigs) return false;
     const size_t sd = (size_t)num_depth_samples;
     auto tk0 = std::chrono::steady_clock::now();
     std::vector<float> X(n * sd);
     for (size_t r = 0; r < n; ++r)
       for (size_t i = 0; i < sd; ++i)
-        X[r * sd + i] = (float)std::log(depth_at(contigs[r], i) + 1.0);
+        X[r * sd + i] = (float)std::log(depth_at(items[r], i) + 1.0);
     if (g_km_prof) rb_prof_add(g_ms_feat, tk0);
-    std::mt19937 rng((unsigned)((seed ? (uint64_t)seed : 1ULL)
-                                + bi * 2654435761ULL));
+    uint64_t rng_seed = (seed ? (uint64_t)seed : 1ULL) + bi * 2654435761ULL;
+    unsigned rng_seed32 = (unsigned)rng_seed; // preserve the established path
+    if (g_stable_split_kmeans) {
+      // FNV-1a over canonical contig indices: the same biological bin gets the
+      // same RNG stream even when hash-map iteration changes its transient ID.
+      uint64_t h = 1469598103934665603ULL;
+      for (size_t c : items) {
+        uint64_t x = (uint64_t)c;
+        for (int b = 0; b < 8; ++b) {
+          h ^= (unsigned char)(x & 0xffU);
+          h *= 1099511628211ULL;
+          x >>= 8;
+        }
+      }
+      rng_seed = (seed ? (uint64_t)seed : 1ULL) ^ h;
+      rng_seed32 = (unsigned)(rng_seed ^ (rng_seed >> 32));
+    }
+    std::mt19937 rng(rng_seed32);
     int best_k = 1; double best_sil = -1.0; std::vector<int> best_labels;
     int kmax = std::min((int)n - 1, splitMaxK);
     for (int k = 2; k <= kmax; ++k) {
@@ -247,6 +271,25 @@ static void abundance_guided_split(BinMap &cls) {
       if (g_km_prof) rb_prof_add(g_ms_kmeans, tk0);
       int seen = 0; { std::vector<char> u(k, 0); for (int l : lab) if (!u[l]) { u[l] = 1; ++seen; } }
       if (seen < 2) continue;
+      if (g_split_reject_small) {
+        std::vector<size_t> child_n((size_t)k, 0), child_bp((size_t)k, 0);
+        for (size_t r = 0; r < n; ++r) {
+          const size_t lab_r = (size_t)lab[r];
+          ++child_n[lab_r];
+          const size_t c = items[r];
+          child_bp[lab_r] += (c < nobs) ? seq_lens[c]
+                                           : small_seq_lens[c - nobs];
+        }
+        bool valid = true;
+        for (int j = 0; j < k; ++j) {
+          if (child_n[(size_t)j] < splitMinSubContigs ||
+              (splitMinSubBp > 0 && child_bp[(size_t)j] < splitMinSubBp)) {
+            valid = false;
+            break;
+          }
+        }
+        if (!valid) continue;
+      }
       tk0 = std::chrono::steady_clock::now();
       double s = fkmv_silhouette(X.data(), n, sd, lab, k, rng);
       if (g_km_prof) rb_prof_add(g_ms_sil, tk0);
@@ -254,7 +297,7 @@ static void abundance_guided_split(BinMap &cls) {
     }
     if (best_k <= 1 || best_sil < g_split_sil) return false;
     sub.assign(best_k, ContigVector());
-    for (size_t r = 0; r < n; ++r) sub[best_labels[r]].push_back(contigs[r]);
+    for (size_t r = 0; r < n; ++r) sub[best_labels[r]].push_back(items[r]);
     return true;
   };
 
@@ -546,7 +589,293 @@ static void abundance_guided_split(BinMap &cls) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Shared abundance statistics — one test for merge / shed / recruit
+// Simplified marker-free splitter. Coverage features are log1p transformed. For
+// every K, K-means uses several deterministic initialisations; only partitions
+// whose every child clears the configured size guards compete by silhouette.
+// Rejecting an invalid proposal leaves the parent intact, so an outlier child is
+// never silently discarded.
+static void abundance_guided_split_simple(BinMap &cls) {
+  if (num_depth_samples < 1) {
+    verbose_message("Abundance split: needs >=1 abundance sample — skipped\n");
+    return;
+  }
+  if (cls.empty()) return;
+
+  const size_t S = (size_t)num_depth_samples;
+  auto depth_at = [&](size_t c, size_t k) -> double {
+    if (c < nobs) {
+      const size_t o = c * S + k;
+      if (o < g_large_means.size()) return (double)g_large_means[o];
+      return (double)depth_matrix(c, k);
+    }
+    const size_t s = c - nobs;
+    const size_t o = s * S + k;
+    if (o < g_small_means.size()) return (double)g_small_means[o];
+    return (double)small_depth_matrix(s, k);
+  };
+  auto child_bp = [&](const ContigVector &cs) -> size_t {
+    size_t bp = 0;
+    for (size_t c : cs)
+      bp += (c < nobs) ? seq_lens[c] : small_seq_lens[c - nobs];
+    return bp;
+  };
+
+  struct InputBin { int id; const ContigVector *members; };
+  std::vector<InputBin> bins;
+  bins.reserve(cls.size());
+  int next_id = 0;
+  for (auto &kv : cls) {
+    bins.push_back({kv.first, &kv.second});
+    next_id = std::max(next_id, kv.first + 1);
+  }
+  std::sort(bins.begin(), bins.end(),
+            [](const InputBin &a, const InputBin &b) { return a.id < b.id; });
+
+  struct SplitResult {
+    std::vector<ContigVector> children;
+    size_t rejected_small = 0;
+  };
+  std::vector<SplitResult> results(bins.size());
+
+#pragma omp parallel for schedule(dynamic, 1) num_threads(numThreads)
+  for (size_t bi = 0; bi < bins.size(); ++bi) {
+    const ContigVector &members = *bins[bi].members;
+    const size_t n = members.size();
+    if ((int)n < splitMinContigs) continue;
+
+    int kmax = std::min(splitMaxK, (int)n - 1);
+    if (splitMinSubContigs > 1)
+      kmax = std::min(kmax, (int)(n / splitMinSubContigs));
+    if (kmax < 2) continue;
+
+    std::vector<float> X(n * S);
+    for (size_t r = 0; r < n; ++r)
+      for (size_t k = 0; k < S; ++k)
+        X[r * S + k] = (float)std::log1p(std::max(0.0, depth_at(members[r], k)));
+
+    const uint64_t base_seed = seed ? (uint64_t)seed : 1ULL;
+    std::mt19937 rng((uint32_t)(base_seed ^
+        ((uint64_t)(uint32_t)bins[bi].id + 0x9e3779b9ULL) * 2654435761ULL));
+    double best_sil = -1.0;
+    std::vector<ContigVector> best_children;
+
+    for (int k = 2; k <= kmax; ++k) {
+      std::vector<int> labels = rb_kmeans(X.data(), n, S, k, rng);
+      std::vector<ContigVector> children((size_t)k);
+      for (size_t r = 0; r < n; ++r) {
+        const int lab = labels[r];
+        if (lab >= 0 && lab < k) children[(size_t)lab].push_back(members[r]);
+      }
+
+      bool valid = true;
+      for (const auto &child : children) {
+        if (child.size() < splitMinSubContigs ||
+            (splitMinSubBp > 0 && child_bp(child) < splitMinSubBp)) {
+          valid = false;
+          break;
+        }
+      }
+      if (!valid) {
+        ++results[bi].rejected_small;
+        continue;
+      }
+
+      const double sil = fkmv_silhouette(X.data(), n, S, labels, k, rng);
+      if (sil > best_sil) {
+        best_sil = sil;
+        best_children = std::move(children);
+      }
+    }
+
+    if (best_sil >= g_split_sil)
+      results[bi].children = std::move(best_children);
+  }
+
+  BinMap out;
+  out.reserve(cls.size() * 2);
+  size_t n_split = 0, rejected_small = 0;
+  for (size_t bi = 0; bi < bins.size(); ++bi) {
+    SplitResult &res = results[bi];
+    rejected_small += res.rejected_small;
+    if (res.children.size() < 2) {
+      out[bins[bi].id] = *bins[bi].members;
+      continue;
+    }
+    ++n_split;
+    out[bins[bi].id] = std::move(res.children[0]);
+    for (size_t i = 1; i < res.children.size(); ++i)
+      out[next_id++] = std::move(res.children[i]);
+  }
+  cls.swap(out);
+  verbose_message("Abundance split (log1p, K=2..%d, restarts=%d, sil>=%.2f, "
+                  "child>=%zu contigs, child>=%zu bp): %zu split, %zu kept, "
+                  "%zu invalid-K proposals -> %zu bins\n",
+                  splitMaxK, splitKmeansRestarts, g_split_sil,
+                  splitMinSubContigs, splitMinSubBp,
+                  n_split, bins.size() - n_split, rejected_small, cls.size());
+}
+
+// A frozen core stores exactly the post-split members used to derive its
+// recruitment threshold and centroid.  Recruits are never folded back into it.
+struct FrozenRecruitCore {
+  int id = -1;
+  double threshold = 1.0;
+  std::vector<double> centroid;
+};
+
+static int frozen_core_unique_match(const float *unit, size_t S,
+                                    const std::vector<FrozenRecruitCore> &cores,
+                                    bool &ambiguous) {
+  ambiguous = false;
+  double norm2 = 0.0;
+  for (size_t k = 0; k < S; ++k) norm2 += (double)unit[k] * unit[k];
+  if (!(norm2 > 0.0)) return -1; // Spearman is undefined for a constant profile
+
+  int match = -1;
+  for (const FrozenRecruitCore &core : cores) {
+    double score = 0.0;
+    for (size_t k = 0; k < S; ++k) score += (double)unit[k] * core.centroid[k];
+    if (score >= core.threshold) {
+      if (match >= 0) {
+        ambiguous = true;
+        return -1;                 // exactly one passing bin is required
+      }
+      match = core.id;
+    }
+  }
+  return match;
+}
+
+// Recruit in two batches: unassigned long contigs first, then retained short
+// contigs.  Both batches compare independently with the same immutable cores.
+// For unit-rank vectors u, the formulas below are exactly the stated mean
+// Spearman scores, evaluated in O(nS) instead of materialising every core pair:
+//
+//   tau_b = (||sum_i u_i||^2 - sum_i ||u_i||^2) / (n(n-1))
+//   r_cb   = u_c . (sum_i u_i / n)
+static void recruit_to_frozen_cores(BinMap &cls, size_t core_floor) {
+  const size_t S = (size_t)num_depth_samples;
+  if (no_recruit || S < 2 || g_depth_unit.empty() || cls.empty()) return;
+
+  std::vector<int> ids;
+  ids.reserve(cls.size());
+  for (const auto &kv : cls) ids.push_back(kv.first);
+  std::sort(ids.begin(), ids.end());
+
+  std::vector<FrozenRecruitCore> cores;
+  cores.reserve(ids.size());
+  for (int id : ids) {
+    const ContigVector &bin = cls.find(id)->second;
+    size_t span = 0;
+    for (size_t c : bin)
+      span += (c < nobs) ? seq_lens[c] : small_seq_lens[c - nobs];
+    // A core must already satisfy the requested output floor.  Otherwise a
+    // tiny low-confidence cluster can cross the floor solely by recruitment,
+    // creating a new bin whose apparent completeness comes from the recruits.
+    if (span < core_floor) continue;
+    std::vector<double> sum(S, 0.0);
+    double self_sum = 0.0;
+    size_t valid = 0;
+    for (size_t c : bin) {
+      if (c >= nobs) continue;
+      const float *u = g_depth_unit.data() + c * S;
+      double norm2 = 0.0;
+      for (size_t k = 0; k < S; ++k) norm2 += (double)u[k] * u[k];
+      if (!(norm2 > 0.0)) continue;
+      for (size_t k = 0; k < S; ++k) sum[k] += u[k];
+      self_sum += norm2;
+      ++valid;
+    }
+    if (valid < std::max<size_t>(2, minCS)) continue;
+
+    double sum_norm2 = 0.0;
+    for (double v : sum) sum_norm2 += v * v;
+    double tau = (sum_norm2 - self_sum) /
+                 ((double)valid * (double)(valid - 1));
+    tau = std::max(-1.0, std::min(1.0, tau));
+    for (double &v : sum) v /= (double)valid;
+    FrozenRecruitCore core;
+    core.id = id;
+    core.threshold = tau;
+    core.centroid = std::move(sum);
+    cores.push_back(std::move(core));
+  }
+  if (cores.empty()) {
+    verbose_message("Frozen-core recruit: no bins have >=%zu valid coverage profiles\n",
+                    minCS);
+    return;
+  }
+
+  // This mask and the cores are frozen before either batch.  Committing the long
+  // batch therefore cannot affect any later score or threshold.
+  std::vector<char> initially_binned(nobs, 0);
+  for (const auto &kv : cls)
+    for (size_t c : kv.second) if (c < nobs) initially_binned[c] = 1;
+
+  std::vector<int> long_assignment(nobs, -1);
+  size_t long_assigned = 0, long_ambiguous = 0, long_unmatched = 0;
+#pragma omp parallel for schedule(dynamic, 128) num_threads(numThreads) \
+    reduction(+:long_assigned,long_ambiguous,long_unmatched)
+  for (size_t c = 0; c < nobs; ++c) {
+    if (initially_binned[c]) continue;
+    bool ambiguous = false;
+    const int id = frozen_core_unique_match(g_depth_unit.data() + c * S, S,
+                                            cores, ambiguous);
+    long_assignment[c] = id;
+    if (id >= 0) ++long_assigned;
+    else if (ambiguous) ++long_ambiguous;
+    else ++long_unmatched;
+  }
+  for (size_t c = 0; c < nobs; ++c)
+    if (long_assignment[c] >= 0) cls[long_assignment[c]].push_back(c);
+  verbose_message("Frozen-core recruit (mean Spearman, unique-bin): long %zu assigned, "
+                  "%zu ambiguous, %zu unmatched against %zu cores\n",
+                  long_assigned, long_ambiguous, long_unmatched, cores.size());
+
+  std::vector<int> short_assignment(nobs1, -1);
+  size_t short_assigned = 0, short_ambiguous = 0, short_unmatched = 0;
+  unsigned long long short_bp = 0;
+#pragma omp parallel num_threads(numThreads) \
+    reduction(+:short_assigned,short_ambiguous,short_unmatched)
+  {
+    std::vector<double> raw(S), ranked(S);
+    std::vector<float> unit(S);
+#pragma omp for schedule(dynamic, 128)
+    for (size_t s = 0; s < nobs1; ++s) {
+      for (size_t k = 0; k < S; ++k) raw[k] = (double)small_depth_matrix(s, k);
+      rank(raw, ranked);
+      double mean = 0.0;
+      for (double v : ranked) mean += v;
+      mean /= (double)S;
+      double ss = 0.0;
+      for (double v : ranked) { const double d = v - mean; ss += d * d; }
+      if (!(ss > 0.0)) {
+        ++short_unmatched;
+        continue;
+      }
+      const double inv = 1.0 / std::sqrt(ss);
+      for (size_t k = 0; k < S; ++k)
+        unit[k] = (float)((ranked[k] - mean) * inv);
+      bool ambiguous = false;
+      const int id = frozen_core_unique_match(unit.data(), S, cores, ambiguous);
+      short_assignment[s] = id;
+      if (id >= 0) ++short_assigned;
+      else if (ambiguous) ++short_ambiguous;
+      else ++short_unmatched;
+    }
+  }
+
+  for (size_t s = 0; s < nobs1; ++s) {
+    if (short_assignment[s] < 0) continue;
+    cls[short_assignment[s]].push_back(s + nobs);
+    short_bp += small_seq_lens[s];
+  }
+  verbose_message("Frozen-core recruit (same immutable cores): short %zu assigned "
+                  "(%llu bp), %zu ambiguous, %zu unmatched\n",
+                  short_assigned, short_bp, short_ambiguous, short_unmatched);
+}
+
+// Shared abundance statistics — one model for merge / recruit
 // ═══════════════════════════════════════════════════════════════════════════
 // Every post-clustering stage answers the same question: are these two sets of
 // contigs samples of ONE genome's coverage profile?  A fixed correlation cutoff
@@ -569,8 +898,8 @@ static void abundance_guided_split(BinMap &cls) {
 // the hypothesis that A and B come from the same genome
 //        T2(A,B) = sum_k (mu_Ak - mu_Bk)^2 / (1/W_Ak + 1/W_Bk)   ~   chi2_S
 // A single contig tested against a bin is the same expression with A = {i}, so
-// merge, shed and recruit all reduce to one statistic against one chi-square
-// critical value.  The bar follows from the sample count S and a significance
+// merge and statistical recruitment both reduce to one statistic against one
+// chi-square critical value.  The bar follows from the sample count S and a significance
 // level; short contigs receive exactly the wider tolerance the model implies.
 
 // Raw per-sample mean depth of a contig (large or small).  depth_matrix and
@@ -738,7 +1067,7 @@ static double rb_chi2_crit(size_t S, double alpha, size_t n_tests) {
   return boost::math::quantile(boost::math::complement(d, q));
 }
 
-// Family-wise significance level shared by merge / shed / recruit.
+// Family-wise significance level shared by statistical merge / recruitment.
 static double g_abd_alpha = 0.05;
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -899,127 +1228,6 @@ static void consolidate_bins(BinMap &cls, size_t floor) {
                   "candidates): %zu -> %zu bins (%zu merges, %zu rejected on "
                   "accumulated drift)\n", pe_min, S, crit, alpha, pe_pair.size(),
                   before, cls.size(), merges, n_drift);
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// Marker-free decontamination — shed foreign contigs from a bin (subtraction)
-// ═══════════════════════════════════════════════════════════════════════════
-// A contig that drifted into a bin by composition but belongs to another genome
-// has a DIFFERENT abundance profile (low depth-correlation to the bin centroid)
-// and NO paired-end linkage to the rest of the bin.  Removing such contigs raises
-// purity without reducing the main genome's completeness.  PE is a PROTECT
-// signal: any contig physically linked to a bin-mate is kept regardless of its
-// depth correlation.  Only bins that are otherwise tight (mean member corr
-// >= mu_min) are cleaned, so a uniformly noisy bin is left alone.  The
-// leave-one-out chi-square decontam was evaluated and reduced HQ on the
-// activated-sludge benchmark; keep it opt-in via RABBIT_BIN_DECONTAM_CHI2=1.
-// Subtraction-only; never enlarges a bin.
-static void decontaminate_bins(BinMap &cls, size_t floor) {
-  if (!g_bin_decontam) return;
-  const size_t S = (size_t)num_depth_samples;
-  if (S < 1 || g_depth_unit.empty() || g_pe_links_compact.empty()) return;
-
-  // Per-contig PE neighbours (binning index space), via compact-row -> name -> idx.
-  phmap::flat_hash_map<std::string, int> name2idx;
-  name2idx.reserve(nobs * 2);
-  for (size_t i = 0; i < nobs; ++i) name2idx[contig_names[i]] = (int)i;
-  auto compact2idx = [&](int32_t cr) -> int {
-    if (cr < 0 || (size_t)cr >= g_pe_names.size()) return -1;
-    std::string nm = g_pe_names[cr];
-    size_t sp = nm.find_first_of(" \t"); if (sp != std::string::npos) nm.resize(sp);
-    auto it = name2idx.find(nm);
-    return it == name2idx.end() ? -1 : it->second;
-  };
-  phmap::flat_hash_map<int, std::vector<int>> peadj;
-  for (auto &lk : g_pe_links_compact) {
-    int ia = compact2idx(std::get<0>(lk)), ib = compact2idx(std::get<1>(lk));
-    if (ia < 0 || ib < 0 || ia == ib) continue;
-    peadj[ia].push_back(ib);
-    peadj[ib].push_back(ia);
-  }
-
-  // Only decontaminate a bin that is OTHERWISE tight: its members' mean depth-
-  // correlation to the centroid is >= mu_min.  In such a bin a member sitting
-  // below abs_thr is clearly foreign (the rest agree strongly).
-  double abs_thr = 0.80;
-  double mu_min  = 0.82;
-  if (const char *e = getenv("RABBIT_BIN_DECONTAM_DCORR"))  abs_thr = atof(e);
-  if (const char *e = getenv("RABBIT_BIN_DECONTAM_MUMIN"))  mu_min  = atof(e);
-
-  auto bin_bp = [&](const ContigVector &cs) -> size_t {
-    size_t s = 0;
-    for (size_t c : cs) s += (c < nobs) ? seq_lens[c] : small_seq_lens[c - nobs];
-    return s;
-  };
-
-  std::vector<int> ids; std::vector<ContigVector*> bp;
-  for (auto &kv : cls) { ids.push_back(kv.first); bp.push_back(&kv.second); }
-  const size_t B = bp.size();
-  std::vector<std::vector<size_t>> shed(B);
-
-#pragma omp parallel for schedule(dynamic, 8) num_threads(numThreads)
-  for (size_t b = 0; b < B; ++b) {
-    ContigVector &cs = *bp[b];
-    if (bin_bp(cs) < floor) continue;
-    std::vector<size_t> L;
-    for (size_t c : cs) if (c < nobs) L.push_back(c);
-    if (L.size() < 4) continue;
-    constexpr size_t CAP = 64;
-    std::vector<size_t> Ls = L;
-    if (Ls.size() > CAP) {
-      std::vector<size_t> s; s.reserve(CAP);
-      const double step = (double)Ls.size() / (double)CAP;
-      for (size_t t = 0; t < CAP; ++t) s.push_back(Ls[(size_t)(t * step)]);
-      Ls.swap(s);
-    }
-    std::vector<float> cent(S, 0.f);
-    for (size_t c : Ls) { const float *u = g_depth_unit.data() + c * S;
-                          for (size_t k = 0; k < S; ++k) cent[k] += u[k]; }
-    double nrm = 0;
-    for (size_t k = 0; k < S; ++k) { cent[k] /= (float)Ls.size(); nrm += (double)cent[k] * cent[k]; }
-    if (nrm <= 1e-12) continue;
-    float inv = (float)(1.0 / std::sqrt(nrm));
-    for (size_t k = 0; k < S; ++k) cent[k] *= inv;
-    phmap::flat_hash_set<int> memset;
-    memset.reserve(cs.size() * 2);
-    for (size_t c : cs) if (c < nobs) memset.insert((int)c);
-    std::vector<double> corr(L.size());
-    double sum = 0;
-    for (size_t i = 0; i < L.size(); ++i) {
-      const float *u = g_depth_unit.data() + L[i] * S;
-      double dc = 0; for (size_t k = 0; k < S; ++k) dc += (double)u[k] * cent[k];
-      corr[i] = dc; sum += dc;
-    }
-    const double mu = sum / (double)L.size();
-    if (mu < mu_min) continue;
-    for (size_t i = 0; i < L.size(); ++i) {
-      if (corr[i] >= abs_thr) continue;
-      const int c = (int)L[i];
-      bool pe_to_bin = false;
-      auto it = peadj.find(c);
-      if (it != peadj.end())
-        for (int nb : it->second) if (nb != c && memset.count(nb)) { pe_to_bin = true; break; }
-      if (pe_to_bin) continue;
-      shed[b].push_back((size_t)c);
-    }
-  }
-
-  size_t n_shed = 0, n_bins_touched = 0;
-  int next_id = 0;
-  for (int id : ids) if (id >= next_id) next_id = id + 1;
-  for (size_t b = 0; b < B; ++b) {
-    if (shed[b].empty()) continue;
-    ++n_bins_touched;
-    phmap::flat_hash_set<size_t> rm(shed[b].begin(), shed[b].end());
-    ContigVector kept;
-    kept.reserve(bp[b]->size());
-    for (size_t c : *bp[b]) if (!rm.count(c)) kept.push_back(c);
-    *bp[b] = std::move(kept);
-    for (size_t c : shed[b]) { cls[next_id++] = ContigVector{c}; ++n_shed; }
-  }
-  if (n_shed)
-    verbose_message("Decontaminate (tight bins mu>=%.2f, shed corr<%.2f & no PE): "
-                    "%zu contigs from %zu bins\n", mu_min, abs_thr, n_shed, n_bins_touched);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

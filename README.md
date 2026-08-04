@@ -159,10 +159,9 @@ Both bounds are user-settable: `--min-contig` accepts any value ≥ 1500 and
 **Post-processing**
 
 5. **Contig recruitment** *(needs coverage)*. Unbinned large contigs, then
-   small contigs, are attached to a bin when exactly one bin's mean within-bin
-   abundance correlation is cleared. Small-contig recruits are dropped as a
-   whole if they would add more than 15 % of the total small-contig bases.
-   Disable with `--no-recruit`.
+   small contigs, are tested against the initial bins with a length-aware
+   abundance model and assigned only when exactly one bin passes. Disable with
+   `--no-recruit`.
 6. **Singleton rescue.** Large contigs left unbinned are promoted to their own
    single-contig bins, subject to the output size filter.
 7. **Abundance-guided bin splitting** *(needs coverage)*. Bins that are
@@ -171,12 +170,40 @@ Both bounds are user-settable: `--min-contig` accepts any value ≥ 1500 and
    split accepted only when the best silhouette ≥ `--split-silhouette`
    (default 0.70). Disable with `--no-split`. Supplying `--marker-seed`
    replaces this with marker-guided splitting.
-8. **Consolidate / recruit / decontaminate** *(needs coverage)*. Same-genome
-   fragments are merged, unbinned tails are attached to bin cores, and
-   depth-outlier contigs are shed. Disable individually with
-   `RABBIT_BIN_MERGE=0`, `RABBIT_BIN_RECRUIT=0`, `RABBIT_BIN_DECONTAM=0`.
+8. **Consolidate / secondary recruit** *(needs coverage)*. Same-genome
+   fragments are merged and unbinned tails are attached to bin cores. Disable
+   these stages with `RABBIT_BIN_MERGE=0` and `RABBIT_BIN_RECRUIT=0`.
 9. **Output size filter.** Bins smaller than `--min-bin-size` (default
    200 000 bp) are not emitted.
+
+The default workflow performs no marker-free subtraction/decontamination pass.
+Heterogeneous bins are handled by splitting; marker-backed purification remains
+available explicitly through `--markers ... --purify`.
+
+### Experimental split-first refinement
+
+`--simple-refinement` replaces post-processing stages 5–8 with a smaller,
+order-independent workflow:
+
+1. Split the initial large-contig bins using `log1p(coverage)`, seeded k-means
+   with multiple initializations, and the best silhouette over `K=2…6`.
+2. Reject a proposed partition in full if any child is smaller than
+   `--split-min-sub-contigs` or `--split-min-sub-bp`.
+3. Freeze the accepted, output-eligible bin cores that have at least
+   `--min-recruit-cluster` valid coverage profiles. Compute each core's mean
+   pairwise Spearman correlation once.
+4. Assign unbinned long contigs in one batch, then short contigs in a second
+   batch. Both batches compare only with the frozen cores, and a contig is
+   assigned only when exactly one core's threshold is met.
+
+This mode intentionally skips the default consolidate and secondary composition
+recruitment passes. It is available for controlled ablation; it is not the
+default quality preset.
+
+Additional single-factor ablation controls are `--fixed-core-recruitment`
+(fixed cores followed by the established refinement tail),
+`--no-singleton-rescue`, `--stable-split-kmeans`, and
+`--split-reject-small-children`. They are off by default.
 
 Off by default, all requiring an explicit flag: SCG quality annotation
 (`--qc`), purification (`--purify`), HQ-only output (`--keep-hq-only`),
@@ -209,9 +236,17 @@ output (`--resolutions`).
 | `--max-edges` | 200 | Maximum PMH neighbours per contig before mutual filtering |
 | `--sketch-m` | 500 | Number of ProbMinHash registers |
 | `--no-recruit` | off | Disable leftover/short-contig recruitment |
+| `--simple-refinement` | off | Use experimental split-first, frozen-core batch recruitment |
+| `--fixed-core-recruitment` | off | Test fixed-core recruitment while retaining the established refinement tail |
+| `--no-singleton-rescue` | off | Disable promotion of output-sized unassigned long contigs |
 | `--no-split` | off | Disable abundance-guided bin splitting |
 | `--split-silhouette` | 0.70 | Minimum mean silhouette to accept a split |
 | `--split-max-k` | 6 | Maximum sub-clusters per split bin |
+| `--split-min-sub-contigs` | 3 | In simple refinement, reject a split with a smaller child |
+| `--split-min-sub-bp` | 0 (off) | In simple refinement, reject a split with a shorter child |
+| `--split-kmeans-restarts` | 10 | K-means initializations tested for each K |
+| `--stable-split-kmeans` | off | Seed splitting from canonical bin membership rather than transient bin order |
+| `--split-reject-small-children` | off | Apply the minimum-child guards to the established splitter |
 | `--percent-identity` | 97 | Min read identity when reading BAMs |
 | `--markers` | — | Contig→marker map, required by `--qc`/`--purify`/`--auto`/`--autotune` |
 | `--qc` | off | Annotate `bins.tsv` with SCG completeness/contamination + MIMAG tier |
