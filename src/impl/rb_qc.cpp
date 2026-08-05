@@ -163,8 +163,9 @@ void rb_qc_ensemble(const std::vector<std::vector<size_t>> &mems_all,
   // split on each config's clusters FIRST, so candidates are the same pure,
   // strain-resolved bins the production pipeline would emit — this is where most
   // HQ bins come from. We then pool post-split bins across all configs and pick
-  // the best non-overlapping set. (abundance_guided_split sets min_bin_bp=0, so
-  // save/restore the user's floor around each call.)
+  // the best non-overlapping set. The splitter may retain sub-floor candidates
+  // internally, so keep the user's floor stable across every config and restore
+  // it after ensemble scoring.
   const size_t saved_min_bin_bp = min_bin_bp;
   const bool saved_verbose = verbose;
   verbose = false;                                   // silence per-config split logs

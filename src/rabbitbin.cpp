@@ -2978,12 +2978,52 @@ static std::atomic<uint64_t> g_km_restarts{0}, g_km_iters{0}, g_km_capped{0};
 // the sum, so distances can differ from the sequential version in the last bit;
 // see RB_KM_STRICT below for the exact-order fallback.
 static const bool g_km_strict = getenv("RB_KM_STRICT") != nullptr;
+// Explicit AVX-512 double-accumulation is the production path after passing the
+// three-dataset CAMI2 hash/accuracy gate.  RABBIT_KM_SCALAR restores the previous
+// four-accumulator scalar kernel; RB_KM_STRICT retains the still older exact-order
+// single accumulator and always takes precedence below.
+static const bool g_km_simd = getenv("RABBIT_KM_SCALAR") == nullptr;
+// A megabin is already one outer OpenMP iteration, so its independent K-means
+// restarts become tasks that idle outer workers can steal.  Seeding remains serial
+// in the established RNG order.  RABBIT_KM_NO_TASKS restores the serial restarts.
+static const bool g_km_tasks = getenv("RABBIT_KM_NO_TASKS") == nullptr;
 static inline double rb_sqdist(const float *a, const float *b, size_t d) {
   if (__builtin_expect(g_km_strict, 0)) {
     double s = 0;
     for (size_t i = 0; i < d; ++i) { double t = a[i] - b[i]; s += t * t; }
     return s;
   }
+#if defined(__AVX512F__)
+  if (__builtin_expect(g_km_simd, 1) && d >= 16) {
+    // Inputs subtract in float exactly as in the established scalar expression,
+    // then widen to double before squaring/accumulating.  Two independent vectors
+    // hide FMA latency.  Only the final reduction is reassociated; the scalar
+    // and strict fallbacks above remain available for portability/A-B checks.
+    __m512d acc0 = _mm512_setzero_pd();
+    __m512d acc1 = _mm512_setzero_pd();
+    size_t i = 0;
+    for (; i + 16 <= d; i += 16) {
+      const __m256 df0 = _mm256_sub_ps(_mm256_loadu_ps(a + i),
+                                      _mm256_loadu_ps(b + i));
+      const __m256 df1 = _mm256_sub_ps(_mm256_loadu_ps(a + i + 8),
+                                      _mm256_loadu_ps(b + i + 8));
+      const __m512d x0 = _mm512_cvtps_pd(df0);
+      const __m512d x1 = _mm512_cvtps_pd(df1);
+      acc0 = _mm512_fmadd_pd(x0, x0, acc0);
+      acc1 = _mm512_fmadd_pd(x1, x1, acc1);
+    }
+    double s = _mm512_reduce_add_pd(_mm512_add_pd(acc0, acc1));
+    double s0 = 0, s1 = 0, s2 = 0, s3 = 0;
+    for (; i + 4 <= d; i += 4) {
+      double t0 = a[i] - b[i], t1 = a[i + 1] - b[i + 1];
+      double t2 = a[i + 2] - b[i + 2], t3 = a[i + 3] - b[i + 3];
+      s0 += t0 * t0; s1 += t1 * t1; s2 += t2 * t2; s3 += t3 * t3;
+    }
+    s += (s0 + s1) + (s2 + s3);
+    for (; i < d; ++i) { double t = a[i] - b[i]; s += t * t; }
+    return s;
+  }
+#endif
   double s0 = 0, s1 = 0, s2 = 0, s3 = 0;
   size_t i = 0;
   for (; i + 4 <= d; i += 4) {
@@ -3001,6 +3041,112 @@ static std::vector<int> rb_kmeans(const float *X, size_t n, size_t d,
   std::vector<int> best_labels(n, 0);
   double best_inertia = std::numeric_limits<double>::infinity();
   if (n == 0 || d == 0 || k <= 1) return best_labels;
+
+  // Large-bin two-level path.  K-means++ initialisations consume RNG but Lloyd
+  // iterations do not, so generate every restart's initial centroid set first,
+  // serially and in the exact historical RNG order.  The independent Lloyd runs
+  // can then execute as tasks; selecting their inertias in restart order keeps
+  // the same strict-< tie-break and therefore the same final labels.
+  const bool use_tasks = g_km_tasks && splitKmeansRestarts > 1 && n >= 1024 &&
+                         omp_in_parallel() && omp_get_num_threads() > 1;
+  if (use_tasks) {
+    const int nr = splitKmeansRestarts;
+    const size_t kd = (size_t)k * d;
+    std::vector<float> seeded((size_t)nr * kd);
+    std::vector<double> d2(n);
+    for (int init = 0; init < nr; ++init) {
+      float *cent0 = seeded.data() + (size_t)init * kd;
+      std::uniform_int_distribution<size_t> u0(0, n - 1);
+      std::copy_n(X + u0(rng) * d, d, cent0);
+      std::fill(d2.begin(), d2.end(), std::numeric_limits<double>::infinity());
+      for (int c = 1; c < k; ++c) {
+        const float *prev = cent0 + (size_t)(c - 1) * d;
+        for (size_t r = 0; r < n; ++r) {
+          double s = rb_sqdist(X + r * d, prev, d);
+          if (s < d2[r]) d2[r] = s;
+        }
+        double sum = 0; for (double v : d2) sum += v;
+        size_t pick = n - 1;
+        if (sum > 0) {
+          std::uniform_real_distribution<double> ur(0, sum);
+          double thr = ur(rng), acc = 0;
+          for (size_t r = 0; r < n; ++r) {
+            acc += d2[r];
+            if (acc >= thr) { pick = r; break; }
+          }
+        } else {
+          pick = u0(rng);
+        }
+        std::copy_n(X + pick * d, d, cent0 + (size_t)c * d);
+      }
+    }
+
+    std::vector<std::vector<int>> restart_labels(
+        (size_t)nr, std::vector<int>(n, 0));
+    std::vector<double> restart_inertia((size_t)nr,
+                                        std::numeric_limits<double>::infinity());
+    auto run_restart = [&](int init) {
+      std::vector<float> cent(seeded.begin() + (size_t)init * kd,
+                              seeded.begin() + (size_t)(init + 1) * kd);
+      std::vector<int> &labels = restart_labels[(size_t)init];
+      std::vector<double> csum(kd);
+      std::vector<int> ccnt((size_t)k);
+      int iter = 0;
+      for (; iter < 200; ++iter) {
+        bool changed = false;
+        for (size_t r = 0; r < n; ++r) {
+          const float *xr = X + r * d;
+          double bd = std::numeric_limits<double>::infinity(); int bl = 0;
+          for (int c = 0; c < k; ++c) {
+            double s = rb_sqdist(xr, cent.data() + (size_t)c * d, d);
+            if (s < bd) { bd = s; bl = c; }
+          }
+          if (labels[r] != bl) { labels[r] = bl; changed = true; }
+        }
+        std::fill(csum.begin(), csum.end(), 0.0);
+        std::fill(ccnt.begin(), ccnt.end(), 0);
+        for (size_t r = 0; r < n; ++r) {
+          const float *xr = X + r * d;
+          double *sc = csum.data() + (size_t)labels[r] * d;
+          ccnt[(size_t)labels[r]]++;
+          for (size_t i = 0; i < d; ++i) sc[i] += xr[i];
+        }
+        for (int c = 0; c < k; ++c)
+          if (ccnt[(size_t)c]) {
+            float *cc = cent.data() + (size_t)c * d;
+            const double *sc = csum.data() + (size_t)c * d;
+            for (size_t i = 0; i < d; ++i)
+              cc[i] = (float)(sc[i] / ccnt[(size_t)c]);
+          }
+        if (!changed) break;
+      }
+      if (g_km_prof) {
+        g_km_restarts.fetch_add(1, std::memory_order_relaxed);
+        g_km_iters.fetch_add((uint64_t)iter + 1, std::memory_order_relaxed);
+        if (iter >= 200) g_km_capped.fetch_add(1, std::memory_order_relaxed);
+      }
+      double inertia = 0;
+      for (size_t r = 0; r < n; ++r)
+        inertia += rb_sqdist(X + r * d,
+                            cent.data() + (size_t)labels[r] * d, d);
+      restart_inertia[(size_t)init] = inertia;
+    };
+
+#pragma omp taskgroup
+    {
+      for (int init = 0; init < nr; ++init) {
+#pragma omp task firstprivate(init) shared(run_restart)
+        run_restart(init);
+      }
+    }
+    for (int init = 0; init < nr; ++init) {
+      if (restart_inertia[(size_t)init] < best_inertia) {
+        best_inertia = restart_inertia[(size_t)init];
+        best_labels = std::move(restart_labels[(size_t)init]);
+      }
+    }
+    return best_labels;
+  }
 
   std::vector<float>  cent((size_t)k * d);
   std::vector<double> d2(n);

@@ -596,14 +596,35 @@ static Distance gen_fused_calib_graph(Graph &g, Distance coverage) {
       numThreads,
       std::vector<std::vector<float>>(NROUNDS, std::vector<float>(SAMP, 0.f)));
 
-  // Tile size: same cache heuristic as before.
+  // Tile size: keep both winner rows and (when present) both abundance rows in
+  // one core's L2.  The production PMH path packs winners to 16 bits, so charging
+  // sizeof(uint32_t) here made the old heuristic substantially too conservative.
+  // Row heaps are sparse writes shared across the whole graph rather than data
+  // reused inside a tile-pair, so including maxEdges in the per-row working set
+  // likewise under-sized the block.  Leave 15% of L2 for loop state / cache-set
+  // conflicts and round down to a SIMD-friendly multiple of 16 rows.
   size_t TILE = 10;
   try {
-    TILE = std::max(
-        (size_t)((CacheSize() * 1024.) /
-                 (2 * (g_pmh_m * sizeof(uint32_t)) +
-                  maxEdges * (sizeof(size_t) + sizeof(StoredDistance)))),
-        (size_t)10);
+    const size_t winner_bytes = (g_win_bits == 16)
+                                    ? sizeof(uint16_t)
+                                    : sizeof(uint32_t);
+    const size_t winner_row = (size_t)g_pmh_m * winner_bytes;
+    const size_t depth_row = num_depth_samples > 1
+                                 ? (size_t)num_depth_samples * sizeof(float)
+                                 : 0;
+    const size_t pair_row_bytes = 2 * (winner_row + depth_row);
+    if (pair_row_bytes > 0) {
+      const size_t usable_l2 = (size_t)(CacheSize() * 1024. * 0.85);
+      TILE = usable_l2 / pair_row_bytes;
+      TILE = std::max((size_t)10, std::min((size_t)1024, TILE));
+      // With hundreds of abundance dimensions the dot-product stream, dynamic
+      // work balance, and early heap-threshold formation benefit from more tile
+      // pairs than the capacity-only estimate provides.  On this path cap the
+      // block at 256 rows; low/medium-dimensional data still use the larger L2
+      // block (512 rows for the common 20-dimensional win16 case).
+      if (depth_row > winner_row / 2) TILE = std::min((size_t)256, TILE);
+      if (TILE >= 16) TILE = (TILE / 16) * 16;
+    }
   } catch (...) {}
   // TILE only affects blocking (never the result), so it is a safe speed knob.
   // The default sizes a tile-pair's two winner blocks for L2; larger tiles cut
@@ -1153,4 +1174,3 @@ static Distance calibrate_sim_cutoff_fused(Distance coverage) {
 // ═══════════════════════════════════════════════════════════════════════════
 // Similarity calibration helpers
 // ═══════════════════════════════════════════════════════════════════════════
-

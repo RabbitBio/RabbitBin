@@ -25,6 +25,13 @@ add_test(NAME test_rabbitbin
          WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/test-each
         )
 
+add_test(NAME test_min_bin_size_strict
+         COMMAND ${CMAKE_COMMAND}
+                 -DRABBITBIN=${CMAKE_BINARY_DIR}/src/rabbitbin
+                 -DWORK_DIR=${CMAKE_BINARY_DIR}/test-min-bin-size
+                 -P ${CMAKE_CURRENT_SOURCE_DIR}/test_min_bin_size.cmake
+        )
+
 file(COPY ${CMAKE_SOURCE_DIR}/run_rabbitbin.sh DESTINATION ${CMAKE_BINARY_DIR}/src)
 file(MAKE_DIRECTORY  ${CMAKE_BINARY_DIR}/test-runRabbitBin)
 add_test(NAME run_rabbitbin.sh
