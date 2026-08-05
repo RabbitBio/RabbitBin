@@ -2,6 +2,7 @@
 #define RABBITBIN_H_
 
 #include <algorithm>
+#include <cstdint>
 #include <cstdarg>
 #include <fstream>
 #include <functional>
@@ -19,6 +20,7 @@
 #include <utility>
 #include <vector>
 #include <limits>
+#include <stdexcept>
 #ifdef __APPLE__
 #include <mach/mach.h>
 #include <sys/sysctl.h>
@@ -253,12 +255,18 @@ static void verbose_message(const char *format, ...) {
   }
 }
 
+// Contigs and graph edges are both bounded far below 2^32 in practice. Keeping
+// their persistent IDs at 32 bits halves the endpoint arrays and every
+// incidence list, which are among the largest live objects after graph build.
+using GraphNodeId = uint32_t;
+using GraphEdgeId = uint32_t;
+
 class Graph {
 public:
   size_t n;
-  std::vector<size_t> from;
-  std::vector<size_t> to;
-  std::vector<std::vector<size_t>>
+  std::vector<GraphNodeId> from;
+  std::vector<GraphNodeId> to;
+  std::vector<std::vector<GraphEdgeId>>
       incs; // incidence list which has edge id instead of node id (compared to
             // adjacent list)
   std::vector<StoredDistance> sComp;
@@ -268,6 +276,8 @@ public:
 
   Graph(size_t num_nodes, bool hasEdges = false)
       : n(num_nodes), hasEdges(hasEdges) {
+    if (num_nodes > (size_t)std::numeric_limits<GraphNodeId>::max())
+      throw std::length_error("RabbitBin graph exceeds the 32-bit node-ID capacity");
     if (hasEdges) {
       incs.resize(num_nodes);
     }
@@ -279,7 +289,12 @@ public:
 
   size_t getEdgeCount() { return from.size(); }
 
-  size_t getOtherNode(size_t e, size_t v) {
+  void requireCompactEdgeIds() const {
+    if (from.size() > (size_t)std::numeric_limits<GraphEdgeId>::max())
+      throw std::length_error("RabbitBin graph exceeds the 32-bit edge-ID capacity");
+  }
+
+  GraphNodeId getOtherNode(size_t e, size_t v) const {
     assert(e < from.size() && e < to.size());
     return from[e] == v ? to[e] : from[e];
   }

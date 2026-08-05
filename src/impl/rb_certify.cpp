@@ -21,6 +21,7 @@ static void certify_stability(Graph &g, const std::vector<size_t> &baseline,
   g_cert_alt.assign(N, SIZE_MAX);
   g_cert_alt_prob.assign(N, 0.0f);
   if (N == 0 || E == 0) return;
+  g.requireCompactEdgeIds();
 
   // Baseline "binned" mask from the production incidence still resident in g.
   std::vector<char> baseBinned(N, 0);
@@ -62,8 +63,8 @@ static void certify_stability(Graph &g, const std::vector<size_t> &baseline,
     for (size_t e = 0; e < E; ++e)
       if (g.edgeScore[e] > 0) {
         if (g.edgeScore[e] > SSCR_MAX) g.edgeScore[e] = SSCR_MAX;
-        g.incs[g.from[e]].push_back(e);
-        g.incs[g.to[e]].push_back(e);
+        g.incs[g.from[e]].push_back((GraphEdgeId)e);
+        g.incs[g.to[e]].push_back((GraphEdgeId)e);
       }
 #pragma omp parallel for schedule(dynamic, 256)
     for (size_t v = 0; v < N; ++v) {

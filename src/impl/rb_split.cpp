@@ -1083,6 +1083,30 @@ static double rb_chi2_crit(size_t S, double alpha, size_t n_tests) {
 // Family-wise significance level shared by statistical merge / recruitment.
 static double g_abd_alpha = 0.05;
 
+// Resolve compact BAM-depth rows to large-contig indices once. Both PE merge and
+// calibrated recruitment consume the same links; retaining this integer mapping
+// avoids rebuilding an nobs-sized name hash and copying/trimming two strings per
+// link in each stage.
+static const std::vector<int> &rb_pe_compact_contig_indices() {
+  if (g_pe_compact_to_contig.size() == g_pe_names.size())
+    return g_pe_compact_to_contig;
+
+  phmap::flat_hash_map<std::string, int> name2idx;
+  name2idx.reserve(nobs * 2);
+  for (size_t c = 0; c < nobs; ++c)
+    name2idx[contig_names[c]] = (int)c;
+
+  g_pe_compact_to_contig.assign(g_pe_names.size(), -1);
+  for (size_t cr = 0; cr < g_pe_names.size(); ++cr) {
+    std::string nm = g_pe_names[cr];
+    const size_t sp = nm.find_first_of(" \t");
+    if (sp != std::string::npos) nm.resize(sp);
+    const auto it = name2idx.find(nm);
+    if (it != name2idx.end()) g_pe_compact_to_contig[cr] = it->second;
+  }
+  return g_pe_compact_to_contig;
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Paired-end bin merge — rejoin fragments of ONE genome
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1139,20 +1163,13 @@ static void consolidate_bins(BinMap &cls, size_t floor) {
     for (size_t c : *bp[b]) if (c < nobs) binpos[c] = (int)b;
   phmap::flat_hash_map<uint64_t, uint32_t> pe_pair;   // pack(min,max bin pos) -> count
   if (!g_pe_links_compact.empty() && !g_pe_names.empty()) {
-    // compact row -> contig index (binning space), via name.
-    phmap::flat_hash_map<std::string, int> name2idx;
-    name2idx.reserve(nobs * 2);
-    for (size_t i = 0; i < nobs; ++i) name2idx[contig_names[i]] = (int)i;
-    auto compact2idx = [&](int32_t cr) -> int {
-      if (cr < 0 || (size_t)cr >= g_pe_names.size()) return -1;
-      std::string nm = g_pe_names[cr];
-      size_t sp = nm.find_first_of(" \t"); if (sp != std::string::npos) nm.resize(sp);
-      auto it = name2idx.find(nm);
-      return it == name2idx.end() ? -1 : it->second;
-    };
+    const std::vector<int> &compact_to_idx = rb_pe_compact_contig_indices();
     for (auto &lk : g_pe_links_compact) {
-      int ia = compact2idx(std::get<0>(lk));
-      int ib = compact2idx(std::get<1>(lk));
+      const int32_t ca = std::get<0>(lk), cb = std::get<1>(lk);
+      const int ia = ca >= 0 && (size_t)ca < compact_to_idx.size()
+                         ? compact_to_idx[(size_t)ca] : -1;
+      const int ib = cb >= 0 && (size_t)cb < compact_to_idx.size()
+                         ? compact_to_idx[(size_t)cb] : -1;
       if (ia < 0 || ib < 0) continue;
       int ba = binpos[ia], bb = binpos[ib];
       if (ba < 0 || bb < 0 || ba == bb) continue;
@@ -1244,21 +1261,34 @@ static void consolidate_bins(BinMap &cls, size_t floor) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Composition+depth recruit — attach UNBINNED contigs to the core they belong to
+// Calibrated core recruit — attach UNBINNED contigs to the core they belong to
 // ═══════════════════════════════════════════════════════════════════════════
-// For each unbinned large contig, attach
-// it to the >=floor core it matches on BOTH tetranucleotide composition (cosine)
-// AND abundance (depth-corr to the core centroid) — a CONJUNCTIVE gate (rejects a
-// contaminant that matches only one signal) plus a margin over the 2nd-best core
-// (unambiguous).  Additive but purity-safe: a contig only joins a core when it
-// looks like that core's own genome on both independent signals.
+// Freeze the >=floor cores, then form a prediction set for every unbinned large
+// contig from two scale-invariant signals:
+//
+//   1. co-abundance shape: cosine to the core centroid of centred, unit Spearman
+//      profiles.  This deliberately ignores a uniform coverage multiplier, which
+//      is unstable for strain-shared contigs because multi-mapping changes their
+//      absolute depth while preserving the across-sample trajectory;
+//   2. composition: cosine to the length-weighted core TNF centroid.
+//
+// Calibration uses no reference genome.  Each core member is classified after
+// leaving it out of its labelled core; a correct return is a positive example and
+// an actual wrong return is a negative example.  Confidence is the log residual-
+// distance ratio log((1-second)/(1-best)), the usual nearest-neighbour evidence
+// ratio expressed in cosine distance. It combines absolute fit and separation in
+// one dimension: a weak match needs proportionally more separation, while a near-
+// perfect match need not clear an unrelated raw margin. One equal-cost ROC/Youden
+// boundary is learned per run. No raw cosine, best-minus-second cutoff, or dataset
+// constant is carried between runs. Assignments use immutable cores and one batch.
 static void recruit_unbinned_to_cores(BinMap &cls, size_t floor) {
   if (!g_bin_recruit) return;
   const size_t S = (size_t)num_depth_samples;
-  if (S < 1 || g_depth_unit.empty() || g_merge_tnf.empty()) return;
+  if (S < 2 || g_depth_unit.size() < nobs * S ||
+      g_merge_tnf.size() < nobs * 256) return;
 
-  std::vector<int> ids; std::vector<ContigVector*> bp;
-  for (auto &kv : cls) { ids.push_back(kv.first); bp.push_back(&kv.second); }
+  std::vector<ContigVector*> bp;
+  for (auto &kv : cls) bp.push_back(&kv.second);
   const size_t B = bp.size();
   auto bin_bp = [&](const ContigVector &cs) {
     size_t s = 0; for (size_t c : cs) s += (c < nobs) ? seq_lens[c] : small_seq_lens[c - nobs];
@@ -1275,67 +1305,363 @@ static void recruit_unbinned_to_cores(BinMap &cls, size_t floor) {
   if (coreIdx.empty()) return;
   const size_t NC = coreIdx.size();
 
-  double thr = 0.88, margin = 0.02;   // conjunctive min(tnf,depth) bar + unambiguity margin
-  int iters = 1;                      // >1 over-recruits as centroids drift (purity loss)
-  if (const char *e = getenv("RABBIT_BIN_RECRUIT_THR"))    thr = atof(e);
-  if (const char *e = getenv("RABBIT_BIN_RECRUIT_MARGIN")) margin = atof(e);
-  if (const char *e = getenv("RABBIT_BIN_RECRUIT_ITERS"))  iters = atoi(e);
+  // Candidate-to-core paired-end support is retained as an orthogonal diagnostic
+  // signal.  It may corroborate the feature winner, but never redirects a contig:
+  // cross-mapping pairs are common between closely related strains.
+  std::vector<int> pe_best_core(nobs, -1);
+  std::vector<uint32_t> pe_best_count(nobs, 0);
+  std::vector<char> pe_tied(nobs, 0);
+  if (!g_pe_links_compact.empty() && !g_pe_names.empty()) {
+    std::vector<int> core_of(nobs, -1);
+    for (size_t ci = 0; ci < NC; ++ci)
+      for (size_t c : *bp[coreIdx[ci]])
+        if (c < nobs) core_of[c] = (int)ci;
 
-  size_t n_rec_total = 0;
-  for (int it = 0; it < iters; ++it) {
-    // Recompute depth + TNF centroids from the CURRENT (growing) core membership.
-    std::vector<std::vector<float>> dcen(NC), tcen(NC);
+    const std::vector<int> &compact_to_idx = rb_pe_compact_contig_indices();
+    phmap::flat_hash_map<uint64_t, uint32_t> support;
+    support.reserve(g_pe_links_compact.size());
+    auto add_support = [&](int candidate, int other, uint32_t count) {
+      if (candidate < 0 || other < 0 || (size_t)candidate >= nobs ||
+          (size_t)other >= nobs || binned[(size_t)candidate]) return;
+      const int ci = core_of[(size_t)other];
+      if (ci < 0) return;
+      const uint64_t key = ((uint64_t)(uint32_t)candidate << 32) | (uint32_t)ci;
+      support[key] += count;
+    };
+    for (const auto &link : g_pe_links_compact) {
+      const int32_t ca = std::get<0>(link), cb = std::get<1>(link);
+      const int a = ca >= 0 && (size_t)ca < compact_to_idx.size()
+                        ? compact_to_idx[(size_t)ca] : -1;
+      const int b = cb >= 0 && (size_t)cb < compact_to_idx.size()
+                        ? compact_to_idx[(size_t)cb] : -1;
+      const uint32_t count = std::get<2>(link);
+      add_support(a, b, count);
+      add_support(b, a, count);
+    }
+    for (const auto &kv : support) {
+      const size_t c = (size_t)(uint32_t)(kv.first >> 32);
+      const int ci = (int)(uint32_t)(kv.first & 0xffffffffu);
+      if (kv.second > pe_best_count[c]) {
+        pe_best_count[c] = kv.second;
+        pe_best_core[c] = ci;
+        pe_tied[c] = 0;
+      } else if (kv.second == pe_best_count[c] && ci != pe_best_core[c]) {
+        pe_tied[c] = 1;
+      }
+    }
+  }
+
+  struct FeatureCores {
+    size_t dim = 0;
+    std::vector<double> sum, norm;
+  };
+
+  auto row_norms = [&](const std::vector<float> &feature, size_t dim) {
+    std::vector<float> out(nobs, 0.0f);
+#pragma omp parallel for schedule(static) num_threads(numThreads)
+    for (size_t c = 0; c < nobs; ++c) {
+      const float *v = feature.data() + c * dim;
+      double ss = 0.0;
+      for (size_t k = 0; k < dim; ++k) ss += (double)v[k] * v[k];
+      if (ss > 1e-30) out[c] = (float)std::sqrt(ss);
+    }
+    return out;
+  };
+
+  auto build_feature_cores = [&](const std::vector<float> &feature,
+                                 const std::vector<float> &norm, size_t dim,
+                                 bool length_weighted) {
+    FeatureCores out;
+    out.dim = dim;
+    out.sum.assign(NC * dim, 0.0);
+    out.norm.assign(NC, 0.0);
 #pragma omp parallel for schedule(dynamic, 8) num_threads(numThreads)
     for (size_t ci = 0; ci < NC; ++ci) {
-      const ContigVector &cs = *bp[coreIdx[ci]];
-      std::vector<size_t> L; for (size_t c : cs) if (c < nobs) L.push_back(c);
-      if (L.empty()) continue;
-      constexpr size_t CAP = 64;
-      std::vector<size_t> Ls = L;
-      if (Ls.size() > CAP) { std::vector<size_t> s; double st=(double)Ls.size()/CAP;
-        for (size_t t=0;t<CAP;++t) s.push_back(Ls[(size_t)(t*st)]); Ls.swap(s); }
-      std::vector<float> d(S, 0.f);
-      for (size_t c : Ls) { const float *u = g_depth_unit.data() + c * S;
-                            for (size_t k = 0; k < S; ++k) d[k] += u[k]; }
-      double nd = 0; for (size_t k = 0; k < S; ++k) { d[k] /= (float)Ls.size(); nd += (double)d[k]*d[k]; }
-      if (nd > 1e-12) { float iv=(float)(1.0/std::sqrt(nd)); for (size_t k=0;k<S;++k) d[k]*=iv; dcen[ci]=std::move(d); }
-      std::vector<float> t(256, 0.f); double tw = 0;
-      for (size_t c : cs) if (c < nobs) { const float *v = g_merge_tnf.data() + c*256;
-        double w = (double)seq_lens[c]; for (int k=0;k<256;++k) t[k]+=(float)(w*v[k]); tw += w; }
-      if (tw > 0) { double nt=0; for (int k=0;k<256;++k) nt+=(double)t[k]*t[k];
-        if (nt>1e-12){ float iv=(float)(1.0/std::sqrt(nt)); for(int k=0;k<256;++k) t[k]*=iv; tcen[ci]=std::move(t);} }
-    }
-    // For each UNBINNED large contig, find best/2nd-best core by conjunctive score.
-    std::vector<int> assign(nobs, -1);
-#pragma omp parallel for schedule(dynamic, 256) num_threads(numThreads)
-    for (size_t c = 0; c < nobs; ++c) {
-      if (binned[c]) continue;
-      const float *du = g_depth_unit.data() + c * S;
-      const float *tu = g_merge_tnf.data() + c * 256;
-      double best = -2, second = -2; long bestk = -1;
-      for (size_t ci = 0; ci < NC; ++ci) {
-        if (dcen[ci].empty() || tcen[ci].empty()) continue;
-        const float *dc = dcen[ci].data(); double dco = 0;
-        for (size_t k = 0; k < S; ++k) dco += (double)du[k]*dc[k];
-        if (dco < thr) continue;                          // depth gate first (cheap reject)
-        const float *tc = tcen[ci].data(); double tco = 0;
-        for (int k = 0; k < 256; ++k) tco += (double)tu[k]*tc[k];
-        double sc = dco < tco ? dco : tco;                // conjunctive = min
-        if (sc > best) { second = best; best = sc; bestk = (long)ci; }
-        else if (sc > second) second = sc;
+      double *sum = out.sum.data() + ci * dim;
+      for (size_t c : *bp[coreIdx[ci]]) {
+        if (c >= nobs || !(norm[c] > 0.0f)) continue;
+        const float *v = feature.data() + c * dim;
+        // TNF is a sequence-count composition estimate, so length is its natural
+        // aggregation weight.  A rank-coverage row instead represents one
+        // genomic segment's across-sample trajectory: keep segments equal-weight
+        // so a long strain-shared contig cannot dominate the core direction.
+        const double w = length_weighted
+                             ? (double)std::max<size_t>(seq_lens[c], 1) : 1.0;
+        const double scale = w / (double)norm[c];
+        for (size_t k = 0; k < dim; ++k) sum[k] += scale * (double)v[k];
       }
-      if (bestk >= 0 && best >= thr && (second < 0 || best - second >= margin))
-        assign[c] = (int)coreIdx[bestk];
+      double ss = 0.0;
+      for (size_t k = 0; k < dim; ++k) ss += sum[k] * sum[k];
+      if (ss > 1e-30) out.norm[ci] = std::sqrt(ss);
     }
-    size_t n_rec = 0;
-    for (size_t c = 0; c < nobs; ++c)
-      if (assign[c] >= 0) { bp[assign[c]]->push_back(c); binned[c] = 1; ++n_rec; }
-    n_rec_total += n_rec;
-    if (!n_rec) break;                                    // converged
+    return out;
+  };
+
+  const std::vector<float> depth_norm = row_norms(g_depth_unit, S);
+  const std::vector<float> tnf_norm = row_norms(g_merge_tnf, 256);
+  const FeatureCores depth_cores =
+      build_feature_cores(g_depth_unit, depth_norm, S, false);
+  const FeatureCores tnf_cores =
+      build_feature_cores(g_merge_tnf, tnf_norm, 256, true);
+
+  // Cosine to a frozen core direction, optionally leaving the queried member
+  // out of its labelled core. Rows are normalised explicitly; depth members have
+  // equal weight, while TNF members are weighted by sequence length because their
+  // k-mer frequency sampling variance decreases with length.
+  auto feature_cosine = [&](size_t c, size_t ci,
+                            const std::vector<float> &feature,
+                            const std::vector<float> &norm,
+                            const FeatureCores &cores,
+                            bool length_weighted, bool leave_self_out) {
+    if (!(norm[c] > 0.0f))
+      return -std::numeric_limits<double>::infinity();
+    const float *v = feature.data() + c * cores.dim;
+    const double *sum = cores.sum.data() + ci * cores.dim;
+    const double w = length_weighted
+                         ? (double)std::max<size_t>(seq_lens[c], 1) : 1.0;
+    double dot = 0.0;
+    double ss = leave_self_out ? 0.0 : cores.norm[ci] * cores.norm[ci];
+    for (size_t k = 0; k < cores.dim; ++k) {
+      const double x = leave_self_out
+                           ? sum[k] - w * (double)v[k] / (double)norm[c]
+                           : sum[k];
+      dot += (double)v[k] / (double)norm[c] * x;
+      if (leave_self_out) ss += x * x;
+    }
+    if (!(ss > 1e-30))
+      return -std::numeric_limits<double>::infinity();
+    return std::max(-1.0, std::min(1.0, dot / std::sqrt(ss)));
+  };
+
+  auto depth_score = [&](size_t c, size_t ci, bool leave_self_out) {
+    return feature_cosine(
+        c, ci, g_depth_unit, depth_norm, depth_cores, false, leave_self_out);
+  };
+  auto tnf_score = [&](size_t c, size_t ci, bool leave_self_out) {
+    return feature_cosine(
+        c, ci, g_merge_tnf, tnf_norm, tnf_cores, true, leave_self_out);
+  };
+  auto joint_score = [&](size_t c, size_t ci, bool leave_self_out) {
+    const double depth = depth_score(c, ci, leave_self_out);
+    const double tnf = tnf_score(c, ci, leave_self_out);
+    return std::min(depth, tnf);  // both signals must agree
+  };
+
+  // Ratio of runner-up cosine distance to winner cosine distance. The log is
+  // monotone but numerically better behaved. Exact unit cosine is handled as the
+  // mathematical limiting case; no empirical epsilon is introduced.
+  auto log_residual_ratio = [](double best, double second) {
+    if (!std::isfinite(best) || !std::isfinite(second))
+      return -std::numeric_limits<double>::infinity();
+    const double winner_distance = std::max(0.0, 1.0 - best);
+    const double runner_distance = std::max(0.0, 1.0 - second);
+    if (winner_distance == 0.0)
+      return runner_distance > 0.0
+                 ? std::numeric_limits<double>::infinity() : 0.0;
+    if (runner_distance == 0.0) return 0.0;
+    return std::log(runner_distance / winner_distance);
+  };
+
+  // Classify every core member after leaving it out. A correct return contributes
+  // winner/runner-up confidence as a positive; a wrong return contributes the
+  // confidence of the actual wrong winner as a negative. This is ordinary leave-
+  // one-out selective-classifier calibration with the same all-core competition
+  // faced by an unbinned contig.
+  struct CalEvidence {
+    double confidence;
+    bool positive;
+  };
+  std::vector<std::vector<CalEvidence>> cal_core(NC);
+#pragma omp parallel for schedule(dynamic, 4) num_threads(numThreads)
+  for (size_t ci = 0; ci < NC; ++ci) {
+    auto &dst = cal_core[ci];
+    for (size_t c : *bp[coreIdx[ci]]) {
+      if (c >= nobs || !(depth_norm[c] > 0.0f) || !(tnf_norm[c] > 0.0f))
+        continue;
+      const double own = joint_score(c, ci, true);
+      double best_other = -std::numeric_limits<double>::infinity();
+      double second_other = -std::numeric_limits<double>::infinity();
+      for (size_t cj = 0; cj < NC; ++cj) {
+        if (cj == ci) continue;
+        // joint=min(depth,TNF), therefore depth is an exact upper bound. Once
+        // it cannot beat the current runner-up, the 256-dimensional TNF dot
+        // product cannot affect either of the top two scores.
+        const double depth = depth_score(c, cj, false);
+        if (depth <= second_other) continue;
+        const double score = std::min(depth, tnf_score(c, cj, false));
+        if (score > best_other) {
+          second_other = best_other;
+          best_other = score;
+        } else if (score > second_other) {
+          second_other = score;
+        }
+      }
+      if (!std::isfinite(second_other)) continue;
+      if (own > best_other) {
+        dst.push_back({log_residual_ratio(own, best_other), true});
+      } else if (best_other > own) {
+        const double runner = std::max(own, second_other);
+        dst.push_back({log_residual_ratio(best_other, runner), false});
+      }
+    }
   }
-  if (n_rec_total)
-    verbose_message("Composition+depth recruit (min(tnf,depth)>=%.2f margin>=%.2f): "
-                    "%zu unbinned contigs into cores\n", thr, margin, n_rec_total);
+
+  std::vector<double> positive_confidence, negative_confidence;
+  size_t ncal = 0;
+  for (const auto &v : cal_core) ncal += v.size();
+  positive_confidence.reserve(ncal);
+  negative_confidence.reserve(ncal);
+  for (const auto &v : cal_core) {
+    for (const CalEvidence &e : v) {
+      (e.positive ? positive_confidence : negative_confidence)
+          .push_back(e.confidence);
+    }
+  }
+  if (positive_confidence.empty() || negative_confidence.empty()) return;
+
+  // Standard equal-cost ROC operating point. Maximising Youden's J (TPR-FPR)
+  // learns the residual-ratio boundary anew for every run; no similarity or
+  // margin number is carried between datasets.
+  struct RocPoint { double value; bool positive; };
+  struct RocBoundary {
+    double value = std::numeric_limits<double>::infinity();
+    double tpr = 0.0, fpr = 0.0;
+  };
+  auto learn_boundary = [&](const std::vector<double> &positive,
+                            const std::vector<double> &negative) {
+    std::vector<RocPoint> points;
+    points.reserve(positive.size() + negative.size());
+    for (double x : positive) points.push_back({x, true});
+    for (double x : negative) points.push_back({x, false});
+    std::sort(points.begin(), points.end(),
+              [](const RocPoint &a, const RocPoint &b) {
+                return a.value > b.value;
+              });
+    size_t tp = 0, fp = 0;
+    double best_j = -std::numeric_limits<double>::infinity();
+    RocBoundary out;
+    for (size_t i = 0; i < points.size();) {
+      size_t j = i;
+      while (j < points.size() && points[j].value == points[i].value) {
+        if (points[j].positive) ++tp; else ++fp;
+        ++j;
+      }
+      const double tpr = (double)tp / (double)positive.size();
+      const double fpr = (double)fp / (double)negative.size();
+      if (tpr - fpr > best_j) {
+        best_j = tpr - fpr;
+        out = {points[i].value, tpr, fpr};
+      }
+      i = j;
+    }
+    return out;
+  };
+  const RocBoundary confidence_gate =
+      learn_boundary(positive_confidence, negative_confidence);
+
+  struct CoreChoice {
+    int core = -1;
+    double score = -std::numeric_limits<double>::infinity();
+    double second = -std::numeric_limits<double>::infinity();
+    double gap = -std::numeric_limits<double>::infinity();
+    double confidence = -std::numeric_limits<double>::infinity();
+  };
+
+  auto choose_core = [&](size_t c) {
+    CoreChoice choice;
+    for (size_t ci = 0; ci < NC; ++ci) {
+      // Exact branch-and-bound: joint score cannot exceed its depth term.
+      const double depth = depth_score(c, ci, false);
+      if (depth <= choice.second) continue;
+      const double score = std::min(depth, tnf_score(c, ci, false));
+      if (score > choice.score) {
+        choice.second = choice.score;
+        choice.score = score;
+        choice.core = (int)ci;
+      } else if (score > choice.second) {
+        choice.second = score;
+      }
+    }
+    if (std::isfinite(choice.second)) {
+      choice.gap = choice.score - choice.second;
+      choice.confidence = log_residual_ratio(choice.score, choice.second);
+    }
+    return choice;
+  };
+
+  std::vector<int> assign(nobs, -1);
+  const char *dump_path = getenv("RABBIT_BIN_RECRUIT_DUMP");
+  const bool do_dump = dump_path && *dump_path;
+  std::vector<int> dump_core;
+  std::vector<float> dump_score, dump_gap, dump_confidence;
+  std::vector<unsigned char> dump_reason;
+  if (do_dump) {
+    dump_core.assign(nobs, -1);
+    dump_score.assign(nobs, -std::numeric_limits<float>::infinity());
+    dump_gap.assign(nobs, -std::numeric_limits<float>::infinity());
+    dump_confidence.assign(nobs, -std::numeric_limits<float>::infinity());
+    dump_reason.assign(nobs, 0);
+  }
+
+  size_t n_candidates = 0, n_pe = 0, n_stat = 0;
+  size_t n_confidence_reject = 0;
+#pragma omp parallel for schedule(dynamic, 256) num_threads(numThreads) \
+    reduction(+:n_candidates,n_pe,n_stat,n_confidence_reject)
+  for (size_t c = 0; c < nobs; ++c) {
+    if (binned[c] || !(depth_norm[c] > 0.0f) || !(tnf_norm[c] > 0.0f))
+      continue;
+    ++n_candidates;
+    const CoreChoice choice = choose_core(c);
+    if (do_dump) {
+      dump_core[c] = choice.core;
+      dump_score[c] = (float)choice.score;
+      dump_gap[c] = (float)choice.gap;
+      dump_confidence[c] = (float)choice.confidence;
+    }
+    if (!(choice.confidence >= confidence_gate.value)) {
+      if (do_dump) dump_reason[c] = 2;
+      ++n_confidence_reject;
+      continue;
+    }
+    assign[c] = (int)coreIdx[(size_t)choice.core];
+    // PE corroborates the feature winner but can never redirect it.
+    const bool pe_corrob =
+        pe_best_core[c] == choice.core && !pe_tied[c];
+    if (do_dump) dump_reason[c] = pe_corrob ? 1 : 4;
+    if (pe_corrob) ++n_pe; else ++n_stat;
+  }
+
+  size_t n_rec = 0;
+  for (size_t c = 0; c < nobs; ++c) {
+    if (assign[c] < 0) continue;
+    bp[(size_t)assign[c]]->push_back(c);
+    ++n_rec;
+  }
+
+  if (do_dump) {
+    std::ofstream dump(dump_path);
+    if (dump) {
+      dump << "SequenceName\tLength\tCoreIndex\tJointScore\tGap\tLogResidualRatio"
+              "\tPECoreIndex\tPECount\tReason\n";
+      for (size_t c = 0; c < nobs; ++c) {
+        if (!dump_reason[c]) continue;
+        dump << contig_names[c] << '\t' << seq_lens[c] << '\t'
+             << dump_core[c] << '\t' << dump_score[c] << '\t'
+             << dump_gap[c] << '\t' << dump_confidence[c] << '\t'
+             << pe_best_core[c] << '\t'
+             << pe_best_count[c] << '\t' << (int)dump_reason[c] << '\n';
+      }
+    }
+  }
+
+  verbose_message(
+      "Self-calibrated core recruit (immutable cores; leave-one-out ROC "
+      "log residual ratio>=%.4g [TPR=%.3g,FPR=%.3g]): "
+      "%zu/%zu unbinned contigs "
+      "(%zu PE-corroborated, %zu statistical, %zu confidence rejects; "
+      "calibration=%zu)\n",
+      confidence_gate.value, confidence_gate.tpr, confidence_gate.fpr,
+      n_rec, n_candidates, n_pe, n_stat, n_confidence_reject, ncal);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

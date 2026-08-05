@@ -171,8 +171,14 @@ Both bounds are user-settable: `--min-contig` accepts any value ≥ 1500 and
    (default 0.70). Disable with `--no-split`. Supplying `--marker-seed`
    replaces this with marker-guided splitting.
 8. **Consolidate / secondary recruit** *(needs coverage)*. Same-genome
-   fragments are merged and unbinned tails are attached to bin cores. Disable
-   these stages with `RABBIT_BIN_MERGE=0` and `RABBIT_BIN_RECRUIT=0`.
+   fragments are merged and unbinned tails are compared with frozen bin cores
+   using co-abundance shape and TNF. Confidence is the ratio of runner-up to
+   winning cosine residuals, so absolute fit and separation form one statistic.
+   Its boundary is learned per run from actual correct and incorrect leave-one-out
+   core predictions (ROC/Youden); no fixed cosine or best-minus-second cutoff is
+   used. Paired-end support is reported as corroborating evidence but cannot
+   redirect the feature winner. Disable these stages with `RABBIT_BIN_MERGE=0`
+   and `RABBIT_BIN_RECRUIT=0`.
 9. **Output size filter.** Bins smaller than `--min-bin-size` (default
    200 000 bp) are not emitted.
 
