@@ -104,9 +104,9 @@ static void marker_guided_split(BinMap &cls) {
   verbose_message("Marker-guided split: %d markers (%zu hits), %zu kept, "
                   "%zu split, %zu dropped(<min_bin_bp) -> %d bins\n",
                   marker_id, hits, n_kept, n_split, n_drop, next);
-  // Split products may be < min_bin_bp; they are legitimate genome bins, so
-  // disable the size filter in output_bins (the base bins were already gated).
-  min_bin_bp = 0;
+  // Split products may be < min_bin_bp. Keep them in `cls` so the downstream
+  // fragment merge can still recover an output-sized bin, but preserve the
+  // user-requested output floor: output_bins() is the final strict filter.
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -146,23 +146,35 @@ static double fkmv_silhouette(const float *X, size_t n, size_t d,
   // per-cluster sizes within the sample
   std::vector<int> csz(k, 0);
   for (size_t a : idx) csz[labels[a]]++;
+  // Every unordered pair contributes the same distance to both endpoints.  The
+  // historical row-wise loop evaluated (a,b) and (b,a) separately; accumulate
+  // the upper triangle once into a compact m×k matrix instead.  For any fixed
+  // row, updates still arrive in ascending peer-index order (peers below the row
+  // during their outer iterations, then peers above it during the row's own
+  // iteration), preserving the established floating-point accumulation order.
+  std::vector<double> sumd(m * (size_t)k, 0.0);
+  for (size_t ii = 0; ii < m; ++ii) {
+    const size_t a = idx[ii];
+    for (size_t jj = ii + 1; jj < m; ++jj) {
+      const size_t b = idx[jj];
+      const double dij = dist(a, b);
+      sumd[ii * (size_t)k + (size_t)labels[b]] += dij;
+      sumd[jj * (size_t)k + (size_t)labels[a]] += dij;
+    }
+  }
+
   double sil_sum = 0;
   size_t cnt = 0;
-  std::vector<double> sumd(k);   // hoisted: was one allocation per sampled row
   for (size_t ii = 0; ii < m; ++ii) {
     size_t a = idx[ii];
     int la = labels[a];
     if (csz[la] <= 1) continue;  // singleton cluster: s=0, skip
-    std::fill(sumd.begin(), sumd.end(), 0.0);
-    for (size_t jj = 0; jj < m; ++jj) {
-      if (jj == ii) continue;
-      sumd[labels[idx[jj]]] += dist(a, idx[jj]);
-    }
-    double ai = sumd[la] / (double)(csz[la] - 1);
+    const double *row_sumd = sumd.data() + ii * (size_t)k;
+    double ai = row_sumd[la] / (double)(csz[la] - 1);
     double bi = std::numeric_limits<double>::infinity();
     for (int c = 0; c < k; ++c) {
       if (c == la || csz[c] == 0) continue;
-      double mc = sumd[c] / (double)csz[c];
+      double mc = row_sumd[c] / (double)csz[c];
       if (mc < bi) bi = mc;
     }
     if (!std::isfinite(bi)) continue;
@@ -584,8 +596,9 @@ static void abundance_guided_split_current(BinMap &cls) {
   verbose_message("Abundance split (sil>=%.2f, bar=%.3f): %zu kept, %zu split, "
                   "%zu recovered(purified<floor), %zu merged->core, %zu dropped -> %d bins\n",
                   g_split_sil, bar, n_kept, n_split, n_recovered, n_merged, n_drop, next);
-  // Retained pieces may be < min_bin_bp; the floor was already applied here.
-  min_bin_bp = 0;
+  // Retained pieces may be < min_bin_bp. Keep them internally for downstream
+  // merge/recruit, but preserve the user-requested floor so output_bins()
+  // strictly filters any pieces that remain below it.
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

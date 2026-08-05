@@ -333,6 +333,46 @@ static void fisher_super_merge(Graph &g, std::vector<size_t> &membership,
   for (size_t i = 0; i < n; ++i) membership[i] = (size_t)comm[comm0[i]];
 }
 
+// Canonical CSR view used by the label-propagation hot loop.  Graph::incs stores
+// an edge id for every incidence, which makes each visit chase that id through
+// from[]/to[] (plus a branch in getOtherNode) and then through logsscr[].  Flatten
+// the already neighbour-sorted incidence lists once into an 8-byte, contiguous
+// {neighbour, weight} stream.  Iterating each row in the same order preserves the
+// exact floating-point accumulation and first-max tie-break of the legacy path.
+// RABBIT_LPA_LEGACY=1 retains the old traversal for direct A/B verification.
+struct LpaArc {
+  uint32_t neighbor;
+  StoredDistance weight;
+};
+static_assert(sizeof(LpaArc) == 8, "LPA CSR arc must stay compact");
+
+struct LpaCsr {
+  std::vector<size_t> offsets;
+  std::vector<LpaArc> arcs;
+};
+
+static LpaCsr build_lpa_csr(Graph &g,
+                            const std::vector<StoredDistance> &edge_weight) {
+  const size_t n = g.getNodeCount();
+  LpaCsr csr;
+  csr.offsets.resize(n + 1, 0);
+  for (size_t v = 0; v < n; ++v)
+    csr.offsets[v + 1] = csr.offsets[v] + g.incs[v].size();
+  csr.arcs.resize(csr.offsets[n]);
+
+#pragma omp parallel for schedule(static)
+  for (size_t v = 0; v < n; ++v) {
+    size_t out = csr.offsets[v];
+    const std::vector<size_t> &inc = g.incs[v];
+    for (size_t j = 0; j < inc.size(); ++j) {
+      const size_t edge = inc[j];
+      csr.arcs[out++] = LpaArc{(uint32_t)g.getOtherNode(edge, v),
+                               edge_weight[edge]};
+    }
+  }
+  return csr;
+}
+
 int cluster_by_propagation(Graph &g, std::vector<size_t> &membership,
                       std::vector<size_t> &node_order) {
   size_t no_of_nodes = g.getNodeCount();
@@ -415,6 +455,22 @@ int cluster_by_propagation(Graph &g, std::vector<size_t> &membership,
   if (g_lpa_score != LpaScore::Fisher)
     cerr << "[LPA] label score = " << lpa_score_name() << endl;
 
+  const bool use_csr = no_of_nodes <= (size_t)std::numeric_limits<uint32_t>::max() &&
+                       getenv("RABBIT_LPA_LEGACY") == nullptr;
+  std::chrono::steady_clock::time_point csr_t0;
+  if (getenv("RB_LPA_CSR_PROF")) csr_t0 = std::chrono::steady_clock::now();
+  LpaCsr lpa_csr;
+  if (use_csr) lpa_csr = build_lpa_csr(g, logsscr);
+  if (getenv("RB_LPA_CSR_PROF")) {
+    const double ms = std::chrono::duration<double, std::milli>(
+                          std::chrono::steady_clock::now() - csr_t0).count();
+    fprintf(stderr, "[RB_LPA_CSR] %s arcs=%zu bytes=%zu build=%.1f ms\n",
+            use_csr ? "on" : "off", lpa_csr.arcs.size(),
+            lpa_csr.arcs.size() * sizeof(LpaArc) +
+                lpa_csr.offsets.size() * sizeof(size_t),
+            ms);
+  }
+
   const bool lpa_trace = getenv("RB_LPA_TRACE") != nullptr;
 
   // ── Optional parallel (Jacobi) label propagation ─────────────────────────
@@ -455,13 +511,24 @@ int cluster_by_propagation(Graph &g, std::vector<size_t> &membership,
           size_t v1 = node_order[i];
           if (!active[v1]) { prop_set[v1] = 0; continue; }
           touched.clear();
-          std::vector<size_t> &ineis = g.incs[v1];
-          for (size_t j = 0; j < ineis.size(); j++) {
-            size_t edgeID = ineis[j];
-            size_t k = membership[g.getOtherNode(edgeID, v1)];
-            if (ncount[k] == 0) touched.push_back(k);
-            lpa_accumulate(nscore[k], logsscr[edgeID]);
-            ncount[k]++;
+          if (use_csr) {
+            const LpaArc *arc = lpa_csr.arcs.data() + lpa_csr.offsets[v1];
+            const LpaArc *end = lpa_csr.arcs.data() + lpa_csr.offsets[v1 + 1];
+            for (; arc != end; ++arc) {
+              size_t k = membership[arc->neighbor];
+              if (ncount[k] == 0) touched.push_back(k);
+              lpa_accumulate(nscore[k], arc->weight);
+              ncount[k]++;
+            }
+          } else {
+            const std::vector<size_t> &ineis = g.incs[v1];
+            for (size_t j = 0; j < ineis.size(); ++j) {
+              size_t edgeID = ineis[j];
+              size_t k = membership[g.getOtherNode(edgeID, v1)];
+              if (ncount[k] == 0) touched.push_back(k);
+              lpa_accumulate(nscore[k], logsscr[edgeID]);
+              ncount[k]++;
+            }
           }
           if (touched.empty()) { prop_set[v1] = 0; continue; }
           const size_t current_k = membership[v1];
@@ -499,9 +566,15 @@ int cluster_by_propagation(Graph &g, std::vector<size_t> &membership,
         if (kPrev != best_k && blacklist.find(v1) == blacklist.end()) {
           membership[v1] = best_k;
           ++changed;
-          std::vector<size_t> &ineis = g.incs[v1];
-          for (size_t j = 0; j < ineis.size(); ++j)
-            next_active[g.getOtherNode(ineis[j], v1)] = 1;
+          if (use_csr) {
+            const LpaArc *arc = lpa_csr.arcs.data() + lpa_csr.offsets[v1];
+            const LpaArc *end = lpa_csr.arcs.data() + lpa_csr.offsets[v1 + 1];
+            for (; arc != end; ++arc) next_active[arc->neighbor] = 1;
+          } else {
+            const std::vector<size_t> &ineis = g.incs[v1];
+            for (size_t j = 0; j < ineis.size(); ++j)
+              next_active[g.getOtherNode(ineis[j], v1)] = 1;
+          }
           auto &seen = visited[v1];
           if (seen.empty()) seen.insert(kPrev);
           if (!seen.insert(best_k).second) {
@@ -556,17 +629,24 @@ int cluster_by_propagation(Graph &g, std::vector<size_t> &membership,
       // Accumulate summed log-p-value and neighbour count per neighbouring
       // cluster into the reusable dense arrays (only `touched` ones are live).
       touched.clear();
-      std::vector<size_t> &ineis = g.incs[v1];
-      for (size_t j = 0; j < ineis.size();
-           j++) { //# of neighbors (edges connected to v1)
-        size_t edgeID = ineis[j];
-
-        size_t k = membership[g.getOtherNode(
-            edgeID, v1)]; // community membership of a neighbor (connected by j)
-
-        if (ncount[k] == 0) touched.push_back(k);
-        lpa_accumulate(nscore[k], logsscr[edgeID]);  // precomputed per edge
-        ncount[k]++;
+      if (use_csr) {
+        const LpaArc *arc = lpa_csr.arcs.data() + lpa_csr.offsets[v1];
+        const LpaArc *end = lpa_csr.arcs.data() + lpa_csr.offsets[v1 + 1];
+        for (; arc != end; ++arc) {
+          size_t k = membership[arc->neighbor];
+          if (ncount[k] == 0) touched.push_back(k);
+          lpa_accumulate(nscore[k], arc->weight);
+          ncount[k]++;
+        }
+      } else {
+        const std::vector<size_t> &ineis = g.incs[v1];
+        for (size_t j = 0; j < ineis.size(); ++j) {
+          size_t edgeID = ineis[j];
+          size_t k = membership[g.getOtherNode(edgeID, v1)];
+          if (ncount[k] == 0) touched.push_back(k);
+          lpa_accumulate(nscore[k], logsscr[edgeID]);
+          ncount[k]++;
+        }
       }
 
       if (!touched.empty()) {
@@ -605,8 +685,15 @@ int cluster_by_propagation(Graph &g, std::vector<size_t> &membership,
           ++changed;
 
           // v1 changed → its neighbours must reconsider (re-activate them).
-          for (size_t j = 0; j < ineis.size(); ++j)
-            active[g.getOtherNode(ineis[j], v1)] = 1;
+          if (use_csr) {
+            const LpaArc *arc = lpa_csr.arcs.data() + lpa_csr.offsets[v1];
+            const LpaArc *end = lpa_csr.arcs.data() + lpa_csr.offsets[v1 + 1];
+            for (; arc != end; ++arc) active[arc->neighbor] = 1;
+          } else {
+            const std::vector<size_t> &ineis = g.incs[v1];
+            for (size_t j = 0; j < ineis.size(); ++j)
+              active[g.getOtherNode(ineis[j], v1)] = 1;
+          }
 
           // Label retention removes score ties, but strict Fisher preferences
           // can still form a cycle. Record every assigned label and freeze only
