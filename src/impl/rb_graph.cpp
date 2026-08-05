@@ -6,8 +6,8 @@
 // Reference all-pairs graph build (O(N^2) Jaccard); used when inverted index is off.
 static void build_graph_allpairs(Graph &g, Similarity cutoff) {
   ProgressTracker progress(nobs);
-  std::vector<size_t> &from = g.from;
-  std::vector<size_t> &to   = g.to;
+  std::vector<GraphNodeId> &from = g.from;
+  std::vector<GraphNodeId> &to   = g.to;
   auto &sComp = g.sComp;
 
   size_t TILE = 10;
@@ -23,7 +23,7 @@ static void build_graph_allpairs(Graph &g, Similarity cutoff) {
                   "TILE=%d nobs=%d maxEdges=%d\n", TILE, nobs, maxEdges);
 
 #pragma omp parallel for schedule(dynamic, 1)                                  \
-    reduction(merge_size_t : from) reduction(merge_size_t : to)                \
+    reduction(merge_graphnode : from) reduction(merge_graphnode : to)          \
     reduction(merge_storeddist : sComp)
   for (size_t ii = 0; ii < nobs; ii += TILE) {
     std::vector<std::priority_queue<Edge, std::vector<Edge>, CompareEdge>>
@@ -103,12 +103,12 @@ static void gen_pmh_graph_index(Graph &g, Similarity cutoff) {
                   nobs, (double)cutoff, b0, minCount,
                   idx.totalPostings, idx.postIdx.size());
 
-  std::vector<size_t>         &from  = g.from;
-  std::vector<size_t>         &to    = g.to;
+  std::vector<GraphNodeId>    &from  = g.from;
+  std::vector<GraphNodeId>    &to    = g.to;
   std::vector<StoredDistance> &sComp  = g.sComp;
 
-  std::vector<std::vector<size_t>>         tl_from(numThreads);
-  std::vector<std::vector<size_t>>         tl_to(numThreads);
+  std::vector<std::vector<GraphNodeId>>    tl_from(numThreads);
+  std::vector<std::vector<GraphNodeId>>    tl_to(numThreads);
   std::vector<std::vector<StoredDistance>> tl_sComp(numThreads);
 
   ProgressTracker progress(nobs);
@@ -197,8 +197,8 @@ static void gen_pmh_graph_index(Graph &g, Similarity cutoff) {
 }
 
 void build_similarity_graph(Graph &g, Similarity cutoff) {
-  std::vector<size_t> &from = g.from;
-  std::vector<size_t> &to   = g.to;
+  std::vector<GraphNodeId> &from = g.from;
+  std::vector<GraphNodeId> &to   = g.to;
   auto &sComp = g.sComp;
 
   if (nobs == 0) return;
@@ -260,8 +260,8 @@ void build_similarity_graph(Graph &g, Similarity cutoff) {
   //    Per-sketch keys are generated on-the-fly (getKeys) – no global skKeys.
   const uint32_t* csrPtr = idx.csrPosts.data();
 
-  std::vector<std::vector<size_t>>         tl_from(numThreads);
-  std::vector<std::vector<size_t>>         tl_to(numThreads);
+  std::vector<std::vector<GraphNodeId>>    tl_from(numThreads);
+  std::vector<std::vector<GraphNodeId>>    tl_to(numThreads);
   std::vector<std::vector<StoredDistance>> tl_sComp(numThreads);
 
   ProgressTracker progress(nobs);
@@ -680,6 +680,12 @@ static Distance gen_fused_calib_graph(Graph &g, Distance coverage) {
   // pair that could pass the fused filter is ever dropped.
   const uint32_t ABD_S = (uint32_t)num_depth_samples;
   const float abd_corr_min_eps = (float)(abd_corr_min - 1e-4);
+#if defined(__AVX512F__)
+  const bool preload_short_abd = abdfirst && ABD_S >= 16 && ABD_S <= 64 &&
+      (getenv("RABBIT_NO_ABD_PRELOAD") == nullptr);
+#else
+  const bool preload_short_abd = false;
+#endif
   // The abd-first prune needs centered + L2-normalised rank vectors so that the
   // depth correlation is a plain dot product.  The edge-weight stage already
   // builds exactly this in the global g_depth_unit (identical layout and values;
@@ -717,6 +723,9 @@ static Distance gen_fused_calib_graph(Graph &g, Distance coverage) {
                     "(g_w_comp=%.2f, min_edge=%.2f)%s\n",
                     abd_corr_min, g_w_comp, (double)min_edge_weight,
                     abd_reused ? " [reused g_depth_unit]" : "");
+    if (preload_short_abd)
+      verbose_message("Abundance dot: batched AVX-512 left-row preload (S=%u)\n",
+                      ABD_S);
   }
 
   // ── Composition early-exit (exact) ───────────────────────────────────────
@@ -842,6 +851,60 @@ static Distance gen_fused_calib_graph(Graph &g, Distance coverage) {
       rs.spin.store(0, std::memory_order_release);  // release spinlock
     };
 
+    auto process_pair = [&](size_t i, size_t j, int i_round,
+                            size_t i_local) {
+      StoredDistance sv;
+      if (comp_ee && i_round < 0 && sample_round[j] < 0) {
+        // Partial winner match → exact upper bound on sv; prune if it cannot
+        // beat either endpoint's heap threshold.  Result is bit-identical to
+        // graph_sim(i,j) on the non-pruned path (same total match count).
+        uint32_t cP, cFull;
+        if (win16) {
+          const uint16_t *aw = g_win16.data() + i * (size_t)g_pmh_m;
+          const uint16_t *bw = g_win16.data() + j * (size_t)g_pmh_m;
+          cP = pmh_match_count16(aw, bw, EE_P);
+          double up = (double)(cP + (g_pmh_m - EE_P)) * g_inv_pmh_m;
+          if (g_pmh_base_on && g_pmh_baseline > 0.0 && g_pmh_baseline < 1.0) {
+            up = (up - g_pmh_baseline) * g_inv_one_minus_b0;
+            if (up < 0.0) up = 0.0;
+          }
+          if (up > 1.0 - 1e-6) up = 1.0 - 1e-6;
+          const float ti = rowsync[i].thresh_sv.load(std::memory_order_relaxed);
+          const float tj = rowsync[j].thresh_sv.load(std::memory_order_relaxed);
+          if ((float)up < (ti < tj ? ti : tj)) return;  // exact: unkeepable
+          cFull = cP + pmh_match_count16(aw + EE_P, bw + EE_P, g_pmh_m - EE_P);
+        } else {
+          const uint32_t *aw = g_win_flat.data() + i * (size_t)g_pmh_m;
+          const uint32_t *bw = g_win_flat.data() + j * (size_t)g_pmh_m;
+          cP = pmh_match_count(aw, bw, EE_P);
+          double up = (double)(cP + (g_pmh_m - EE_P)) * g_inv_pmh_m;
+          if (g_pmh_base_on && g_pmh_baseline > 0.0 && g_pmh_baseline < 1.0) {
+            up = (up - g_pmh_baseline) * g_inv_one_minus_b0;
+            if (up < 0.0) up = 0.0;
+          }
+          if (up > 1.0 - 1e-6) up = 1.0 - 1e-6;
+          const float ti = rowsync[i].thresh_sv.load(std::memory_order_relaxed);
+          const float tj = rowsync[j].thresh_sv.load(std::memory_order_relaxed);
+          if ((float)up < (ti < tj ? ti : tj)) return;  // exact: unkeepable
+          cFull = cP + pmh_match_count(aw + EE_P, bw + EE_P, g_pmh_m - EE_P);
+        }
+        sv = (StoredDistance)pmh_sv_from_count(cFull);
+      } else {
+        sv = (StoredDistance)graph_sim(i, j);
+      }
+      update_row(i, j, sv);
+      update_row(j, i, sv);
+      if (i_round >= 0) {
+        float &m = my_jmax[i_round][i_local];
+        if ((float)sv > m) m = (float)sv;
+      }
+      const int j_round = sample_round[j];
+      if (j_round >= 0) {
+        float &m = my_jmax[j_round][sample_local[j]];
+        if ((float)sv > m) m = (float)sv;
+      }
+    };
+
     if (!use_lsh) {
 #pragma omp for schedule(dynamic, 1)
     for (size_t p = 0; p < tilepairs.size(); ++p) {
@@ -854,7 +917,33 @@ static Distance gen_fused_calib_graph(Graph &g, Distance coverage) {
         const int    i_round = sample_round[i];
         const size_t i_local = sample_local[i];
         // Diagonal tile: only j>i; off-diagonal: full j range.
-        for (size_t j = (diag ? i + 1 : jj); j < j_stop; ++j) {
+        const size_t j_begin = diag ? i + 1 : jj;
+#if defined(__AVX512F__)
+        if (preload_short_abd) {
+          UnitDotLeft64 left;
+          unit_dot_left64_init(left, abd_u + i * ABD_S, ABD_S);
+          static constexpr size_t DOT_BATCH = 8;
+          for (size_t jb = j_begin; jb < j_stop; jb += DOT_BATCH) {
+            const size_t nb = std::min(DOT_BATCH, j_stop - jb);
+            uint8_t nz[DOT_BATCH];
+            float corr[DOT_BATCH];
+            for (size_t q = 0; q < nb; ++q) {
+              const size_t j = jb + q;
+              nz[q] = (uint8_t)is_nz(i, j);
+              if (nz[q])
+                corr[q] = unit_dot_f_left64(left, abd_u + j * ABD_S);
+            }
+            // Keep PMH/heap processing in the original j order.  Only the
+            // independent abundance tests are computed ahead within a batch.
+            for (size_t q = 0; q < nb; ++q) {
+              if (!nz[q] || corr[q] < abd_corr_min_eps) continue;
+              process_pair(i, jb + q, i_round, i_local);
+            }
+          }
+          continue;
+        }
+#endif
+        for (size_t j = j_begin; j < j_stop; ++j) {
           if (!is_nz(i, j)) continue;
           // Abundance-first exact upper-bound prune: skip the PMH kernel for
           // pairs whose best-case fused score is already below the cutoff.
@@ -862,56 +951,7 @@ static Distance gen_fused_calib_graph(Graph &g, Distance coverage) {
             const float c = unit_dot_f(abd_u + i * ABD_S, abd_u + j * ABD_S, ABD_S);
             if (c < abd_corr_min_eps) continue;
           }
-          StoredDistance sv;
-          if (comp_ee && i_round < 0 && sample_round[j] < 0) {
-            // Partial winner match → exact upper bound on sv; prune if it cannot
-            // beat either endpoint's heap threshold.  Result is bit-identical to
-            // graph_sim(i,j) on the non-pruned path (same total match count).
-            uint32_t cP, cFull;
-            if (win16) {
-              const uint16_t *aw = g_win16.data() + i * (size_t)g_pmh_m;
-              const uint16_t *bw = g_win16.data() + j * (size_t)g_pmh_m;
-              cP = pmh_match_count16(aw, bw, EE_P);
-              double up = (double)(cP + (g_pmh_m - EE_P)) * g_inv_pmh_m;
-              if (g_pmh_base_on && g_pmh_baseline > 0.0 && g_pmh_baseline < 1.0) {
-                up = (up - g_pmh_baseline) * g_inv_one_minus_b0;
-                if (up < 0.0) up = 0.0;
-              }
-              if (up > 1.0 - 1e-6) up = 1.0 - 1e-6;
-              const float ti = rowsync[i].thresh_sv.load(std::memory_order_relaxed);
-              const float tj = rowsync[j].thresh_sv.load(std::memory_order_relaxed);
-              if ((float)up < (ti < tj ? ti : tj)) continue;  // exact: unkeepable
-              cFull = cP + pmh_match_count16(aw + EE_P, bw + EE_P, g_pmh_m - EE_P);
-            } else {
-              const uint32_t *aw = g_win_flat.data() + i * (size_t)g_pmh_m;
-              const uint32_t *bw = g_win_flat.data() + j * (size_t)g_pmh_m;
-              cP = pmh_match_count(aw, bw, EE_P);
-              double up = (double)(cP + (g_pmh_m - EE_P)) * g_inv_pmh_m;
-              if (g_pmh_base_on && g_pmh_baseline > 0.0 && g_pmh_baseline < 1.0) {
-                up = (up - g_pmh_baseline) * g_inv_one_minus_b0;
-                if (up < 0.0) up = 0.0;
-              }
-              if (up > 1.0 - 1e-6) up = 1.0 - 1e-6;
-              const float ti = rowsync[i].thresh_sv.load(std::memory_order_relaxed);
-              const float tj = rowsync[j].thresh_sv.load(std::memory_order_relaxed);
-              if ((float)up < (ti < tj ? ti : tj)) continue;  // exact: unkeepable
-              cFull = cP + pmh_match_count(aw + EE_P, bw + EE_P, g_pmh_m - EE_P);
-            }
-            sv = (StoredDistance)pmh_sv_from_count(cFull);
-          } else {
-            sv = (StoredDistance)graph_sim(i, j);
-          }
-          update_row(i, j, sv);
-          update_row(j, i, sv);
-          if (i_round >= 0) {
-            float &m = my_jmax[i_round][i_local];
-            if ((float)sv > m) m = (float)sv;
-          }
-          const int j_round = sample_round[j];
-          if (j_round >= 0) {
-            float &m = my_jmax[j_round][sample_local[j]];
-            if ((float)sv > m) m = (float)sv;
-          }
+          process_pair(i, j, i_round, i_local);
         }
       }
       if (verbose && tid == 0 && (p & 0x3FFu) == 0)
@@ -996,8 +1036,8 @@ static Distance gen_fused_calib_graph(Graph &g, Distance coverage) {
   verbose_message("Starting Building Similarity Graph (Fusion D). "
                   "nobs=%zu cutoff=%.4f\n", nobs, (double)cutoff);
 
-  std::vector<size_t>         &from  = g.from;
-  std::vector<size_t>         &to    = g.to;
+  std::vector<GraphNodeId>    &from  = g.from;
+  std::vector<GraphNodeId>    &to    = g.to;
   std::vector<StoredDistance> &sComp  = g.sComp;
 
   if (!g_mutual_knn) {
@@ -1046,8 +1086,8 @@ static Distance gen_fused_calib_graph(Graph &g, Distance coverage) {
     }
 
     // (2) Parallel emit: for each i, keep (i,j) with i<j iff i ∈ nbr[j] too.
-    std::vector<std::vector<size_t>>         tl_from(numThreads);
-    std::vector<std::vector<size_t>>         tl_to(numThreads);
+    std::vector<std::vector<GraphNodeId>>    tl_from(numThreads);
+    std::vector<std::vector<GraphNodeId>>    tl_to(numThreads);
     std::vector<std::vector<StoredDistance>> tl_sv(numThreads);
 #pragma omp parallel num_threads(numThreads)
     {

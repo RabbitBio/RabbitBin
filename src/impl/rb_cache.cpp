@@ -93,9 +93,10 @@ static inline bool rbc_rd_mat(FILE *f, Matrix &m) {
 
 static const char RBC_MAGIC[8] = {'R', 'B', 'C', 'A', 'C', 'H', 'E', '1'};
 // v1: original (no SNV).  v2: appends an optional per-large-contig SNV block
-// (feature #5) so --strain results are reusable from cache.  v1 caches still
-// load (the SNV block is simply absent).
-static const uint32_t RBC_VERSION = 2;
+// (feature #5) so --strain results are reusable from cache.  v3 stores graph
+// endpoints as uint32_t instead of size_t; v1/v2 remain readable and are
+// range-checked while converting their endpoint arrays.
+static const uint32_t RBC_VERSION = 3;
 
 } // namespace
 
@@ -227,6 +228,11 @@ bool rb_load_cache(const std::string &path) {
   nobs = (size_t)v_nobs;
   nobs1 = (size_t)v_nobs1;
   num_depth_samples = (size_t)v_nds;
+  if (v_nobs > (uint64_t)std::numeric_limits<GraphNodeId>::max()) {
+    cerr << "[Error!] cached graph exceeds the 32-bit node-ID capacity\n";
+    fclose(f);
+    return false;
+  }
   g_cache_seed = v_seed;
   totalSize = v_ts;
   totalSize1 = v_ts1;
@@ -245,9 +251,48 @@ bool rb_load_cache(const std::string &path) {
   ok &= rbc_rd_vec(f, g_large_means);
   ok &= rbc_rd_vec(f, g_depth_raw);
   ok &= rbc_rd_vec(f, g_depth_colnorm);
-  ok &= rbc_rd_vec(f, g_cache_from);
-  ok &= rbc_rd_vec(f, g_cache_to);
+  if (ver >= 3) {
+    ok &= rbc_rd_vec(f, g_cache_from);
+    ok &= rbc_rd_vec(f, g_cache_to);
+  } else {
+    std::vector<size_t> legacy_from, legacy_to;
+    ok &= rbc_rd_vec(f, legacy_from);
+    ok &= rbc_rd_vec(f, legacy_to);
+    if (ok) {
+      g_cache_from.resize(legacy_from.size());
+      g_cache_to.resize(legacy_to.size());
+      for (size_t i = 0; i < legacy_from.size(); ++i) {
+        if (legacy_from[i] >
+            (size_t)std::numeric_limits<GraphNodeId>::max()) {
+          ok = false;
+          break;
+        }
+        g_cache_from[i] = (GraphNodeId)legacy_from[i];
+      }
+      for (size_t i = 0; ok && i < legacy_to.size(); ++i) {
+        if (legacy_to[i] >
+            (size_t)std::numeric_limits<GraphNodeId>::max()) {
+          ok = false;
+          break;
+        }
+        g_cache_to[i] = (GraphNodeId)legacy_to[i];
+      }
+    }
+  }
   ok &= rbc_rd_vec(f, g_cache_scomp);
+
+  if (ok && (g_cache_from.size() != g_cache_to.size() ||
+             g_cache_from.size() != g_cache_scomp.size()))
+    ok = false;
+  if (ok) {
+    for (size_t e = 0; e < g_cache_from.size(); ++e) {
+      if ((uint64_t)g_cache_from[e] >= v_nobs ||
+          (uint64_t)g_cache_to[e] >= v_nobs) {
+        ok = false;
+        break;
+      }
+    }
+  }
 
   // ── SNV / strain block (v2; feature #5) ──────────────────────────────────
   g_cache_has_snv = false;

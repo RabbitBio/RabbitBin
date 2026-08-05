@@ -363,7 +363,7 @@ static LpaCsr build_lpa_csr(Graph &g,
 #pragma omp parallel for schedule(static)
   for (size_t v = 0; v < n; ++v) {
     size_t out = csr.offsets[v];
-    const std::vector<size_t> &inc = g.incs[v];
+    const std::vector<GraphEdgeId> &inc = g.incs[v];
     for (size_t j = 0; j < inc.size(); ++j) {
       const size_t edge = inc[j];
       csr.arcs[out++] = LpaArc{(uint32_t)g.getOtherNode(edge, v),
@@ -521,7 +521,7 @@ int cluster_by_propagation(Graph &g, std::vector<size_t> &membership,
               ncount[k]++;
             }
           } else {
-            const std::vector<size_t> &ineis = g.incs[v1];
+            const std::vector<GraphEdgeId> &ineis = g.incs[v1];
             for (size_t j = 0; j < ineis.size(); ++j) {
               size_t edgeID = ineis[j];
               size_t k = membership[g.getOtherNode(edgeID, v1)];
@@ -571,7 +571,7 @@ int cluster_by_propagation(Graph &g, std::vector<size_t> &membership,
             const LpaArc *end = lpa_csr.arcs.data() + lpa_csr.offsets[v1 + 1];
             for (; arc != end; ++arc) next_active[arc->neighbor] = 1;
           } else {
-            const std::vector<size_t> &ineis = g.incs[v1];
+            const std::vector<GraphEdgeId> &ineis = g.incs[v1];
             for (size_t j = 0; j < ineis.size(); ++j)
               next_active[g.getOtherNode(ineis[j], v1)] = 1;
           }
@@ -639,7 +639,7 @@ int cluster_by_propagation(Graph &g, std::vector<size_t> &membership,
           ncount[k]++;
         }
       } else {
-        const std::vector<size_t> &ineis = g.incs[v1];
+        const std::vector<GraphEdgeId> &ineis = g.incs[v1];
         for (size_t j = 0; j < ineis.size(); ++j) {
           size_t edgeID = ineis[j];
           size_t k = membership[g.getOtherNode(edgeID, v1)];
@@ -690,7 +690,7 @@ int cluster_by_propagation(Graph &g, std::vector<size_t> &membership,
             const LpaArc *end = lpa_csr.arcs.data() + lpa_csr.offsets[v1 + 1];
             for (; arc != end; ++arc) active[arc->neighbor] = 1;
           } else {
-            const std::vector<size_t> &ineis = g.incs[v1];
+            const std::vector<GraphEdgeId> &ineis = g.incs[v1];
             for (size_t j = 0; j < ineis.size(); ++j)
               active[g.getOtherNode(ineis[j], v1)] = 1;
           }
@@ -772,7 +772,7 @@ void compute_node_confidence(Graph &g,
   touched.reserve(256);
 
   for (size_t v1 = 0; v1 < nnodes; ++v1) {
-    std::vector<size_t> &ineis = g.incs[v1];
+    std::vector<GraphEdgeId> &ineis = g.incs[v1];
     if (ineis.empty()) continue;
     touched.clear();
     for (size_t j = 0; j < ineis.size(); ++j) {

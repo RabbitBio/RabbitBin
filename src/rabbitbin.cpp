@@ -143,11 +143,10 @@ static double      g_split_consolidate_delta = 0.0;
 // Agglomerates compatible fragments using paired-end linkage as the decisive
 // physical signal and depth-centroid agreement as a consistency check.
 static bool        g_bin_merge        = true;
-// Composition+depth recruitment of unbinned contigs into cores. For each
-// unbinned large contig, attach it to the core it matches on both tetranucleotide
-// composition (cosine) AND abundance (depth-corr) — a conjunctive gate (a
-// contaminant that matches on only one signal is rejected) with an unambiguity
-// margin over the second-best core.
+// Calibrated recruitment of unbinned large contigs into frozen output-sized
+// cores. Actual correct and incorrect leave-one-out core predictions learn one
+// ROC/Youden boundary for the nearest/runner-up cosine residual ratio. Paired-end
+// support can corroborate, but cannot override, the feature winner.
 static bool        g_bin_recruit      = true;
 // Raw per-sample mean depths of small contigs, snapshotted BEFORE small_depth_matrix is
 // rank-transformed in place during recruitment, so marker_guided_split sees the
@@ -196,8 +195,8 @@ static std::vector<float>  g_depth_unit;           // nobs × num_depth_samples 
 // constructed at load time); the do-block in main() moves them into Graph g.
 // g_cache_seed / g_cache_has_depth carry the build-time seed + depth flag so a
 // --load-cache run reproduces the cached run unless the user overrides --seed.
-static std::vector<size_t>         g_cache_from;
-static std::vector<size_t>         g_cache_to;
+static std::vector<GraphNodeId>    g_cache_from;
+static std::vector<GraphNodeId>    g_cache_to;
 static std::vector<StoredDistance> g_cache_scomp;
 static unsigned long long          g_cache_seed = 0;
 static bool                        g_cache_has_depth = false;
@@ -797,6 +796,87 @@ static inline float unit_dot_f(const float *__restrict__ a,
   return r;
 }
 
+#if defined(__AVX512F__)
+// Preloaded left-hand side for the common short abundance rows.  The four
+// cases below intentionally reproduce unit_dot_f's accumulator assignment and
+// horizontal-reduction order exactly; only the repeated loads of row `a` and
+// the generic loop bookkeeping are removed.  Used in small batches so these
+// registers are not kept live across the much larger PMH/heap-update kernel.
+struct UnitDotLeft64 {
+  __m512 a0, a1, a2, a3;
+  __mmask16 tail;
+  uint8_t kind;  // 1:16..31, 2:32..47, 3:48..63, 4:64
+};
+
+static inline bool unit_dot_left64_init(UnitDotLeft64 &p,
+                                        const float *__restrict__ a,
+                                        uint32_t S) {
+  if (S < 16 || S > 64) return false;
+  p.a0 = _mm512_loadu_ps(a);
+  p.a1 = p.a2 = p.a3 = _mm512_setzero_ps();
+  p.tail = 0;
+  if (S < 32) {
+    p.kind = 1;
+    const uint32_t rem = S - 16;
+    if (rem) {
+      p.tail = (__mmask16)((1u << rem) - 1u);
+      p.a1 = _mm512_maskz_loadu_ps(p.tail, a + 16);
+    }
+  } else if (S < 48) {
+    p.kind = 2;
+    p.a1 = _mm512_loadu_ps(a + 16);
+    const uint32_t rem = S - 32;
+    if (rem) {
+      p.tail = (__mmask16)((1u << rem) - 1u);
+      p.a2 = _mm512_maskz_loadu_ps(p.tail, a + 32);
+    }
+  } else if (S < 64) {
+    p.kind = 3;
+    p.a1 = _mm512_loadu_ps(a + 16);
+    p.a2 = _mm512_loadu_ps(a + 32);
+    const uint32_t rem = S - 48;
+    if (rem) {
+      p.tail = (__mmask16)((1u << rem) - 1u);
+      p.a3 = _mm512_maskz_loadu_ps(p.tail, a + 48);
+    }
+  } else {
+    p.kind = 4;
+    p.a1 = _mm512_loadu_ps(a + 16);
+    p.a2 = _mm512_loadu_ps(a + 32);
+    p.a3 = _mm512_loadu_ps(a + 48);
+  }
+  return true;
+}
+
+static inline float unit_dot_f_left64(const UnitDotLeft64 &p,
+                                      const float *__restrict__ b) {
+  __m512 acc0 = _mm512_setzero_ps(), acc1 = _mm512_setzero_ps();
+  acc0 = _mm512_fmadd_ps(p.a0, _mm512_loadu_ps(b), acc0);
+  if (p.kind == 1) {
+    if (p.tail)
+      acc0 = _mm512_fmadd_ps(
+          p.a1, _mm512_maskz_loadu_ps(p.tail, b + 16), acc0);
+  } else {
+    acc1 = _mm512_fmadd_ps(p.a1, _mm512_loadu_ps(b + 16), acc1);
+    if (p.kind == 2) {
+      if (p.tail)
+        acc0 = _mm512_fmadd_ps(
+            p.a2, _mm512_maskz_loadu_ps(p.tail, b + 32), acc0);
+    } else {
+      acc0 = _mm512_fmadd_ps(p.a2, _mm512_loadu_ps(b + 32), acc0);
+      if (p.kind == 3) {
+        if (p.tail)
+          acc0 = _mm512_fmadd_ps(
+              p.a3, _mm512_maskz_loadu_ps(p.tail, b + 48), acc0);
+      } else {
+        acc1 = _mm512_fmadd_ps(p.a3, _mm512_loadu_ps(b + 48), acc1);
+      }
+    }
+  }
+  return _mm512_reduce_add_ps(_mm512_add_ps(acc0, acc1));
+}
+#endif
+
 // Depth term for edge blending, dispatching on g_depth_sim.  Sets ok=false to
 // hard-cut the edge (non-finite, or strongly negative correlation).
 // Conjunctive dual depth correlation: min(corr over all-read half, corr over
@@ -889,10 +969,11 @@ static std::vector<float> g_k4freq_flat; // nobs × 256, non-canonical entries=0
 static bool              g_exact_cos_cmp = false;
 static std::vector<float> g_k4cosine_flat; // nobs × 256, L2-normalised GC-norm freqs
 
-// Tetranucleotide (k=4) composition vectors for composition+depth recruit
-// (g_bin_recruit).  256-dim L2-normalised per LARGE contig; built from the
-// resident sequences during the streaming parse only when recruit is enabled.
-static std::vector<float> g_merge_tnf;        // nobs  × 256, L2-normalised (large)
+// Tetranucleotide (k=4) composition vectors for calibrated core recruitment
+// (g_bin_recruit). Built from resident sequences during the streaming parse only
+// when recruitment is enabled. The ordinary path stores unit rows; the recruit
+// implementation normalises explicitly so optional GC-normalised rows are safe.
+static std::vector<float> g_merge_tnf;        // nobs × 256 (large contigs)
 static inline void rb_fill_tnf(const char *s, size_t L, float *out) {
   for (int i = 0; i < 256; ++i) out[i] = 0.f;
   auto code = [](char c) -> int {
@@ -916,10 +997,11 @@ static inline void rb_fill_tnf(const char *s, size_t L, float *out) {
 // Paired-end cross-contig linkage captured during the BAM depth scan, used as a
 // high-precision physical gate for bin merging. Stored
 // first in compact depth-row space (g_pe_links_compact, with g_pe_names mapping a
-// compact row -> contig name), then converted to binning contig indices inside
-// consolidate_bins (where contig_names is available).
+// compact row -> contig name), then lazily converted once to binning contig
+// indices for both merge and recruitment (after contig_names is available).
 static std::vector<std::string> g_pe_names;                          // compact row -> name
 static std::vector<std::tuple<int32_t, int32_t, uint32_t>> g_pe_links_compact;
+static std::vector<int> g_pe_compact_to_contig;                      // lazy name mapping
 
 // Fast Jaccard on raw pointers (no virtual dispatch, no null checks).
 // a, b: pointers to the start of two signature rows in g_sig_flat.
@@ -1497,6 +1579,7 @@ static std::unique_ptr<rabbit_invidx::InvertedIndex> g_pmh_idx;
 
 // ── OMP reduction operators (must be visible before parallel loops) ───────
 #pragma omp declare reduction (merge_size_t : std::vector<size_t> : omp_out.insert(omp_out.end(), omp_in.begin(), omp_in.end()) )
+#pragma omp declare reduction (merge_graphnode : std::vector<GraphNodeId> : omp_out.insert(omp_out.end(), omp_in.begin(), omp_in.end()) )
 #pragma omp declare reduction (merge_dist : std::vector<Distance> : omp_out.insert(omp_out.end(), omp_in.begin(), omp_in.end()) )
 #pragma omp declare reduction (merge_storeddist : std::vector<StoredDistance> : omp_out.insert(omp_out.end(), omp_in.begin(), omp_in.end()) )
 
@@ -3695,6 +3778,7 @@ static int rb_cmd_bin(int ac, char *av[]) {
         if (g_bin_merge && !cols.pe_links.empty()) {
           g_pe_names = cols.names;
           g_pe_links_compact = std::move(cols.pe_links);
+          g_pe_compact_to_contig.clear();
         }
         DepthMap m;
         m.reserve(cols.names.size());
@@ -4974,12 +5058,13 @@ static int rb_cmd_bin(int ac, char *av[]) {
 
         // Rebuild incidence lists from the current g.edgeScore (clamp + sort).
         auto rebuild_incs = [&]() {
+          g.requireCompactEdgeIds();
           g.incs.assign(nobs, {});
           for (size_t e = 0; e < E; ++e) {
             if (g.edgeScore[e] > 0) {
               if (g.edgeScore[e] > SSCR_MAX) g.edgeScore[e] = SSCR_MAX;
-              g.incs[g.from[e]].push_back(e);
-              g.incs[g.to[e]].push_back(e);
+              g.incs[g.from[e]].push_back((GraphEdgeId)e);
+              g.incs[g.to[e]].push_back((GraphEdgeId)e);
             }
           }
 #pragma omp parallel for schedule(dynamic, 256)
@@ -5386,12 +5471,13 @@ static int rb_cmd_bin(int ac, char *av[]) {
       // Clamp edgeScore to (0, 1-eps): Boost 1.66 cdf(chi_squared, x) throws when
       // x = -2*LOG(1-edgeScore) is non-finite (LOG(0) = -inf when edgeScore >= 1.0).
       static constexpr StoredDistance SSCR_MAX = 1.0f - 1e-6f;
+      g.requireCompactEdgeIds();
       g.incs.resize(nobs);
       for (size_t e = 0; e < g.getEdgeCount(); ++e) {
         if (g.edgeScore[e] > 0) {
           if (g.edgeScore[e] > SSCR_MAX) g.edgeScore[e] = SSCR_MAX;
-          g.incs[g.from[e]].push_back(e);
-          g.incs[g.to[e]].push_back(e);
+          g.incs[g.from[e]].push_back((GraphEdgeId)e);
+          g.incs[g.to[e]].push_back((GraphEdgeId)e);
         }
       }
       // Determinism: the parallel edge build concatenates per-thread lists in a
@@ -5467,11 +5553,12 @@ static int rb_cmd_bin(int ac, char *av[]) {
           const StoredDistance frac = (StoredDistance)((double)agree[e] * invN);
           g.edgeScore[e] = frac > SSCR_MAX_ENS ? SSCR_MAX_ENS : frac;
         }
+        g.requireCompactEdgeIds();
         g.incs.assign(nobs, {});
         for (size_t e = 0; e < E; ++e) {
           if (g.edgeScore[e] > 0) {
-            g.incs[g.from[e]].push_back(e);
-            g.incs[g.to[e]].push_back(e);
+            g.incs[g.from[e]].push_back((GraphEdgeId)e);
+            g.incs[g.to[e]].push_back((GraphEdgeId)e);
           }
         }
 #pragma omp parallel for schedule(dynamic, 256)
