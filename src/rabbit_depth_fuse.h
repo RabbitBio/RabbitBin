@@ -5,6 +5,7 @@
 // decompression overlaps the binning FASTA/sketch pass. The returned string is
 // byte-identical to the standalone rabbit_depth depth file.
 #include <cstdint>
+#include <cstddef>
 #include <memory>
 #include <string>
 #include <tuple>
@@ -84,12 +85,16 @@ std::string depth_format_table(const std::vector<DepthColumn> &cols,
 // Structured per-contig depth (means only) — an in-memory alternative to the TSV
 // string.  Lets the fused binning path skip formatting millions of contigs to
 // text and parsing them back: ~format+parse of the depth round-trip.  Emits the
-// SAME contig set as the TSV (length >= minContigLength); means[i] is one float
-// per sample for contig names[i] (length lens[i]).
+// SAME contig set as the TSV (length >= minContigLength). `means` is one
+// contiguous row-major allocation: row i starts at means[i * num_samples].
+// This avoids one allocation and one vector object per contig.
 struct DepthMatrixOut {
   std::vector<std::string> names;
   std::vector<int32_t> lens;
-  std::vector<std::vector<float>> means; // means[contig][sample]
+  size_t num_samples = 0;
+  std::vector<float> means; // row-major [contig][sample]
+  float *row(size_t i) { return means.data() + i * num_samples; }
+  const float *row(size_t i) const { return means.data() + i * num_samples; }
   // Paired-end cross-contig linkage (feature: PE refinement).  Filled only when
   // collectPELink is requested.  Each entry is (compact_row_a, compact_row_b,
   // count) with a<b, summed over all BAMs.  compact_row_* indexes the same
