@@ -589,6 +589,30 @@ static Distance gen_fused_calib_graph(Graph &g, Distance coverage) {
     rowsync[r].spin.store(0, std::memory_order_relaxed);
   }
 
+  // Optional hot-loop diagnostics.  Counters are strictly thread-local inside
+  // the parallel region; enabling RB_GRAPH_PROF therefore avoids introducing
+  // the very atomics/locks that this profile is intended to measure.
+  struct alignas(64) GraphPassProfile {
+    uint64_t tiles = 0;
+    uint64_t geometricPairs = 0;
+    uint64_t similarityPairs = 0;
+    uint64_t upperBoundPruned = 0;
+    uint64_t q8Pruned = 0;
+    uint64_t q8FloatChecked = 0;
+    uint64_t q8FloatRejected = 0;
+    uint64_t partialThenFull = 0;
+    uint64_t graphSimCalls = 0;
+    uint64_t rowUpdateCalls = 0;
+    uint64_t similarityRejects = 0;
+    uint64_t keyRejects = 0;
+    uint64_t lockAcquires = 0;
+    uint64_t lockContentions = 0;
+    uint64_t heapPushes = 0;
+    uint64_t heapReplacements = 0;
+  };
+  const bool graphProfileOn = getenv("RB_GRAPH_PROF") != nullptr;
+  std::vector<GraphPassProfile> graphProfile(numThreads);
+
   // Per-thread maxsim accumulators — both endpoints of every pair feed these;
   // merged into the global maxsim[][] after the pass (max is order-independent,
   // so calibration is bit-identical regardless of pair processing order).
@@ -621,7 +645,7 @@ static Distance gen_fused_calib_graph(Graph &g, Distance coverage) {
       // work balance, and early heap-threshold formation benefit from more tile
       // pairs than the capacity-only estimate provides.  On this path cap the
       // block at 256 rows; low/medium-dimensional data still use the larger L2
-      // block (512 rows for the common 20-dimensional win16 case).
+      // block. Lower-dimensional data retain the capacity-derived size.
       if (depth_row > winner_row / 2) TILE = std::min((size_t)256, TILE);
       if (TILE >= 16) TILE = (TILE / 16) * 16;
     }
@@ -695,6 +719,11 @@ static Distance gen_fused_calib_graph(Graph &g, Distance coverage) {
   std::vector<float> abd_unit;   // fallback storage only
   const float *abd_u = nullptr;
   bool abd_reused = false;
+  bool use_abd_q8 = false;
+  size_t abd_q8_stride = 0;
+  int32_t abd_q8_prune_max = std::numeric_limits<int32_t>::min();
+  std::vector<int8_t> abd_q8;
+  std::vector<int32_t> abd_q8_sum;
   if (abdfirst) {
     if (!g_depth_unit.empty() && g_depth_unit.size() == (size_t)nobs * ABD_S) {
       abd_u = g_depth_unit.data();
@@ -723,7 +752,87 @@ static Distance gen_fused_calib_graph(Graph &g, Distance coverage) {
                     "(g_w_comp=%.2f, min_edge=%.2f)%s\n",
                     abd_corr_min, g_w_comp, (double)min_edge_weight,
                     abd_reused ? " [reused g_depth_unit]" : "");
-    if (preload_short_abd)
+#if defined(__AVX512VNNI__) && defined(__AVX512BW__)
+    // ISA-gated exact-safe int8 prefilter. Quantisation is never used as the
+    // similarity value: an analytically conservative error radius only rejects
+    // pairs that cannot reach the original float-dot threshold. All remaining
+    // pairs still execute unit_dot_f and therefore keep the original graph
+    // semantics. The dimension limit follows directly from int32 accumulator
+    // range for dpbusd's worst-case (255 * 127) product, not from input data.
+    const char *abdQ8Env = getenv("RABBIT_ABD_Q8");
+    constexpr int Q8_SCALE = 127;
+    const size_t q8MinDefaultDim = sizeof(__m512i) / sizeof(float);
+    const size_t q8SafeDim =
+        (size_t)std::numeric_limits<int32_t>::max() /
+        (255u * (size_t)Q8_SCALE);
+    // Below one 512-bit float vector, padding to a 64-byte int8 row can move
+    // more data than the original dot. Keep that small-S case on float unless
+    // explicitly forced; RABBIT_ABD_Q8=0 disables the prefilter everywhere.
+    const bool q8Requested = abdQ8Env ? atoi(abdQ8Env) != 0
+                                      : (size_t)ABD_S >= q8MinDefaultDim;
+    if (q8Requested && ABD_S > 0 && (size_t)ABD_S <= q8SafeDim) {
+      abd_q8_stride = ((size_t)ABD_S + 63u) & ~(size_t)63u;
+      if (abd_q8_stride != 0 &&
+          nobs <= std::numeric_limits<size_t>::max() / abd_q8_stride) {
+        abd_q8.assign(nobs * abd_q8_stride, (int8_t)0);
+        abd_q8_sum.assign(nobs, 0);
+        double maxXNorm = 0.0, maxErrNorm = 0.0;
+#pragma omp parallel for num_threads(numThreads) schedule(static) \
+    reduction(max : maxXNorm, maxErrNorm)
+        for (size_t r = 0; r < nobs; ++r) {
+          const float *src = abd_u + r * (size_t)ABD_S;
+          int8_t *dst = abd_q8.data() + r * abd_q8_stride;
+          int32_t qsum = 0;
+          double xss = 0.0, ess = 0.0;
+          for (uint32_t k = 0; k < ABD_S; ++k) {
+            long q = std::lround((double)src[k] * Q8_SCALE);
+            q = std::max(-Q8_SCALE, std::min(Q8_SCALE, (int)q));
+            dst[k] = (int8_t)q;
+            qsum += (int32_t)q;
+            const double x = (double)q / Q8_SCALE;
+            const double e = (double)src[k] - x;
+            xss += x * x;
+            ess += e * e;
+          }
+          abd_q8_sum[r] = qsum;
+          maxXNorm = std::max(maxXNorm, std::sqrt(xss));
+          maxErrNorm = std::max(maxErrNorm, std::sqrt(ess));
+        }
+
+        // For u=x+e and v=y+f:
+        // u.v <= x.y + ||x||||f|| + ||y||||e|| + ||e||||f||.
+        // Global maxima make one pair-independent bound, leaving the hot loop
+        // with only an integer dot and compare. Add a forward-error bound for
+        // the original float FMA/reduction so this prefilter cannot reject a
+        // pair that unit_dot_f would round upward across the threshold.
+        const double eps = std::numeric_limits<float>::epsilon();
+        const double dotOps = (double)(((size_t)ABD_S + 15u) / 16u + 4u);
+        const double gamma =
+            (dotOps * eps < 0.5) ? (dotOps * eps) / (1.0 - dotOps * eps)
+                                 : 1.0;
+        const double maxUnitNorm = maxXNorm + maxErrNorm;
+        const double slack = 2.0 * maxXNorm * maxErrNorm +
+                             maxErrNorm * maxErrNorm +
+                             gamma * maxUnitNorm * maxUnitNorm + 1e-7;
+        const double qCutReal =
+            ((double)abd_corr_min_eps - slack) * Q8_SCALE * Q8_SCALE;
+        const double qCutCeil = std::ceil(qCutReal);
+        if (qCutCeil > (double)std::numeric_limits<int32_t>::min() &&
+            qCutCeil <= (double)std::numeric_limits<int32_t>::max()) {
+          abd_q8_prune_max = (int32_t)qCutCeil - 1;
+          use_abd_q8 = true;
+          verbose_message(
+              "Abundance prefilter: exact-safe int8/VNNI S=%u stride=%zu "
+              "error_bound=%.6g q_prune_max=%d\n",
+              ABD_S, abd_q8_stride, slack, abd_q8_prune_max);
+        } else {
+          std::vector<int8_t>().swap(abd_q8);
+          std::vector<int32_t>().swap(abd_q8_sum);
+        }
+      }
+    }
+#endif
+    if (!use_abd_q8 && preload_short_abd)
       verbose_message("Abundance dot: batched AVX-512 left-row preload (S=%u)\n",
                       ABD_S);
   }
@@ -792,6 +901,7 @@ static Distance gen_fused_calib_graph(Graph &g, Distance coverage) {
   {
     const int tid = omp_get_thread_num();
     auto &my_jmax = thread_jmax[tid];
+    GraphPassProfile &my_prof = graphProfile[tid];
     std::vector<uint32_t> visited;       // LSH per-i dedup stamp
     uint32_t visit_gen = 0;
     if (use_lsh) visited.assign(nobs, 0u);
@@ -819,33 +929,46 @@ static Distance gen_fused_calib_graph(Graph &g, Distance coverage) {
                           std::memory_order_relaxed);
     };
     auto update_row = [&](size_t r, size_t other, StoredDistance sv) {
+      if (graphProfileOn) ++my_prof.rowUpdateCalls;
       RowSync &rs = rowsync[r];
       // Common case: similarity strictly below the kept threshold — rejected with
       // one float compare, identical cost to the original sv-only fast path.
-      if (sv < rs.thresh_sv.load(std::memory_order_relaxed)) return;
+      if (sv < rs.thresh_sv.load(std::memory_order_relaxed)) {
+        if (graphProfileOn) ++my_prof.similarityRejects;
+        return;
+      }
       // Near/at threshold (rare): resolve the deterministic equal-similarity
       // smaller-id-wins tie-break lock-free via the packed key.
       uint32_t svb;
       std::memcpy(&svb, &sv, sizeof(svb));
       const uint64_t ck = ((uint64_t)svb << 32) | (uint32_t)(~(uint32_t)other);
-      if (ck <= rs.thresh_key.load(std::memory_order_relaxed)) return;
+      if (ck <= rs.thresh_key.load(std::memory_order_relaxed)) {
+        if (graphProfileOn) ++my_prof.keyRejects;
+        return;
+      }
       // ── acquire spinlock (test-and-test-and-set) ──
-      while (rs.spin.exchange(1, std::memory_order_acquire)) {
+      if (rs.spin.exchange(1, std::memory_order_acquire)) {
+        if (graphProfileOn) ++my_prof.lockContentions;
+        do {
         while (rs.spin.load(std::memory_order_relaxed))
 #if defined(__x86_64__) || defined(__i386__)
           __builtin_ia32_pause();
 #else
           ;
 #endif
+        } while (rs.spin.exchange(1, std::memory_order_acquire));
       }
+      if (graphProfileOn) ++my_prof.lockAcquires;
       Heap &h = heaps[r];
       const Edge32 cand{(uint32_t)other, sv};
       if (h.size() < (size_t)maxEdges) {
         h.push(cand);
+        if (graphProfileOn) ++my_prof.heapPushes;
         if (h.size() == (size_t)maxEdges) store_thresh(rs, h.top());
       } else if (cmp_edge(cand, h.top())) {  // cand kept-preferred over weakest
         h.pop();
         h.push(cand);
+        if (graphProfileOn) ++my_prof.heapReplacements;
         store_thresh(rs, h.top());
       }
       rs.spin.store(0, std::memory_order_release);  // release spinlock
@@ -853,6 +976,7 @@ static Distance gen_fused_calib_graph(Graph &g, Distance coverage) {
 
     auto process_pair = [&](size_t i, size_t j, int i_round,
                             size_t i_local) {
+      if (graphProfileOn) ++my_prof.similarityPairs;
       StoredDistance sv;
       if (comp_ee && i_round < 0 && sample_round[j] < 0) {
         // Partial winner match → exact upper bound on sv; prune if it cannot
@@ -871,7 +995,10 @@ static Distance gen_fused_calib_graph(Graph &g, Distance coverage) {
           if (up > 1.0 - 1e-6) up = 1.0 - 1e-6;
           const float ti = rowsync[i].thresh_sv.load(std::memory_order_relaxed);
           const float tj = rowsync[j].thresh_sv.load(std::memory_order_relaxed);
-          if ((float)up < (ti < tj ? ti : tj)) return;  // exact: unkeepable
+          if ((float)up < (ti < tj ? ti : tj)) {
+            if (graphProfileOn) ++my_prof.upperBoundPruned;
+            return;  // exact: unkeepable
+          }
           cFull = cP + pmh_match_count16(aw + EE_P, bw + EE_P, g_pmh_m - EE_P);
         } else {
           const uint32_t *aw = g_win_flat.data() + i * (size_t)g_pmh_m;
@@ -885,11 +1012,16 @@ static Distance gen_fused_calib_graph(Graph &g, Distance coverage) {
           if (up > 1.0 - 1e-6) up = 1.0 - 1e-6;
           const float ti = rowsync[i].thresh_sv.load(std::memory_order_relaxed);
           const float tj = rowsync[j].thresh_sv.load(std::memory_order_relaxed);
-          if ((float)up < (ti < tj ? ti : tj)) return;  // exact: unkeepable
+          if ((float)up < (ti < tj ? ti : tj)) {
+            if (graphProfileOn) ++my_prof.upperBoundPruned;
+            return;  // exact: unkeepable
+          }
           cFull = cP + pmh_match_count(aw + EE_P, bw + EE_P, g_pmh_m - EE_P);
         }
+        if (graphProfileOn) ++my_prof.partialThenFull;
         sv = (StoredDistance)pmh_sv_from_count(cFull);
       } else {
+        if (graphProfileOn) ++my_prof.graphSimCalls;
         sv = (StoredDistance)graph_sim(i, j);
       }
       update_row(i, j, sv);
@@ -913,11 +1045,41 @@ static Distance gen_fused_calib_graph(Graph &g, Distance coverage) {
       const size_t i_stop = std::min(ii + TILE, nobs);
       const size_t j_stop = std::min(jj + TILE, nobs);
       const bool diag = (ii == jj);
+      if (graphProfileOn) {
+        const uint64_t ni = (uint64_t)(i_stop - ii);
+        const uint64_t nj = (uint64_t)(j_stop - jj);
+        ++my_prof.tiles;
+        my_prof.geometricPairs += diag ? ni * (ni - 1) / 2 : ni * nj;
+      }
       for (size_t i = ii; i < i_stop; ++i) {
         const int    i_round = sample_round[i];
         const size_t i_local = sample_local[i];
         // Diagonal tile: only j>i; off-diagonal: full j range.
         const size_t j_begin = diag ? i + 1 : jj;
+#if defined(__AVX512VNNI__) && defined(__AVX512BW__)
+        if (use_abd_q8) {
+          const int8_t *qi = abd_q8.data() + i * abd_q8_stride;
+          for (size_t j = j_begin; j < j_stop; ++j) {
+            if (!is_nz(i, j)) continue;
+            const int32_t qdot = unit_dot_q8_vnni(
+                qi, abd_q8.data() + j * abd_q8_stride,
+                abd_q8_stride, abd_q8_sum[j]);
+            if (qdot <= abd_q8_prune_max) {
+              if (graphProfileOn) ++my_prof.q8Pruned;
+              continue;
+            }
+            if (graphProfileOn) ++my_prof.q8FloatChecked;
+            const float c = unit_dot_f(
+                abd_u + i * ABD_S, abd_u + j * ABD_S, ABD_S);
+            if (c < abd_corr_min_eps) {
+              if (graphProfileOn) ++my_prof.q8FloatRejected;
+              continue;
+            }
+            process_pair(i, j, i_round, i_local);
+          }
+          continue;
+        }
+#endif
 #if defined(__AVX512F__)
         if (preload_short_abd) {
           UnitDotLeft64 left;
@@ -996,6 +1158,70 @@ static Distance gen_fused_calib_graph(Graph &g, Distance coverage) {
           verbose_message("LSH cand %zu/%zu\r", i, nobs);
       }
     }
+  }
+
+  if (graphProfileOn) {
+    GraphPassProfile total{};
+    uint64_t minPairs = std::numeric_limits<uint64_t>::max();
+    uint64_t maxPairs = 0;
+    for (const auto &p : graphProfile) {
+      total.tiles += p.tiles;
+      total.geometricPairs += p.geometricPairs;
+      total.similarityPairs += p.similarityPairs;
+      total.upperBoundPruned += p.upperBoundPruned;
+      total.q8Pruned += p.q8Pruned;
+      total.q8FloatChecked += p.q8FloatChecked;
+      total.q8FloatRejected += p.q8FloatRejected;
+      total.partialThenFull += p.partialThenFull;
+      total.graphSimCalls += p.graphSimCalls;
+      total.rowUpdateCalls += p.rowUpdateCalls;
+      total.similarityRejects += p.similarityRejects;
+      total.keyRejects += p.keyRejects;
+      total.lockAcquires += p.lockAcquires;
+      total.lockContentions += p.lockContentions;
+      total.heapPushes += p.heapPushes;
+      total.heapReplacements += p.heapReplacements;
+      if (p.geometricPairs != 0) {
+        minPairs = std::min(minPairs, p.geometricPairs);
+        maxPairs = std::max(maxPairs, p.geometricPairs);
+      }
+    }
+    if (minPairs == std::numeric_limits<uint64_t>::max()) minPairs = 0;
+    uint64_t nzPairs = total.geometricPairs;
+    if (g_anynz.size() == nobs) {
+      const uint64_t nzRows = (uint64_t)std::count(
+          g_anynz.begin(), g_anynz.end(), (uint8_t)1);
+      const uint64_t zeroRows = (uint64_t)nobs - nzRows;
+      nzPairs -= zeroRows * (zeroRows - 1) / 2;
+    }
+    fprintf(stderr,
+            "[RB_GRAPH_PROF] tiles=%llu geometric_pairs=%llu nz_pairs=%llu "
+            "similarity_pairs=%llu upper_pruned=%llu partial_full=%llu "
+            "graph_sim=%llu q8_pruned=%llu q8_float_checked=%llu "
+            "q8_float_rejected=%llu thread_pair_min=%llu thread_pair_max=%llu\n",
+            (unsigned long long)total.tiles,
+            (unsigned long long)total.geometricPairs,
+            (unsigned long long)nzPairs,
+            (unsigned long long)total.similarityPairs,
+            (unsigned long long)total.upperBoundPruned,
+            (unsigned long long)total.partialThenFull,
+            (unsigned long long)total.graphSimCalls,
+            (unsigned long long)total.q8Pruned,
+            (unsigned long long)total.q8FloatChecked,
+            (unsigned long long)total.q8FloatRejected,
+            (unsigned long long)minPairs,
+            (unsigned long long)maxPairs);
+    fprintf(stderr,
+            "[RB_GRAPH_PROF] row_updates=%llu sim_rejects=%llu key_rejects=%llu "
+            "lock_acquires=%llu lock_contentions=%llu heap_pushes=%llu "
+            "heap_replacements=%llu\n",
+            (unsigned long long)total.rowUpdateCalls,
+            (unsigned long long)total.similarityRejects,
+            (unsigned long long)total.keyRejects,
+            (unsigned long long)total.lockAcquires,
+            (unsigned long long)total.lockContentions,
+            (unsigned long long)total.heapPushes,
+            (unsigned long long)total.heapReplacements);
   }
 
   if (rb_timing) {

@@ -763,10 +763,9 @@ static inline float unit_dot_f(const float *__restrict__ a,
   }
   for (; k + 16 <= S; k += 16)
     acc0 = _mm512_fmadd_ps(_mm512_loadu_ps(a + k), _mm512_loadu_ps(b + k), acc0);
-  // The common multi-sample case is not a multiple of 16 (bench has S=46).
-  // Keep its 14-value tail in SIMD instead of dropping back to a dependency-
-  // chained scalar loop for every one of the O(N^2) candidate pairs.  Masked
-  // loads do not access beyond the row and zero inactive lanes.
+  // Keep a non-multiple-of-16 tail in SIMD instead of dropping back to a
+  // dependency-chained scalar loop for every candidate pair.  Masked loads do
+  // not access beyond the row and zero inactive lanes.
   if (k < S) {
     const uint32_t rem = S - k;  // 1..15 (the full vectors were consumed above)
     const __mmask16 mask = (__mmask16)((1u << rem) - 1u);
@@ -875,6 +874,29 @@ static inline float unit_dot_f_left64(const UnitDotLeft64 &p,
   }
   return _mm512_reduce_add_ps(_mm512_add_ps(acc0, acc1));
 }
+#endif
+
+#if defined(__AVX512VNNI__) && defined(__AVX512BW__)
+// Exact dot product of two signed int8 rows using VNNI's unsigned×signed
+// instruction.  Biasing the left row by 128 makes it unsigned; subtracting
+// 128*sum(right) restores the signed dot. `stride` is padded to 64 bytes.
+// Callers cap the logical dimension so every 32-bit lane and the horizontal
+// sum remain provably within int32_t range.
+static inline int32_t unit_dot_q8_vnni(const int8_t *__restrict__ a,
+                                       const int8_t *__restrict__ b,
+                                       size_t stride, int32_t bsum) {
+  __m512i acc = _mm512_setzero_si512();
+  const __m512i bias = _mm512_set1_epi8((char)0x80);
+  for (size_t k = 0; k < stride; k += 64) {
+    const __m512i av = _mm512_loadu_si512((const void *)(a + k));
+    const __m512i bv = _mm512_loadu_si512((const void *)(b + k));
+    const __m512i au = _mm512_add_epi8(av, bias);
+    acc = _mm512_dpbusd_epi32(acc, au, bv);
+  }
+  const int32_t biased = _mm512_reduce_add_epi32(acc);
+  return biased - 128 * bsum;
+}
+
 #endif
 
 // Depth term for edge blending, dispatching on g_depth_sim.  Sets ok=false to
@@ -3062,7 +3084,7 @@ static std::atomic<uint64_t> g_km_restarts{0}, g_km_iters{0}, g_km_capped{0};
 // see RB_KM_STRICT below for the exact-order fallback.
 static const bool g_km_strict = getenv("RB_KM_STRICT") != nullptr;
 // Explicit AVX-512 double-accumulation is the production path after passing the
-// three-dataset CAMI2 hash/accuracy gate.  RABBIT_KM_SCALAR restores the previous
+// cross-dataset output/accuracy gate. RABBIT_KM_SCALAR restores the previous
 // four-accumulator scalar kernel; RB_KM_STRICT retains the still older exact-order
 // single accumulator and always takes precedence below.
 static const bool g_km_simd = getenv("RABBIT_KM_SCALAR") == nullptr;
@@ -3398,9 +3420,11 @@ static int rb_cmd_bin(int ac, char *av[]) {
 #ifdef RABBITBIN_FUSE
       ("bam", po::value<std::vector<std::string>>(&fuse_bams)->multitoken(),
        "Sorted BAM(s); depth is computed in-process (overlaps FASTA parse). "
-       "Mutually exclusive with --depth. BAMs may also be given positionally.")
+       "Sidecar indexes are ignored. Mutually exclusive with --depth. BAMs may also be "
+       "given positionally.")
       ("bam-list", po::value<std::string>(&fuse_bam_list),
-       "File with one sorted-BAM path per line (appended to --bam)")
+       "File with one sorted-BAM path per line (appended to --bam; sidecar "
+       "indexes are ignored)")
       ("percent-identity", po::value<int>(&fuse_pctid)->default_value(97),
        "[--bam] Min mapped-read percent identity")
       ("min-contig-length", po::value<int>(&fuse_min_contig_len)->default_value(1),
@@ -3691,15 +3715,20 @@ static int rb_cmd_bin(int ac, char *av[]) {
                     getUsedPhysMem(), getTotalPhysMem() / 1024 / 1024);
   } else
   // ── Validate FASTA / depth files ─────────────────────────────────────────
-  // depth_future: async pre-parse of the depth_matrix file into a name→values map.
-  // Launched immediately after the header scan so it runs in parallel with
-  // the FASTA decompression (the main bottleneck).
+  // depth_future: asynchronously parse a depth file, or compute a structured
+  // depth matrix from BAM. Launched before FASTA work so the two overlap.
   {
   if (!has_depth)
     verbose_message("No --depth/--bam: composition-only binning "
                     "(abundance split/recruit disabled).\n");
   using DepthMap = phmap::flat_hash_map<std::string, RawDepthEntry>;
-  std::future<DepthMap> depth_future;
+  struct DepthAsyncResult {
+    DepthMap by_name;  // TSV / CRAM compatibility path
+#ifdef RABBITBIN_FUSE
+    std::unique_ptr<DepthMatrixOut> matrix;  // fused BAM contiguous path
+#endif
+  };
+  std::future<DepthAsyncResult> depth_future;
   // Resolve the merge flag BEFORE the depth/parse kickoff below: the depth
   // async collects paired-end linkage only when merge is on, and the rest of
   // the env block runs only later.
@@ -3712,9 +3741,9 @@ static int rb_cmd_bin(int ac, char *av[]) {
                       "(overlaps FASTA parse) [%.1fGb / %.1fGb]\n",
                       fuse_bams.size(), getUsedPhysMem(),
                       getTotalPhysMem() / 1024 / 1024);
-      // Compute depth from BAMs AND parse the resulting TSV on the background
-      // thread, so the (dominant) BAM decompression runs concurrently with the
-      // FASTA decompression + sketch pass below. num_depth_samples already set.
+      // Compute structured depth on the background thread so BAM decompression
+      // runs concurrently with the FASTA decompression + sketch pass below.
+      // num_depth_samples is already set.
       std::vector<std::string> bams = fuse_bams;
       if (g_long_read && fuse_pctid == 97) fuse_pctid = 80;   // long-read preset
       float pctid = (float)fuse_pctid / 100.0f;
@@ -3722,8 +3751,8 @@ static int rb_cmd_bin(int ac, char *av[]) {
       // shard drop a read before caldepth instead of accumulating depth rows that
       // the prefilter discards moments later.  It is output-identical either way,
       // but it only wins when the assembly really carries sub-kb fragments: on an
-      // assembly already filtered at 1 kb the index removes nothing and the extra
-      // per-read indirection cost 27 s of a 4:34 run.  So it stays opt-in.
+      // assembly already filtered at the same threshold, the index removes
+      // nothing while adding a per-read indirection. So it stays opt-in.
       int mcl = fuse_min_contig_len;
       double mcd = fuse_min_contig_depth;
       int medge = fuse_max_edge;
@@ -3745,19 +3774,26 @@ static int rb_cmd_bin(int ac, char *av[]) {
         g_snv_result.resolve = true;   // also collect per-site data (strains)
         g_snv_result.maxSites = g_strain_max_sites;
       }
-      depth_future = std::async(std::launch::async, [=]() -> DepthMap {
+      depth_future = std::async(std::launch::async, [=]() -> DepthAsyncResult {
+        using DepthProfileClock = std::chrono::steady_clock;
+        const bool depthProfileOn = getenv("RB_DEPTH_PROF") != nullptr;
+        const auto depthProfileStart = depthProfileOn
+                                           ? DepthProfileClock::now()
+                                           : DepthProfileClock::time_point{};
+        DepthAsyncResult result;
         // CRAM/generic still goes through the TSV (no structured path there).
         if (any_cram) {
           std::string tsv = compute_depth_tsv_generic(
               bams, pctid, mcl, (float)mcd, medge,
               /*includeEdgeBases=*/false, /*intraDepthVariance=*/true, nt, ref);
-          return parse_depth_buf(tsv.data(), tsv.size(), cv, nds, fH, nt);
+          result.by_name =
+              parse_depth_buf(tsv.data(), tsv.size(), cv, nds, fH, nt);
+          return result;
         }
-        // BAM path: get per-contig depths as a structured matrix and build the
-        // name->RawDepthEntry map directly, skipping the format-to-TSV +
-        // parse-back round-trip (≈ a few seconds + a multi-hundred-MB string on
-        // assemblies with millions of contigs).
-        DepthMatrixOut cols;
+        // BAM path: retain the structured row-major matrix.  The main thread
+        // builds a non-owning name->row index after FASTA parsing, avoiding a
+        // separately allocated vector of sample values for every contig.
+        auto cols = std::make_unique<DepthMatrixOut>();
         // intraDepthVariance=false: the structured fill computes per-sample means
         // directly from the raw depth sums (identical to variance.mean), so the
         // full num_bams × n_targets variance matrix (~1 GB on million-contig
@@ -3770,29 +3806,26 @@ static int rb_cmd_bin(int ac, char *av[]) {
         compute_depth_tsv_inmem(bams, pctid, mcl, (float)mcd, medge,
                                 /*includeEdgeBases=*/false,
                                 /*intraDepthVariance=*/false, nt,
-                                snvOn ? &g_snv_result : nullptr, &cols,
+                                snvOn ? &g_snv_result : nullptr, cols.get(),
                                 /*minMapQual=*/0, /*dualMapQual=*/dualQ,
                                 /*collectPELink=*/g_bin_merge);
-        // Stash paired-end linkage (compact-row space) for the merge pass;
-        // converted to contig indices later, once contig_names is ready.
-        if (g_bin_merge && !cols.pe_links.empty()) {
-          g_pe_names = cols.names;
-          g_pe_links_compact = std::move(cols.pe_links);
-          g_pe_compact_to_contig.clear();
+        // Apply exactly the same FASTA-label normalization as the file parser.
+        // Duplicate normalized labels are resolved later by first-row emplace,
+        // matching the existing name-map semantics.
+        if (!fH)
+          for (std::string &name : cols->names) trim_fasta_label(name);
+        result.matrix = std::move(cols);
+        if (depthProfileOn) {
+          const auto now = DepthProfileClock::now();
+          const double totalMs = std::chrono::duration<double, std::milli>(
+                                     now - depthProfileStart).count();
+          fprintf(stderr,
+                  "[RB_DEPTH_PROF] stage=depth_matrix_ready rows=%zu "
+                  "samples=%zu total_ms=%.1f\n",
+                  result.matrix->names.size(), result.matrix->num_samples,
+                  totalMs);
         }
-        DepthMap m;
-        m.reserve(cols.names.size());
-        const bool prefilter = rb_env_depth_prefilter_on();
-        const size_t minlen = min_small_contig; // same prefilter parse_depth_buf uses
-        for (size_t i = 0; i < cols.names.size(); ++i) {
-          if (prefilter && (size_t)cols.lens[i] < minlen) continue;
-          std::string name = cols.names[i];
-          if (!fH) trim_fasta_label(name);
-          RawDepthEntry e;
-          e.means = std::move(cols.means[i]);
-          m.emplace(std::move(name), std::move(e));
-        }
-        return m;
+        return result;
       });
     } else
 #endif
@@ -3810,9 +3843,20 @@ static int rb_cmd_bin(int ac, char *av[]) {
       }
       // Launch depth_matrix pre-parse on a background thread.  It runs while
       // libdeflate decompresses and parses the FASTA below.
-      depth_future = std::async(std::launch::async,
-                              parse_depth_async,
-                              depth_file, cvExt, num_depth_samples, fullHeader, (int)numThreads);
+      const std::string async_depth_file = depth_file;
+      const bool async_cv_ext = cvExt;
+      const int async_samples = num_depth_samples;
+      const bool async_full_header = fullHeader;
+      const int async_threads = (int)numThreads;
+      depth_future = std::async(
+          std::launch::async,
+          [=]() -> DepthAsyncResult {
+            DepthAsyncResult result;
+            result.by_name = parse_depth_async(
+                async_depth_file, async_cv_ext, async_samples,
+                async_full_header, async_threads);
+            return result;
+          });
     }
 
     rb_phase("parse start");
@@ -4383,7 +4427,66 @@ static int rb_cmd_bin(int ac, char *av[]) {
       verbose_message("Merging abundance data [%.1fGb / %.1fGb]\n",
                       getUsedPhysMem(), getTotalPhysMem() / 1024 / 1024);
 
-      DepthMap depth_map = depth_future.get();   // blocks only if not yet done
+      using DepthMergeClock = std::chrono::steady_clock;
+      const bool depthProfileOn = getenv("RB_DEPTH_PROF") != nullptr;
+      const auto depthWaitStart = depthProfileOn
+                                      ? DepthMergeClock::now()
+                                      : DepthMergeClock::time_point{};
+      DepthAsyncResult depth_result =
+          depth_future.get();  // blocks only if not yet done
+      DepthMap &depth_map = depth_result.by_name;
+#ifdef RABBITBIN_FUSE
+      DepthMatrixOut *depth_cols = depth_result.matrix.get();
+      using DepthRowMap = phmap::flat_hash_map<std::string_view, size_t>;
+      DepthRowMap depth_rows;
+      if (depth_cols) {
+        const bool shape_ok =
+            depth_cols->num_samples == (size_t)num_depth_samples &&
+            depth_cols->names.size() == depth_cols->lens.size() &&
+            (depth_cols->num_samples == 0
+                 ? depth_cols->means.empty()
+                 : depth_cols->names.size() <=
+                       std::numeric_limits<size_t>::max() /
+                           depth_cols->num_samples &&
+                   depth_cols->means.size() ==
+                       depth_cols->names.size() * depth_cols->num_samples);
+        if (!shape_ok) {
+          cerr << "[Error!] In-process BAM depth matrix has inconsistent "
+                  "dimensions.\n";
+          return 1;
+        }
+        depth_rows.reserve(depth_cols->names.size());
+        for (size_t i = 0; i < depth_cols->names.size(); ++i) {
+          // Rows shorter than the configured smallest retained contig cannot
+          // be consumed by either target matrix.
+          if ((size_t)depth_cols->lens[i] < min_small_contig) continue;
+          depth_rows.emplace(std::string_view(depth_cols->names[i]), i);
+        }
+      }
+#endif
+      size_t depth_result_rows = depth_map.size();
+#ifdef RABBITBIN_FUSE
+      if (depth_cols) depth_result_rows = depth_cols->names.size();
+#endif
+      auto depthMergeLast = depthProfileOn ? DepthMergeClock::now()
+                                           : DepthMergeClock::time_point{};
+      if (depthProfileOn) {
+        const double waitMs = std::chrono::duration<double, std::milli>(
+                                  depthMergeLast - depthWaitStart).count();
+        fprintf(stderr,
+                "[RB_DEPTH_PROF] stage=depth_future_wait rows=%zu delta_ms=%.1f\n",
+                depth_result_rows, waitMs);
+      }
+      auto depthMergeMark = [&](const char *stage, size_t rows) {
+        if (!depthProfileOn) return;
+        const auto now = DepthMergeClock::now();
+        const double deltaMs = std::chrono::duration<double, std::milli>(
+                                   now - depthMergeLast).count();
+        fprintf(stderr,
+                "[RB_DEPTH_PROF] stage=%s rows=%zu delta_ms=%.1f\n",
+                stage, rows, deltaMs);
+        depthMergeLast = now;
+      };
 
       size_t r = 0, r1 = 0;
       size_t num = 0, nskip = 0;
@@ -4395,6 +4498,18 @@ static int rb_cmd_bin(int ac, char *av[]) {
       // cal_depth_dist(), has no live call sites, so allocating + zero-filling
       // nobs×S floats here was pure waste.  Revive both if cal_depth_dist returns.
       small_depth_matrix.resize(nobs1, num_depth_samples, false);
+      depthMergeMark("depth_matrix_alloc", nobs + nobs1);
+
+      auto find_depth_means = [&](const std::string &name) -> const float * {
+#ifdef RABBITBIN_FUSE
+        if (depth_cols) {
+          auto it = depth_rows.find(std::string_view(name));
+          return it == depth_rows.end() ? nullptr : depth_cols->row(it->second);
+        }
+#endif
+        auto it = depth_map.find(name);
+        return it == depth_map.end() ? nullptr : it->second.means.data();
+      };
 
       // Iterate large contigs in order (preserves original row semantics).
       // Fast path: when the FASTA had no duplicate headers, contigs[name] == ci
@@ -4413,17 +4528,17 @@ static int rb_cmd_bin(int ac, char *av[]) {
           idx = ci; row = ci;
         }
 
-        auto jt = depth_map.find(name);
-        if (jt == depth_map.end()) { ignored_too_small++; continue; }
-        const RawDepthEntry& entry = jt->second;
+        const float *means = find_depth_means(name);
+        if (!means) { ignored_too_small++; continue; }
 
         for (int i = 0; i < num_depth_samples; ++i)
-          depth_matrix(row, i) = entry.means[i];
+          depth_matrix(row, i) = means[i];
         // NOTE: depth_var_matrix is intentionally NOT filled — its only reader,
         // cal_depth_dist(), has no live call sites, so the per-element variance
         // store here was dead work.  Re-add this if cal_depth_dist is revived.
         r++;  num++;  totalSize += seq_lens[idx];
       }
+      depthMergeMark("depth_large_copy", r);
 
       // Iterate small contigs (same fast path as the large-contig loop above)
       for (size_t ci = 0; ci < small_contig_names.size(); ++ci) {
@@ -4439,26 +4554,38 @@ static int rb_cmd_bin(int ac, char *av[]) {
           idx = ci; row = ci;
         }
 
-        auto jt = depth_map.find(name);
-        if (jt == depth_map.end()) { ignored_too_small++; continue; }
-        const RawDepthEntry& entry = jt->second;
+        const float *means = find_depth_means(name);
+        if (!means) { ignored_too_small++; continue; }
 
         for (int i = 0; i < num_depth_samples; ++i) {
-          small_depth_matrix(row, i) = entry.means[i];
+          small_depth_matrix(row, i) = means[i];
         }
         r1++;  num1++;  totalSize1 += small_seq_lens[idx];
       }
+      depthMergeMark("depth_small_copy", r1);
 
-      // depth_map (one entry per depth-file row — often millions, incl. all the
-      // tiny contigs that never get binned) is no longer needed after the merge.
-      // Its single-threaded teardown (freeing ~N hash slots + per-row mean/var
-      // vectors) costs hundreds of ms; hand it to a detached thread so that the
-      // free overlaps the sketch + graph-build work instead of stalling here.
+      // The parsed depth result is no longer needed after the merge.  Hand its
+      // teardown to a detached thread so deallocation can overlap subsequent
+      // sketch and graph work.
       // The contigs / small_contigs dedup maps are also done being read here;
       // fold their (string-key) teardown into the same detached thread.
-      std::thread([dm = std::move(depth_map),
+#ifdef RABBITBIN_FUSE
+      if (depth_cols && g_bin_merge && !depth_cols->pe_links.empty()) {
+        // The row names use the same normalization as FASTA and can now move
+        // into the lazy compact-row -> contig mapper without another copy.
+        g_pe_names = std::move(depth_cols->names);
+        g_pe_links_compact = std::move(depth_cols->pe_links);
+        g_pe_compact_to_contig.clear();
+      }
+      std::thread([dm = std::move(depth_result.by_name),
+                   matrix = std::move(depth_result.matrix),
                    cm = std::move(contigs),
                    scm = std::move(small_contigs)]() mutable { }).detach();
+#else
+      std::thread([dm = std::move(depth_result.by_name),
+                   cm = std::move(contigs),
+                   scm = std::move(small_contigs)]() mutable { }).detach();
+#endif
 
       nobs  = r;
       nobs1 = r1;
@@ -6121,7 +6248,7 @@ static int rb_cmd_bin(int ac, char *av[]) {
   // An explicit --marker-seed takes priority (marker-guided); otherwise the
   // default marker-free abundance split runs (disable with --no-split).
   // --simple-refinement evaluates the proposed split-first/frozen-core flow.
-  // The established refinement remains the default because the CAMI2 ablation
+  // The established refinement remains the default because cross-dataset ablation
   // currently shows a recovery regression for the simplified path.
   auto do_refine = [&](BinMap &c) {
     const size_t merge_floor = min_bin_bp;
