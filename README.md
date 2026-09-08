@@ -6,6 +6,10 @@ candidate graph, weights candidate edges by contig composition and coverage
 agreement, clusters the graph with Fisher label propagation, and then recruits
 short contigs and re-splits multi-modal bins.
 
+RabbitBin uses [RabbitBAM](https://github.com/RabbitBio/RabbitBAM/tree/sortedbam)
+for parallel BAM I/O. The `sortedbam` branch provides the BAM reading, sorting,
+and indexing modules.
+
 | Command | What it does |
 |---------|--------------|
 | `rabbitbin bin`    | Bin contigs into genomes (the main pipeline) |
