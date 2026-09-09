@@ -483,7 +483,6 @@ struct DepthShardProfile {
   double scanMs = 0.0;
   uint64_t records = 0;
   uint64_t accepted = 0;
-  uint64_t peUpdates = 0;
   bool openOk = false;
   bool seekOk = false;
 };
@@ -608,7 +607,6 @@ static void process_depth_shard(const DepthShard &sh,
                                 int snvMaxSites = 0,
                                 const int32_t *tid2compact = nullptr,
                                 CountType *contigDepthsU = nullptr, int dualQ = 0,
-                                std::unordered_map<uint64_t, uint32_t> *peLink = nullptr,
                                 DepthShardProfile *profile = nullptr) {
   using ProfileClock = std::chrono::steady_clock;
   const auto openStart = profile ? ProfileClock::now()
@@ -665,9 +663,9 @@ static void process_depth_shard(const DepthShard &sh,
     if (profile) ++profile->records;
     int32_t tid = b->core.tid;
     // Coordinate-sorted BAMs place records without a reference/position
-    // (tid == -1) after every mapped record.  Depth, SNV and PE linkage all
-    // ignore those records, so once the unmapped tail begins there can be no
-    // later contribution from this shard.
+    // (tid == -1) after every mapped record. Depth and SNV ignore those
+    // records, so once the unmapped tail begins there can be no later
+    // contribution from this shard.
     if (tid < 0)
       break;
     int32_t pos = b->core.pos;
@@ -722,19 +720,6 @@ static void process_depth_shard(const DepthShard &sh,
       // SNV uses the IDENTICAL read set as depth (same pct-id / edge filters).
       if (snvBam)
         snv_accumulate_read(b, snvCnt.data(), snvCurLen, snvMinBaseQ);
-      // Paired-end cross-contig linkage: this read's mate maps to a DIFFERENT
-      // kept contig → a physical adjacency edge.  Accumulated from the same
-      // depth-quality read set, in compact-row space, into this shard's own map.
-      if (peLink && (b->core.flag & BAM_FPAIRED) && b->core.mtid >= 0 &&
-          b->core.mtid != tid && b->core.mtid < n_targets) {
-        int32_t ca = tid2compact ? tid2compact[tid] : tid;
-        int32_t cb = tid2compact ? tid2compact[b->core.mtid] : b->core.mtid;
-        if (ca >= 0 && cb >= 0) {
-          uint32_t lo = (uint32_t)std::min(ca, cb), hi = (uint32_t)std::max(ca, cb);
-          (*peLink)[((uint64_t)lo << 32) | hi]++;
-          if (profile) ++profile->peUpdates;
-        }
-      }
     }
   }
   if (profile)
@@ -960,8 +945,7 @@ static bool process_depth_byterange(
     bool includeEdgeBases, int avgRead, int minMapQual,
     std::vector<std::pair<int32_t, CountType>> &out,
     std::vector<std::pair<int32_t, CountType>> *outU = nullptr, int dualQ = 0,
-    const int32_t *tid2compact = nullptr,
-    std::unordered_map<uint64_t, uint32_t> *peLink = nullptr) {
+    const int32_t *tid2compact = nullptr) {
   htsFile *fp = hts_open(bamPath.c_str(), "rb");
   if (!fp)
     return false;
@@ -1060,19 +1044,6 @@ static bool process_depth_byterange(
       // Same decoded read feeds the unique-read block in one pass — no second
       // BAM scan. Only reads that map uniquely (MAPQ>=dualQ) count here.
       if (outU && b->core.qual >= dualQ) curSumU += ov;
-      // Match process_depth_shard(): retain cross-contig paired-end evidence in
-      // the byte-range path as well. The map is private to this byte-range
-      // shard, so updates need no locks and are reduced after the scan.
-      if (peLink && (b->core.flag & BAM_FPAIRED) && b->core.mtid >= 0 &&
-          b->core.mtid != tid && b->core.mtid < n_targets) {
-        int32_t ca = tid2compact ? tid2compact[tid] : tid;
-        int32_t cb = tid2compact ? tid2compact[b->core.mtid] : b->core.mtid;
-        if (ca >= 0 && cb >= 0) {
-          uint32_t lo = (uint32_t)std::min(ca, cb);
-          uint32_t hi = (uint32_t)std::max(ca, cb);
-          (*peLink)[((uint64_t)lo << 32) | hi]++;
-        }
-      }
     }
   }
   if (curTid >= 0) {
@@ -1099,8 +1070,7 @@ std::string compute_depth_tsv_inmem(const StringVector &bamFilePaths,
                                     bool includeEdgeBases,
                                     bool intraDepthVariance, int numThreads,
                                     SnvResult *snv, DepthMatrixOut *outCols,
-                                    int minMapQualArg, int dualMapQual,
-                                    bool collectPELink) {
+                                    int minMapQualArg, int dualMapQual) {
   using DepthProfileClock = std::chrono::steady_clock;
   const bool depthProfileOn = getenv("RB_DEPTH_PROF") != nullptr;
   const auto depthProfileStart = depthProfileOn ? DepthProfileClock::now()
@@ -1314,17 +1284,11 @@ std::string compute_depth_tsv_inmem(const StringVector &bamFilePaths,
   if (depthProfileOn)
     fprintf(stderr,
             "[RB_DEPTH_PROF] depth_rows=%d kept_rows=%d samples=%d compact=%d "
-            "dual=%d pe=%d\n",
+            "dual=%d\n",
             header->n_targets, depthN, num_bams, compactMode ? 1 : 0,
-            dualOn ? 1 : 0, (collectPELink && compactMode && snv == nullptr) ? 1 : 0);
+            dualOn ? 1 : 0);
   depthProfileMark("depth_storage_alloc");
 
-  // Paired-end linkage: one sparse map per shard (lock-free), merged after.
-  const bool peOn = collectPELink && compactMode && (snv == nullptr);
-  std::vector<std::unordered_map<uint64_t, uint32_t>> peShard(peOn ? shards.size() : 0);
-  std::vector<std::unordered_map<uint64_t, uint32_t>> b2PeShard(
-      peOn ? b2shards.size() : 0);
-  std::vector<std::unordered_map<uint64_t, uint32_t>> b2FallbackPe;
   std::vector<DepthShardProfile> shardProfile(
       depthProfileOn ? shards.size() : 0);
   omp_set_num_threads(g_full_threads);
@@ -1344,12 +1308,11 @@ std::string compute_depth_tsv_inmem(const StringVector &bamFilePaths,
                         snvOn ? snv->minBaseQ : 0, snvSitesBam,
                         snvSitesOn ? snv->maxSites : 0, t2c,
                         dualOn ? bamContigDepthsU[bi].get() : nullptr, dualMapQual,
-                        peOn ? &peShard[s] : nullptr,
                         depthProfileOn ? &shardProfile[s] : nullptr);
   }
   if (depthProfileOn) {
     double openSeekMs = 0.0, scanMs = 0.0, maxScanMs = 0.0;
-    uint64_t records = 0, accepted = 0, peUpdates = 0;
+    uint64_t records = 0, accepted = 0;
     size_t openOk = 0, seekOk = 0;
     for (const auto &p : shardProfile) {
       openSeekMs += p.openSeekMs;
@@ -1357,17 +1320,16 @@ std::string compute_depth_tsv_inmem(const StringVector &bamFilePaths,
       maxScanMs = std::max(maxScanMs, p.scanMs);
       records += p.records;
       accepted += p.accepted;
-      peUpdates += p.peUpdates;
       openOk += p.openOk ? 1 : 0;
       seekOk += p.seekOk ? 1 : 0;
     }
     fprintf(stderr,
             "[RB_DEPTH_PROF] shard_scan shards=%zu open_ok=%zu seek_ok=%zu "
-            "records=%llu accepted=%llu pe_updates=%llu worker_open_seek_ms=%.1f "
+            "records=%llu accepted=%llu worker_open_seek_ms=%.1f "
             "worker_scan_ms=%.1f max_shard_scan_ms=%.1f\n",
             shardProfile.size(), openOk, seekOk,
             (unsigned long long)records, (unsigned long long)accepted,
-            (unsigned long long)peUpdates, openSeekMs, scanMs, maxScanMs);
+            openSeekMs, scanMs, maxScanMs);
     std::vector<size_t> slowShard(shardProfile.size());
     for (size_t i = 0; i < slowShard.size(); ++i) slowShard[i] = i;
     const size_t nSlow = std::min((size_t)8, slowShard.size());
@@ -1409,8 +1371,7 @@ std::string compute_depth_tsv_inmem(const StringVector &bamFilePaths,
           bamFilePaths[sh.bamIdx], header, sh.startVoff, sh.endCoff,
           sh.needResync, percentIdentity, maxEdgeBases, includeEdgeBases,
           averageReadSize[sh.bamIdx], minMapQual, b2local[s],
-          dualOn ? &b2localU[s] : nullptr, dualMapQual, t2c,
-          peOn ? &b2PeShard[s] : nullptr);
+          dualOn ? &b2localU[s] : nullptr, dualMapQual, t2c);
       shardOk[s] = ok ? 1 : 0;
     }
     std::vector<char> bamFailed(num_bams, 0);
@@ -1450,12 +1411,6 @@ std::string compute_depth_tsv_inmem(const StringVector &bamFilePaths,
       fprintf(stderr,
               "[depth] B2 re-sync failed on %zu BAM(s); whole-file fallback\n",
               failedBams.size());
-      // Discard partial linkage from every failed BAM before replacing it with
-      // a complete whole-file scan.
-      if (peOn)
-        for (size_t s = 0; s < b2shards.size(); ++s)
-          if (bamFailed[b2shards[s].bamIdx]) b2PeShard[s].clear();
-      b2FallbackPe.resize(peOn ? failedBams.size() : 0);
       const int budget = std::max(1, g_full_threads / (int)failedBams.size());
       omp_set_num_threads(std::min(g_full_threads, (int)failedBams.size()));
 #pragma omp parallel for schedule(dynamic, 1)
@@ -1466,8 +1421,7 @@ std::string compute_depth_tsv_inmem(const StringVector &bamFilePaths,
             bamFilePaths[bi], header, bamContigDepths[bi].get(), percentIdentity,
             maxEdgeBases, includeEdgeBases, averageReadSize[bi], minMapQual,
             nullptr, 5, 0.05, 0, nullptr, 0, t2c,
-            dualOn ? bamContigDepthsU[bi].get() : nullptr, dualMapQual,
-            peOn ? &b2FallbackPe[fi] : nullptr);
+            dualOn ? bamContigDepthsU[bi].get() : nullptr, dualMapQual);
       }
     }
   }
@@ -1536,36 +1490,6 @@ std::string compute_depth_tsv_inmem(const StringVector &bamFilePaths,
       }
     }
     depthProfileMark("matrix_materialize");
-    // Merge the per-shard paired-end linkage maps (compact-row keys, summed over
-    // all shards/BAMs) into outCols->pe_links.  Compact rows == outCols rows.
-    uint64_t peTotalUpdates = 0;
-    if (peOn) {
-      std::unordered_map<uint64_t, uint32_t> peAll;
-      for (auto &m : peShard)
-        for (auto &kv : m) peAll[kv.first] += kv.second;
-      for (auto &m : b2PeShard)
-        for (auto &kv : m) peAll[kv.first] += kv.second;
-      for (auto &m : b2FallbackPe)
-        for (auto &kv : m) peAll[kv.first] += kv.second;
-      outCols->pe_links.clear();
-      outCols->pe_links.reserve(peAll.size());
-      for (auto &kv : peAll) {
-        int32_t a = (int32_t)(kv.first >> 32);
-        int32_t b = (int32_t)(kv.first & 0xFFFFFFFFu);
-        outCols->pe_links.emplace_back(a, b, kv.second);
-        peTotalUpdates += kv.second;
-      }
-    }
-    if (peOn) {
-      if (depthProfileOn)
-        fprintf(stderr,
-                "[RB_DEPTH_PROF] pe_maps=%zu pe_unique_links=%zu "
-                "pe_updates=%llu\n",
-                peShard.size() + b2PeShard.size() + b2FallbackPe.size(),
-                outCols->pe_links.size(),
-                (unsigned long long)peTotalUpdates);
-      depthProfileMark("pe_link_reduce");
-    }
     // Self-check hook: dump the structured matrix (name, length, per-sample
     // means) so a run can be diffed against one taken with a different
     // --min-contig-length.  Rows are emitted in tid order, so two dumps differ

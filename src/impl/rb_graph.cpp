@@ -679,22 +679,23 @@ static Distance gen_fused_calib_graph(Graph &g, Distance coverage) {
   if (rb_timing) _t_pass0 = std::chrono::steady_clock::now();
 
   // ── Abundance-first exact upper-bound prune (RABBIT_ABDFIRST=1) ───────────
-  // The final edge weight is w = g_w_comp·sComp + (1−g_w_comp)·corr, kept only
-  // if w ≥ min_edge_weight.  sComp ≤ 1, so the best-case score for a pair is
-  // g_w_comp·1 + (1−g_w_comp)·corr.  If even that is below the cutoff the pair
-  // can NEVER become an edge — so we can skip the (≈100× more expensive) PMH
-  // composition kernel after only an O(num_samples) abundance correlation.
-  // This is exact w.r.t. the fused-edge filter: no pruned pair could survive.
-  // corr threshold: corr < (min_edge_weight − g_w_comp)/(1 − g_w_comp).
+  // The default coverage weight is w = min(max(corr,0), Jcov), so a pair
+  // with corr < min_edge_weight cannot pass the final cutoff.  Skip its PMH
+  // kernel before it can consume a bounded candidate-neighbour slot.
+  // This bound also holds for corr-only and product fusion, but not for
+  // weighted Jaccard alone, geometric-mean fusion, or dual-channel correlation.
+  // Adaptive cutoffs are unknown here and must not use the fixed-cutoff bound.
   // Abundance-first prune is ON by default for multi-sample data (it is exact
   // w.r.t. the fused-edge filter and substantially improves multi-sample
   // binning by stopping high-composition / low-abundance pairs from starving
   // the composition top-k). RABBIT_NO_ABDFIRST=1 disables this pruning.
+  const bool corr_bounds_weight = !g_dual_conj &&
+      (g_depth_sim == 0 ||
+       (g_depth_sim == 2 && (g_depth_fuse == 1 || g_depth_fuse == 2)));
   const bool abdfirst = (getenv("RABBIT_NO_ABDFIRST") == nullptr) &&
-                        num_depth_samples > 1 && g_w_comp < 1.0 &&
-                        g_w_comp < min_edge_weight;
-  const double abd_corr_min = abdfirst
-      ? (min_edge_weight - g_w_comp) / (1.0 - g_w_comp) : -2.0;
+                        num_depth_samples >= 3 && corr_bounds_weight &&
+                        rb_env_edge_cut_mode() == 0;
+  const double abd_corr_min = abdfirst ? (double)min_edge_weight : -2.0;
   // Precompute per-contig unit rank vectors u_i so the abundance correlation
   // corr(i,j) = Σ_k u_i[k]·u_j[k] is a single length-S dot product — bit-equal
   // to the Pearson-on-ranks that cal_depth_corr() computes (depth_matrix is
@@ -749,8 +750,8 @@ static Distance gen_fused_calib_graph(Graph &g, Distance coverage) {
       abd_u = abd_unit.data();
     }
     verbose_message("Abundance-first prune: skip pairs with depth corr < %.4f "
-                    "(g_w_comp=%.2f, min_edge=%.2f)%s\n",
-                    abd_corr_min, g_w_comp, (double)min_edge_weight,
+                    "(coverage-only, min_edge=%.2f)%s\n",
+                    abd_corr_min, (double)min_edge_weight,
                     abd_reused ? " [reused g_depth_unit]" : "");
 #if defined(__AVX512VNNI__) && defined(__AVX512BW__)
     // ISA-gated exact-safe int8 prefilter. Quantisation is never used as the

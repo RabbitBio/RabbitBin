@@ -95,13 +95,6 @@ struct DepthMatrixOut {
   std::vector<float> means; // row-major [contig][sample]
   float *row(size_t i) { return means.data() + i * num_samples; }
   const float *row(size_t i) const { return means.data() + i * num_samples; }
-  // Paired-end cross-contig linkage (feature: PE refinement).  Filled only when
-  // collectPELink is requested.  Each entry is (compact_row_a, compact_row_b,
-  // count) with a<b, summed over all BAMs.  compact_row_* indexes the same
-  // dense contig order as names/lens/means above, so the caller maps a row to a
-  // contig by names[row]. A read pair with mates on two different kept contigs
-  // provides a physical adjacency signal at insert-size scale.
-  std::vector<std::tuple<int32_t, int32_t, uint32_t>> pe_links;
 };
 
 // When outCols != nullptr, compute_depth_tsv_inmem fills *outCols directly and
@@ -114,8 +107,7 @@ std::string compute_depth_tsv_inmem(const std::vector<std::string> &bamFilePaths
                                     SnvResult *snv = nullptr,
                                     DepthMatrixOut *outCols = nullptr,
                                     int minMapQual = 0,
-                                    int dualMapQual = 0,
-                                    bool collectPELink = false);
+                                    int dualMapQual = 0);
 
 // Generic BAM/CRAM, reference-aware depth (used for CRAM input or when a
 // reference is supplied). Same output format as compute_depth_tsv_inmem.
