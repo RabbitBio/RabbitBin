@@ -91,6 +91,19 @@ static int      sketch_kmer_size  = 8;     // k-mer size for sketching
 static uint32_t sketch_size = 500;  // PMH registers (--sketch-m)
 static uint32_t sketch_bits        = 2;    // bits per OPH bucket (bit-planes)
 
+// Representation-level PMH validation.  This is an explicitly gold-aware
+// diagnostic that exits before graph construction / clustering; gold labels
+// never enter the production binning path.
+static std::string g_validate_pmh_gold;
+static std::string g_validate_pmh_out;
+static size_t      g_validate_pmh_queries = 1000;
+static size_t      g_validate_pmh_top     = 400;
+
+// Gold-aware audit of the production candidate and retained graphs.  Like the
+// PMH representation diagnostic above, this never contributes to binning.
+static std::string g_audit_graph_gold;
+static std::string g_audit_graph_out;
+
 // ── Marker-guided bin splitting (Phase 2; --marker-seed <file>) ─────────────
 // Seed file (MetaDecoder format): one line per single-copy marker:
 //   <marker>\t<contig>\t<contig>...
@@ -100,8 +113,6 @@ static uint32_t sketch_bits        = 2;    // bits per OPH bucket (bit-planes)
 static std::string marker_seed_file;
 static int         splitMaxK        = 6;  // cap on sub-clusters per split bin
 static int         splitMinContigs  = 6;  // min contigs in a bin to consider
-static size_t      splitMinSubContigs = 3; // reject a split with a smaller child
-static size_t      splitMinSubBp      = 0; // optional minimum child span (0=off)
 static int         splitKmeansRestarts = 10;
 // ── Marker-FREE Phase-2 split (--split-bins) ──────────────────────────────
 // Splits internally multi-modal bins using only the multi-sample abundance
@@ -110,44 +121,12 @@ static int         splitKmeansRestarts = 10;
 // best silhouette >= g_split_sil.
 static bool        g_split_abundance      = true;  // ON by default; --noAbdSplit disables
 static bool        g_no_split_abundance   = false; // --noAbdSplit
-static bool        g_simple_refinement    = false; // evaluated split-first fixed-core path
-static bool        g_fixed_core_recruit   = false; // fixed cores + established refinement tail
 static bool        g_no_singleton_rescue  = false; // single-factor ablation control
-static bool        g_stable_split_kmeans  = false; // seed from canonical bin membership
-static bool        g_split_reject_small   = false; // apply child guards to current splitter
+// Final selective recruitment into frozen output-sized cores.  The decision
+// boundary is learned within each run from leave-one-out core predictions.
+static bool        g_bin_recruit          = true;
 static double      g_split_sil      = 0.70;  // silhouette threshold (RABBIT_SPLIT_SIL)
 static size_t      g_sil_sample_cap = 600;   // sample cap for O(n^2) silhouette
-// Content-conserving retention of sub-min_bin_bp bins. A small bin is retained
-// only when its mean intra-bin depth correlation passes a data-derived coherence
-// bar estimated from confidently sized bins.
-static bool        g_split_keep_coherent = true;
-// Percentile of confident-bin coherences used as the retention bar (0..100).
-// A small bin is kept iff its coherence >= this percentile of the >=min_bin_bp
-// bins' coherences.  Lower = keep more partial-genome bins.  Default 10: "at
-// least as internally coherent as the bottom decile of confidently-sized bins".
-static double      g_split_coh_pct  = 10.0;
-// Optional conservative split guard. A proposed split of a large coherent bin
-// is accepted only when the least-coherent child improves on the parent by the
-// requested margin.
-static bool        g_split_guard       = false;
-static size_t      g_split_guard_bp    = 1000000;  // only guard bins >= 1 Mb
-static double      g_split_guard_margin = 0.05;     // required coherence gain
-// Optional sub-floor fragment consolidation. A retained fragment may be attached
-// to the best-matching confidently sized core when their cross-bin depth
-// correlation passes the same data-derived coherence bar used for retention.
-static bool        g_split_consolidate     = false;
-// Extra correlation margin required ABOVE the retention bar before a fragment is
-// merged into a core (RABBIT_CONSOLIDATE_DELTA).  0 = merge at the bar.
-static double      g_split_consolidate_delta = 0.0;
-// ── Paired-end-supported bin merge ─────────────────────────────────────────
-// Agglomerates compatible fragments using paired-end linkage as the decisive
-// physical signal and depth-centroid agreement as a consistency check.
-static bool        g_bin_merge        = true;
-// Calibrated recruitment of unbinned large contigs into frozen output-sized
-// cores. Actual correct and incorrect leave-one-out core predictions learn one
-// ROC/Youden boundary for the nearest/runner-up cosine residual ratio. Paired-end
-// support can corroborate, but cannot override, the feature winner.
-static bool        g_bin_recruit      = true;
 // Raw per-sample mean depths of small contigs, snapshotted BEFORE small_depth_matrix is
 // rank-transformed in place during recruitment, so marker_guided_split sees the
 // same coverage values as the large-contig depth_matrix (means, not ranks).
@@ -268,17 +247,18 @@ static double g_pmh_baseline = 0.0;       // estimated chance-collision baseline
 static double g_inv_pmh_m        = 0.0;   // 1.0 / g_pmh_m
 static double g_inv_one_minus_b0 = 1.0;   // 1.0 / (1.0 - g_pmh_baseline)
 
-// Edge-weight blend of composition (sComp) vs abundance correlation:
-//   w = alpha*sComp + (1-alpha)*corr     (alpha = RABBIT_W_COMP, default 0.5)
-static double g_w_comp = 0.5;
+// With S>=3 coverage samples, graph weights use coverage only:
+//   w = min(max(Spearman(i,j), 0), weighted_Jaccard_coverage(i,j)).
+// Composition similarity selects candidate neighbours; it is not an edge term.
+// S<=2 retains the original composition-weighted fallback.
 
 // Graph precision controls:
 //   RABBIT_MUTUAL_KNN     default on (RABBIT_MUTUAL_KNN=0 disables)
 //   RABBIT_NEG_DEPTH      default -0.3 (set <-0.99 to disable depth gate)
-//   RABBIT_EDGE_POWER=<p> raise composite edge weight to power p before LPA
+//   RABBIT_EDGE_POWER=<p> raise edge weight to power p before LPA (opt-in)
 static bool   g_mutual_knn  = true;
 static double g_neg_depth_thr = -0.3;
-static double g_edge_power  = 1.0;     // applied to composite w; 1.0 = no-op
+static double g_edge_power  = 1.0;     // applied to w; 1.0 = no-op
 
 // ── Assembly-graph (GFA) integration (feature #1) ───────────────────────────
 // The assembler already computed which contigs are physically adjacent in the
@@ -446,32 +426,6 @@ static double rb_env_neg_depth_thr() {
   const char *e = rb_getenv("RABBIT_NEG_DEPTH");
   return e ? std::atof(e) : -0.3;
 }
-// Returns the user-requested composition weight, or -1.0 if RABBIT_W_COMP was
-// not set (so the caller can fall back to the sample-count-aware default).
-static double rb_env_w_comp() {
-  const char *e = rb_getenv("RABBIT_W_COMP");
-  if (!e) return -1.0;                       // sentinel: not set → auto by S
-  double v = std::atof(e);
-  return (v < 0.0) ? 0.0 : (v > 1.0 ? 1.0 : v);
-}
-
-// ── Sample-count-aware composition/depth fusion weight ───────────────────────
-// RabbitBin's edge model is TWO-STAGE:
-//   • composition (PMH sketch)  = candidate generation (top-k recall)
-//   • depth (coverage corr)     = LPA edge weight (discrimination / precision)
-// The channel choice follows the statistical degrees of freedom of correlation:
-//   depth = Spearman/Pearson correlation over `num_samples` coverage columns.
-//   A correlation coefficient with n≤2 paired observations is deterministically
-//   ±1 (degrees of freedom = n−2 ≤ 0) — it carries ZERO information.  It becomes
-//   non-degenerate at n≥3.
-// Hence:
-//   S ≤ 2 : g_w_comp = 1.0  (composition-only; depth correlation is degenerate)
-//   S ≥ 3 : g_w_comp = 0.0  (depth-driven LPA; sketch = candidate filter only)
-static double auto_w_comp(size_t num_samples) {
-  if (num_samples <= 2) return 1.0;   // depth correlation degenerate (DOF ≤ 0)
-  return 0.0;                          // depth-driven LPA (sketch = candidate filter)
-}
-
 // ── Shared-Nearest-Neighbour (SNN) edge reinforcement ────────────────────────
 // Shared-nearest-neighbour reinforcement uses local graph structure as an
 // independent support signal for an edge.
@@ -599,45 +553,6 @@ static double rb_env_split_sil() {
   const char *e = rb_getenv("RABBIT_SPLIT_SIL");
   return e ? std::atof(e) : 0.70;
 }
-static bool rb_env_split_keep_coherent() {
-  const char *e = rb_getenv("RABBIT_SPLIT_KEEP_COHERENT");
-  return !e || e[0] != '0';
-}
-static double rb_env_split_coh_pct() {
-  const char *e = rb_getenv("RABBIT_SPLIT_COH_PCT");
-  if (!e) return 10.0;
-  double v = std::atof(e);
-  return v < 0.0 ? 0.0 : (v > 100.0 ? 100.0 : v);
-}
-static bool rb_env_split_guard() {
-  const char *e = rb_getenv("RABBIT_SPLIT_GUARD");
-  return e && e[0] != '0';            // default OFF; opt-in via RABBIT_SPLIT_GUARD=1
-}
-static size_t rb_env_split_guard_bp() {
-  const char *e = rb_getenv("RABBIT_SPLIT_GUARD_BP");
-  if (!e) return 1000000;
-  long v = std::atol(e);
-  return v < 0 ? 0 : (size_t)v;
-}
-static double rb_env_split_guard_margin() {
-  const char *e = rb_getenv("RABBIT_SPLIT_GUARD_MARGIN");
-  if (!e) return 0.05;
-  return std::atof(e);
-}
-static bool rb_env_split_consolidate() {
-  const char *e = rb_getenv("RABBIT_CONSOLIDATE");
-  return e && e[0] != '0';             // default OFF; depth-only merge is at best
-                                       // neutral (see rb_split.cpp); opt-in only
-}
-static double rb_env_split_consolidate_delta() {
-  const char *e = rb_getenv("RABBIT_CONSOLIDATE_DELTA");
-  if (!e) return 0.0;
-  return std::atof(e);
-}
-static bool rb_env_bin_merge() {
-  const char *e = rb_getenv("RABBIT_BIN_MERGE");
-  return !e || e[0] != '0';
-}
 static bool rb_env_bin_recruit() {
   const char *e = rb_getenv("RABBIT_BIN_RECRUIT");
   return !e || e[0] != '0';
@@ -679,7 +594,7 @@ static bool rb_env_depth_wjac_gate() {
 }
 
 // Weighted-Jaccard abundance similarity on RAW per-sample depths (g_depth_raw),
-// returns a value in [0,1] ready to blend as the depth term.  Defined here (top
+// returns a value in [0,1] for the coverage edge weight.  Defined here (top
 // of TU) so the graph edge-weight loops below can call it; data is filled in the
 // sketch loop before the in-place Spearman rank transform.
 static inline double cal_depth_wjac(size_t r1, size_t r2) {
@@ -878,10 +793,8 @@ static inline float unit_dot_f_left64(const UnitDotLeft64 &p,
 
 #if defined(__AVX512VNNI__) && defined(__AVX512BW__)
 // Exact dot product of two signed int8 rows using VNNI's unsigned×signed
-// instruction.  Biasing the left row by 128 makes it unsigned; subtracting
+// instruction. Biasing the left row by 128 makes it unsigned; subtracting
 // 128*sum(right) restores the signed dot. `stride` is padded to 64 bytes.
-// Callers cap the logical dimension so every 32-bit lane and the horizontal
-// sum remain provably within int32_t range.
 static inline int32_t unit_dot_q8_vnni(const int8_t *__restrict__ a,
                                        const int8_t *__restrict__ b,
                                        size_t stride, int32_t bsum) {
@@ -896,11 +809,8 @@ static inline int32_t unit_dot_q8_vnni(const int8_t *__restrict__ a,
   const int32_t biased = _mm512_reduce_add_epi32(acc);
   return biased - 128 * bsum;
 }
-
 #endif
 
-// Depth term for edge blending, dispatching on g_depth_sim.  Sets ok=false to
-// hard-cut the edge (non-finite, or strongly negative correlation).
 // Conjunctive dual depth correlation: min(corr over all-read half, corr over
 // unique-read half), using the per-half unit rows. Both halves are unit vectors
 // so each block dot is a correlation in [-1,1]; the min is the conservative
@@ -927,6 +837,8 @@ static inline double snv_traj_cos(size_t i, size_t j) {
   return d < 0 ? -d : d;   // both unit ⇒ |dot| = |cos|
 }
 
+// Coverage edge weight, dispatching on g_depth_sim. Sets ok=false for a
+// non-finite correlation or an edge rejected by an enabled evidence gate.
 static inline double depth_edge_term(size_t i, size_t j, bool &ok) {
   ok = true;
   // SNV-aware strain gate (opt-in): when both contigs carry a trajectory
@@ -969,6 +881,58 @@ static inline double depth_edge_term(size_t i, size_t j, bool &ok) {
   return cp;
 }
 
+// Shared by production, graph reuse and stability certification. The S<=2
+// composition fallback retains its original depth gates and cutoff behaviour.
+// For S>=3 the score comes entirely from coverage, with no composition blend.
+static inline double depth_graph_raw_weight(size_t i, size_t j,
+                                           StoredDistance composition) {
+  if (num_depth_samples <= 1) return (double)composition;
+  bool ok;
+  const double depth = depth_edge_term(i, j, ok);
+  if (!ok) return 0.0;
+  return num_depth_samples >= 3 ? depth : (double)composition;
+}
+
+static inline StoredDistance depth_graph_edge_score(size_t i, size_t j,
+                                                    StoredDistance composition) {
+  double w = depth_graph_raw_weight(i, j, composition);
+  if (num_depth_samples > 1 &&
+      (!std::isfinite(w) || w < (double)min_edge_weight)) return 0.0f;
+  if (g_edge_power != 1.0 && w > 0.0) w = std::pow(w, g_edge_power);
+  return (StoredDistance)w;
+}
+
+// Preserve the original diagnostic columns and append both coverage inputs
+// and the actual scored weight, before the LPA numerical clamp to <1.
+static void dump_coverage_edge_scores(const Graph &g) {
+  if (num_depth_samples == 0) return;
+  const char *path = rb_getenv("RB_PAIR_DUMP");
+  if (!path || !*path) return;
+  FILE *f = fopen(path, "w");
+  if (!f) {
+    cerr << "[Warn] RB_PAIR_DUMP: cannot open " << path << "\n";
+    return;
+  }
+  fprintf(f, "name_i\tname_j\tsComp\tdterm\tok\trho\tJcov\tweight\n");
+  for (size_t e = 0; e < g.from.size(); ++e) {
+    if (edge_is_gfa(g.sComp[e])) continue;
+    const size_t i = g.from[e], j = g.to[e];
+    if (i >= contig_names.size() || j >= contig_names.size()) continue;
+    bool ok = true;
+    const double undefined = std::numeric_limits<double>::quiet_NaN();
+    const double d = num_depth_samples > 1 ? depth_edge_term(i, j, ok) : undefined;
+    fprintf(f, "%s\t%s\t%.9g\t%.9g\t%d\t%.9g\t%.9g\t%.9g\n",
+            contig_names[i].c_str(), contig_names[j].c_str(),
+            (double)g.sComp[e], d, ok ? 1 : 0,
+            num_depth_samples > 1 ? depth_corr_fast(i, j) : undefined,
+            num_depth_samples > 1 ? cal_depth_wjac(i, j) : undefined,
+            (double)g.edgeScore[e]);
+  }
+  fclose(f);
+  verbose_message("RB_PAIR_DUMP: wrote %zu candidate pairs to %s\n",
+                  g.from.size(), path);
+}
+
 // IDF (inverse document frequency) normalization for PMH k-mer weights.
 // Controlled by RABBIT_IDF_NORM=1 (requires g_gc_norm>0 and k==4).
 //
@@ -990,40 +954,6 @@ static std::vector<float> g_k4freq_flat; // nobs × 256, non-canonical entries=0
 // Storage: ~30 MB for N=30k contigs.  Comparison cost: 256 FMAs per pair.
 static bool              g_exact_cos_cmp = false;
 static std::vector<float> g_k4cosine_flat; // nobs × 256, L2-normalised GC-norm freqs
-
-// Tetranucleotide (k=4) composition vectors for calibrated core recruitment
-// (g_bin_recruit). Built from resident sequences during the streaming parse only
-// when recruitment is enabled. The ordinary path stores unit rows; the recruit
-// implementation normalises explicitly so optional GC-normalised rows are safe.
-static std::vector<float> g_merge_tnf;        // nobs × 256 (large contigs)
-static inline void rb_fill_tnf(const char *s, size_t L, float *out) {
-  for (int i = 0; i < 256; ++i) out[i] = 0.f;
-  auto code = [](char c) -> int {
-    switch (c) { case 'A': case 'a': return 0; case 'C': case 'c': return 1;
-                 case 'G': case 'g': return 2; case 'T': case 't': return 3;
-                 default: return -1; }
-  };
-  if (L < 4) return;
-  int idx = 0, valid = 0;
-  for (size_t p = 0; p < L; ++p) {
-    int c = code(s[p]);
-    if (c < 0) { valid = 0; idx = 0; continue; }
-    idx = ((idx << 2) | c) & 0xFF;
-    if (++valid >= 4) out[idx] += 1.0f;
-  }
-  double nrm = 0; for (int i = 0; i < 256; ++i) nrm += (double)out[i] * out[i];
-  if (nrm > 0) { float inv = (float)(1.0 / std::sqrt(nrm));
-                 for (int i = 0; i < 256; ++i) out[i] *= inv; }
-}
-
-// Paired-end cross-contig linkage captured during the BAM depth scan, used as a
-// high-precision physical gate for bin merging. Stored
-// first in compact depth-row space (g_pe_links_compact, with g_pe_names mapping a
-// compact row -> contig name), then lazily converted once to binning contig
-// indices for both merge and recruitment (after contig_names is available).
-static std::vector<std::string> g_pe_names;                          // compact row -> name
-static std::vector<std::tuple<int32_t, int32_t, uint32_t>> g_pe_links_compact;
-static std::vector<int> g_pe_compact_to_contig;                      // lazy name mapping
 
 // Fast Jaccard on raw pointers (no virtual dispatch, no null checks).
 // a, b: pointers to the start of two signature rows in g_sig_flat.
@@ -1896,7 +1826,6 @@ static bool parse_fasta_mmap_parallel(
     bool                 stream_pmh_arg,
     bool                 no_store_seqs_arg,
     bool                 collect_tiny_arg,
-    bool                 collect_tnf_arg,
     uint32_t             pmh_m_arg,
     int                  pmh_k_arg,
     // outputs  ──────────────────────────────────────────────────────────
@@ -2165,12 +2094,6 @@ static bool parse_fasta_mmap_parallel(
                             pmh_k_arg, pmh_m_arg, /*seed=*/42u,
                             rec.winners.data(), my_scratch,
                             /*out64=*/nullptr, /*out_keys=*/nullptr, k4out);
-        }
-        // Tetranucleotide fingerprint for composition+depth recruit (computed
-        // here while the sequence bytes are resident; no_store_seqs frees them).
-        if (collect_tnf_arg && rec.k4freq.empty()) {
-          rec.k4freq.resize(256, 0.0f);
-          rb_fill_tnf(seq_bytes, seq_len, rec.k4freq.data());
         }
         if (!no_store_seqs_arg) {
           rec.seq_view_ptr = view_ptr;   // zero-copy (single-line) or nullptr
@@ -3330,6 +3253,12 @@ static std::vector<int> rb_kmeans(const float *X, size_t n, size_t d,
 // ── split helpers (before main) ──────────────────────────────────────────
 #include "impl/rb_split.cpp"
 
+// Gold-aware PMH neighbourhood validation (diagnostic-only, exits pre-graph).
+#include "impl/rb_pmh_validate.cpp"
+
+// Gold-aware production candidate/retained-edge audit (diagnostic-only).
+#include "impl/rb_graph_audit.cpp"
+
 // ── cache I/O (before main; used by both the save hook and the load path) ──
 #include "impl/rb_cache.cpp"
 
@@ -3349,7 +3278,7 @@ static int rb_cmd_bin(int ac, char *av[]) {
       ("min-contig,m", po::value<size_t>(&minContig)->default_value(2500), "Minimum contig length (>=1500)")
       ("min-small-contig", po::value<size_t>(&min_small_contig)->default_value(1000), "Min length for small-contig recruiting")
       ("max-posterior", po::value<Similarity>(&calib_connected_pct)->default_value(95), "Well-connected contig percent for calibration")
-      ("min-edge-score", po::value<Similarity>(&min_edge_weight)->default_value(70), "Minimum edge weight (1-99); higher keeps only confident edges. Default 70.")
+      ("min-edge-score", po::value<Similarity>(&min_edge_weight)->default_value(70), "Minimum edge weight (2-99, percent); coverage only for >=3 samples. Default 70.")
       ("gfa", po::value<std::string>(&g_gfa_file), "Assembly graph (GFA) whose L-links/P-paths are injected as high-weight same-genome edges")
       ("gfa-weight", po::value<double>(&g_gfa_weight)->default_value(0.90), "Edge weight assigned to GFA links (0,1)")
       ("confidence", po::value<bool>(&g_emit_confidence)->zero_tokens(), "Emit per-contig assignment confidence (members.tsv column + <prefix>.confidence.tsv soft assignment)")
@@ -3372,11 +3301,15 @@ static int rb_cmd_bin(int ac, char *av[]) {
       ("sketch-k", po::value<int>(&sketch_kmer_size)->default_value(8), "Sketch k-mer size")
       ("sketch-m", po::value<uint32_t>(&sketch_size)->default_value(500), "Sketch size (PMH registers)")
       ("sketch-b", po::value<uint32_t>(&sketch_bits)->default_value(2), "MinHash bucket bits")
+      ("validate-pmh-gold", po::value<std::string>(&g_validate_pmh_gold), "Diagnostic only: evaluate sequence-only PMH top-N neighbourhoods against CAMI gold, then exit")
+      ("validate-pmh-out", po::value<std::string>(&g_validate_pmh_out), "[--validate-pmh-gold] Output TSV (default: <output>.pmh_validation.tsv)")
+      ("validate-pmh-queries", po::value<size_t>(&g_validate_pmh_queries)->default_value(1000), "[--validate-pmh-gold] Seed-controlled labelled query-contig sample")
+      ("validate-pmh-top", po::value<size_t>(&g_validate_pmh_top)->default_value(400), "[--validate-pmh-gold] Largest top-N neighbourhood retained")
+      ("audit-graph-gold", po::value<std::string>(&g_audit_graph_gold), "Diagnostic only: audit production candidate/retained edges against CAMI gold without affecting binning")
+      ("audit-graph-out", po::value<std::string>(&g_audit_graph_out), "[--audit-graph-gold] Output TSV (default: <output>.graph_audit.tsv)")
       ("no-recruit", po::value<bool>(&no_recruit)->zero_tokens(), "Disable small-contig recruiting")
-      ("simple-refinement", po::value<bool>(&g_simple_refinement)->zero_tokens(), "Experimental split-first, frozen-core mean-Spearman recruitment")
-      ("fixed-core-recruitment", po::value<bool>(&g_fixed_core_recruit)->zero_tokens(), "Ablation: fixed-core recruitment followed by the established refinement tail")
       ("no-singleton-rescue", po::value<bool>(&g_no_singleton_rescue)->zero_tokens(), "Ablation: do not promote unassigned long contigs to singleton bins")
-      ("no_gold", po::value<bool>(&no_gold)->zero_tokens(), "Label-free multi-resolution: sweep alpha/edge_power on the reused graph, auto-select max-modularity partition (no ground truth needed)")
+      ("no_gold", po::value<bool>(&no_gold)->zero_tokens(), "Label-free multi-resolution: sweep edge power on the reused graph, auto-select max-modularity partition (no ground truth needed)")
       ("min-recruit-cluster", po::value<size_t>(&minCS)->default_value(10), "Min cluster size for recruiting")
       ("recruit-abd-centroid", po::value<bool>(&recruit_to_depth_centroid)->default_value(false)->zero_tokens(), "Recruit using abundance centroid")
       ("recruit-cutoff", po::value<Distance>(&recruitSimFactor)->default_value(0.0), "Recruit sim factor x sim-cutoff (0=off)")
@@ -3395,16 +3328,12 @@ static int rb_cmd_bin(int ac, char *av[]) {
       ("seed", po::value<unsigned long long>(&seed)->default_value(0), "Random seed (0=time)")
       ("marker-seed", po::value<std::string>(&marker_seed_file)->default_value(""), "Optional marker seed file")
       ("split-max-k", po::value<int>(&splitMaxK)->default_value(6), "Max sub-clusters per split bin")
-      ("split-min-sub-contigs", po::value<size_t>(&splitMinSubContigs)->default_value(3), "Reject a split if any child has fewer contigs")
-      ("split-min-sub-bp", po::value<size_t>(&splitMinSubBp)->default_value(0), "Reject a split if any child is shorter than this (0=off)")
       ("split-kmeans-restarts", po::value<int>(&splitKmeansRestarts)->default_value(10), "K-means initializations per candidate K")
-      ("stable-split-kmeans", po::value<bool>(&g_stable_split_kmeans)->zero_tokens(), "Ablation: canonical members and membership-derived K-means seed")
-      ("split-reject-small-children", po::value<bool>(&g_split_reject_small)->zero_tokens(), "Ablation: apply minimum-child guards to the established splitter")
       ("split-bins", po::value<bool>(&g_split_abundance)->zero_tokens(), "Abundance bin splitting (default ON)")
       ("no-split", po::value<bool>(&g_no_split_abundance)->zero_tokens(), "Disable abundance splitting")
       ("split-silhouette", po::value<double>(&g_split_sil)->default_value(rb_env_split_sil()), "Silhouette split threshold")
       ("auto", po::value<bool>(&g_auto_select)->zero_tokens(), "Build the graph once, sweep configs, and auto-select the partition with the most near-complete bins (needs --markers)")
-      ("autotune", po::value<bool>(&g_autotune)->zero_tokens(), "Self-tuning: search alpha x edge-power x split-silhouette by SCG quality and use the best (needs --markers)")
+      ("autotune", po::value<bool>(&g_autotune)->zero_tokens(), "Self-tuning: search edge-power x split-silhouette by SCG quality and use the best (needs --markers)")
       ("ensemble", po::value<bool>(&g_ensemble)->zero_tokens(), "[experimental] Consensus over the swept configs: greedily keep the highest-quality non-overlapping bins (needs --markers). The swept configs share one graph and are highly correlated; intended for diverse/independent partitions.")
       ("markers", po::value<std::string>(&g_markers_file), "Contig->marker map for --auto/--autotune/--qc/--purify (from scripts/rabbitbin_markers.sh)")
       ("qc", po::value<bool>(&g_qc_annotate)->zero_tokens(), "Annotate bins.tsv with SCG completeness/contamination + MIMAG tier (needs --markers)")
@@ -3583,18 +3512,21 @@ static int rb_cmd_bin(int ac, char *av[]) {
   if (sketch_size < 2) {
     cerr << "[Error!] --sketch-m must be >= 2\n"; return 1;
   }
+  if (!g_validate_pmh_gold.empty()) {
+    if (!cache_load_file.empty()) {
+      cerr << "[Error!] --validate-pmh-gold needs --assembly, not --load-cache\n";
+      return 1;
+    }
+    if (g_validate_pmh_queries < 1 || g_validate_pmh_top < 1) {
+      cerr << "[Error!] --validate-pmh-queries and --validate-pmh-top must be >= 1\n";
+      return 1;
+    }
+  }
   if (splitMaxK < 2) {
     cerr << "[Error!] --split-max-k must be >= 2\n"; return 1;
   }
-  if (splitMinSubContigs < 1) {
-    cerr << "[Error!] --split-min-sub-contigs must be >= 1\n"; return 1;
-  }
   if (splitKmeansRestarts < 1) {
     cerr << "[Error!] --split-kmeans-restarts must be >= 1\n"; return 1;
-  }
-  if (g_simple_refinement && g_fixed_core_recruit) {
-    cerr << "[Error!] --simple-refinement and --fixed-core-recruitment are mutually exclusive\n";
-    return 1;
   }
   if (g_no_split_abundance) g_split_abundance = false;  // explicit opt-out
   minCVSum = std::max(minCV, minCVSum);
@@ -3718,6 +3650,7 @@ static int rb_cmd_bin(int ac, char *av[]) {
   // depth_future: asynchronously parse a depth file, or compute a structured
   // depth matrix from BAM. Launched before FASTA work so the two overlap.
   {
+  g_bin_recruit = has_depth && rb_env_bin_recruit();
   if (!has_depth)
     verbose_message("No --depth/--bam: composition-only binning "
                     "(abundance split/recruit disabled).\n");
@@ -3729,11 +3662,6 @@ static int rb_cmd_bin(int ac, char *av[]) {
 #endif
   };
   std::future<DepthAsyncResult> depth_future;
-  // Resolve the merge flag BEFORE the depth/parse kickoff below: the depth
-  // async collects paired-end linkage only when merge is on, and the rest of
-  // the env block runs only later.
-  g_bin_merge = !g_simple_refinement && rb_env_bin_merge();
-  g_bin_recruit = !g_simple_refinement && rb_env_bin_recruit();
   {
 #ifdef RABBITBIN_FUSE
     if (fuse_mode) {
@@ -3807,8 +3735,7 @@ static int rb_cmd_bin(int ac, char *av[]) {
                                 /*includeEdgeBases=*/false,
                                 /*intraDepthVariance=*/false, nt,
                                 snvOn ? &g_snv_result : nullptr, cols.get(),
-                                /*minMapQual=*/0, /*dualMapQual=*/dualQ,
-                                /*collectPELink=*/g_bin_merge);
+                                /*minMapQual=*/0, /*dualMapQual=*/dualQ);
         // Apply exactly the same FASTA-label normalization as the file parser.
         // Duplicate normalized labels are resolved later by first-row emplace,
         // matching the existing name-map semantics.
@@ -3973,7 +3900,8 @@ static int rb_cmd_bin(int ac, char *av[]) {
         // consumers is active, the bytes are dead weight, so we skip storing them
         // and cut peak RSS by roughly the input size.  Bit-identical results.
         return stream_pmh_mmap && noBinOut && !outUnbinned &&
-               recruitSimFactor <= 0.0 && getenv("RB_SEQHASH") == nullptr &&
+               recruitSimFactor <= 0.0 &&
+               getenv("RB_SEQHASH") == nullptr &&
                !g_mge_scan &&  // --mge-scan needs sequences resident for DTR detection
                !(g_certify && g_cert_core_fasta);  // core_bins/ FASTA needs sequences
       }();
@@ -4047,7 +3975,6 @@ static int rb_cmd_bin(int ac, char *av[]) {
               fullHeader,
               stream_pmh_mmap, no_store_seqs_mmap,
               /*collect_tiny=*/outUnbinned,
-              /*collect_tnf=*/g_bin_recruit,
               pmh_m_mmap, pmh_k_mmap,
               mmap_large, mmap_small, mmap_tiny,
               num_seqs);
@@ -4092,9 +4019,6 @@ static int rb_cmd_bin(int ac, char *av[]) {
         if (do_collect_k4) {
           g_k4freq_flat.assign(mmap_large.size() * 256, 0.0f);
         }
-        const bool do_collect_tnf = g_bin_recruit;
-        if (do_collect_tnf) g_merge_tnf.assign(mmap_large.size() * 256, 0.0f);
-
         // Merge results into global arrays (serial, but O(nobs) and fast).
         // Sequences become string_views into the retained mmap (single-line) or
         // the per-thread arenas (multi-line); no copy here either.
@@ -4133,10 +4057,6 @@ static int rb_cmd_bin(int ac, char *av[]) {
           }
           if (do_collect_k4 && !rec.k4freq.empty()) {
             std::memcpy(g_k4freq_flat.data() + r * 256,
-                        rec.k4freq.data(), 256 * sizeof(float));
-          }
-          if (do_collect_tnf && !rec.k4freq.empty()) {
-            std::memcpy(g_merge_tnf.data() + r * 256,
                         rec.k4freq.data(), 256 * sizeof(float));
           }
         }
@@ -4271,7 +4191,8 @@ static int rb_cmd_bin(int ac, char *av[]) {
         // winners are produced during this streaming parse — bit-identical, and
         // removes the dominant (~assembly-sized) memory cost.
         return stream_pmh && noBinOut && !outUnbinned &&
-               recruitSimFactor <= 0.0 && getenv("RB_SEQHASH") == nullptr &&
+               recruitSimFactor <= 0.0 &&
+               getenv("RB_SEQHASH") == nullptr &&
                !g_mge_scan &&  // --mge-scan needs sequences resident for DTR detection
                !(g_certify && g_cert_core_fasta);  // core_bins/ FASTA needs sequences
       }();
@@ -4570,13 +4491,6 @@ static int rb_cmd_bin(int ac, char *av[]) {
       // The contigs / small_contigs dedup maps are also done being read here;
       // fold their (string-key) teardown into the same detached thread.
 #ifdef RABBITBIN_FUSE
-      if (depth_cols && g_bin_merge && !depth_cols->pe_links.empty()) {
-        // The row names use the same normalization as FASTA and can now move
-        // into the lazy compact-row -> contig mapper without another copy.
-        g_pe_names = std::move(depth_cols->names);
-        g_pe_links_compact = std::move(depth_cols->pe_links);
-        g_pe_compact_to_contig.clear();
-      }
       std::thread([dm = std::move(depth_result.by_name),
                    matrix = std::move(depth_result.matrix),
                    cm = std::move(contigs),
@@ -4667,35 +4581,20 @@ static int rb_cmd_bin(int ac, char *av[]) {
   g_pmh_mode    = rb_env_pmh_on();
   g_pmh_k       = [] { const char *e = rb_getenv("RABBIT_PMHK"); return e ? std::atoi(e) : 4; }();
   g_pmh_base_on = [] { const char *e = rb_getenv("RABBIT_PMH_BASE"); return !e || e[0] != '0'; }();
-  {
-    double wc_req = rb_env_w_comp();          // -1.0 if RABBIT_W_COMP unset
-    g_w_comp = (wc_req < 0.0) ? auto_w_comp(num_depth_samples) : wc_req;
-    if (wc_req >= 0.0)
-      verbose_message("Fusion: g_w_comp=%.2f (user RABBIT_W_COMP override)\n",
-                      g_w_comp);
-    else if (num_depth_samples >= 3)
-      verbose_message("Fusion: S=%zu (≥3, depth corr non-degenerate) → "
-                      "depth-driven LPA (g_w_comp=0; sketch = candidate filter)\n",
-                      (size_t)num_depth_samples);
-    else
-      verbose_message("Fusion: S=%zu (≤2, depth corr degenerate) → "
-                      "composition-only (g_w_comp=1)\n",
-                      (size_t)num_depth_samples);
-  }
+  if (rb_getenv("RABBIT_W_COMP"))
+    cerr << "[Warn] RABBIT_W_COMP is ignored: S>=3 uses coverage weights; "
+            "S<=2 retains composition weights.\n";
+  if (has_depth && num_depth_samples >= 3)
+    verbose_message("Edge weighting: S=%zu; coverage only, "
+                    "PMH selects candidate neighbours\n", num_depth_samples);
+  else
+    verbose_message("Edge weighting: S=%zu; composition-only fallback "
+                    "(fewer than three coverage samples)\n", num_depth_samples);
   g_depth_sim       = rb_env_depth_sim();
   g_depth_fuse      = rb_env_depth_fuse();
   g_depth_wjac_norm = rb_env_depth_wjac_norm_on();
   g_depth_wjac_cut  = rb_env_depth_wjac_cut();
   g_depth_wjac_gate = rb_env_depth_wjac_gate();
-  g_split_keep_coherent = rb_env_split_keep_coherent();
-  g_split_coh_pct = rb_env_split_coh_pct();
-  g_split_guard = rb_env_split_guard();
-  g_split_guard_bp = rb_env_split_guard_bp();
-  g_split_guard_margin = rb_env_split_guard_margin();
-  g_split_consolidate = rb_env_split_consolidate();
-  g_split_consolidate_delta = rb_env_split_consolidate_delta();
-  g_bin_merge = !g_simple_refinement && rb_env_bin_merge();
-  g_bin_recruit = !g_simple_refinement && rb_env_bin_recruit();
   g_mutual_knn  = rb_env_mutual_knn_on();
   g_neg_depth_thr = rb_env_neg_depth_thr();
   g_edge_power  = [] { const char *e = rb_getenv("RABBIT_EDGE_POWER"); double v = e ? std::atof(e) : 1.0;
@@ -4808,7 +4707,10 @@ static int rb_cmd_bin(int ac, char *av[]) {
       g_depth_colnorm.clear();
     }
     verbose_message("Abundance edge metric: %s (per-sample norm %s)\n",
-                    g_depth_sim == 2 ? "fuse(corr×wjac)" : "weighted Jaccard",
+                    g_depth_sim != 2 ? "weighted Jaccard" :
+                    g_depth_fuse == 1 ? "min(max(Spearman,0),coverage Jaccard)" :
+                    g_depth_fuse == 2 ? "max(Spearman,0)*coverage Jaccard" :
+                                       "sqrt(max(Spearman,0)*coverage Jaccard)",
                     g_depth_wjac_norm ? "ON" : "OFF");
   }
 
@@ -4964,6 +4866,19 @@ static int rb_cmd_bin(int ac, char *av[]) {
                     g_pmh_baseline);
   }
 
+  // Gold-aware representation validation is a terminal diagnostic.  It uses
+  // the same packed winner identities as the production graph kernel, measures
+  // pure sequence-only top-N neighbourhoods, writes the requested report, and
+  // exits before abundance scoring, graph construction, or clustering.
+  if (!g_validate_pmh_gold.empty()) {
+    const std::string report = g_validate_pmh_out.empty()
+                                   ? outFile + ".pmh_validation.tsv"
+                                   : g_validate_pmh_out;
+    return rb_validate_pmh_neighbourhoods(
+        g_validate_pmh_gold, report, g_validate_pmh_queries,
+        g_validate_pmh_top);
+  }
+
   // Precompute centered + L2-normalised rank vectors once (depth_matrix is fully
   // rank-transformed by now).  Lets the O(E·S) edge-weight corr term be a pure
   // dot product (depth_corr_fast) instead of the per-pair Welford (3 div/sample +
@@ -5053,13 +4968,9 @@ static int rb_cmd_bin(int ac, char *av[]) {
         build_similarity_graph(g, simCutoff / 1000.);
       }
 
-      // PMH winner arrays fed ONLY the O(N²) composition-similarity kernel
-      // (graph_sim / Fusion D / calibration), which is now complete — the
-      // similarities are baked into g.sComp.  No later stage (edgeScore, LP,
-      // recruit, split, output, certify, cache) reads them, so release the
-      // packed 16-bit (2·nobs·m) and any 32-bit winner array here, before the
-      // edge-scoring + propagation phases.  No-op on the --load-cache path.
-      if (!g_win16.empty())    std::vector<uint16_t>().swap(g_win16);
+      // PMH winner arrays fed only graph construction and can be released
+      // before edge scoring, clustering, and refinement.
+      if (!g_win16.empty()) std::vector<uint16_t>().swap(g_win16);
       if (!g_win_flat.empty()) std::vector<uint32_t>().swap(g_win_flat);
 
       // ── Save hook: persist the post-graph state, then continue normally so
@@ -5083,12 +4994,12 @@ static int rb_cmd_bin(int ac, char *av[]) {
       // ── --no_gold: label-free multi-resolution auto-selection ─────────────
       // Build the (expensive) similarity graph ONCE, then run many CHEAP
       // (edgeScore + incidence + label-propagation) passes under different
-      // α (g_w_comp) / edge_power settings, and select the partition with the
-      // highest weighted modularity on the fixed composition graph — a quality
+      // edge_power settings, and select the partition with the highest
+      // weighted modularity on the fixed coverage graph — a quality
       // signal that needs NO ground truth. The selected membership then flows
       // into the normal recruit/split/output pipeline (no early exit), so the
       // final bins are a complete, auto-resolution result.
-      // Trigger: --no_gold (default grid) or RABBIT_REUSE_SWEEP="a:p;a:p;..."
+      // Trigger: --no_gold (default grid) or RABBIT_REUSE_SWEEP="p;p;..."
       // for a custom grid. RABBIT_NO_GOLD_DUMP=1 additionally writes per-config
       // and selected AMBER .binning files (for offline evaluation). When neither
       // is set, the single-resolution production path below is byte-identical.
@@ -5120,24 +5031,28 @@ static int rb_cmd_bin(int ac, char *av[]) {
           return std::chrono::duration<double, std::milli>(clk::now() - t0).count();
         };
 
-        // Parse "a:p;a:p" configs; null/"1"/empty → default grid.
-        std::vector<std::pair<double, double>> cfgs;
+        // Sweep edge powers only; S>=3 weights remain coverage-based.
+        // null/"1"/empty selects the default grid. Legacy alpha:power configs
+        // are rejected so a former composition sweep cannot change meaning.
+        std::vector<double> cfgs;
         {
           std::string spec(sweep_env ? sweep_env : "");
           if (spec.empty() || spec == "1") {
-            cfgs = {{0.3, 1.0}, {0.4, 1.0}, {0.5, 1.0},
-                    {0.5, 1.5}, {0.6, 1.0}};
+            cfgs = {1.0, 1.25, 1.5, 2.0, 3.0};
           } else {
             size_t p = 0;
             while (p < spec.size()) {
               size_t semi = spec.find(';', p);
               std::string tok = spec.substr(p, semi == std::string::npos ? std::string::npos : semi - p);
-              size_t colon = tok.find(':');
-              if (colon != std::string::npos) {
-                double a = std::atof(tok.substr(0, colon).c_str());
-                double pw = std::atof(tok.substr(colon + 1).c_str());
-                if (a >= 0.0 && a <= 1.0 && pw >= 0.1) cfgs.emplace_back(a, pw);
+              char *end = nullptr;
+              double pw = std::strtod(tok.c_str(), &end);
+              if (tok.empty() || end == tok.c_str() || *end != '\0' ||
+                  !std::isfinite(pw) || pw < 0.1) {
+                cerr << "[Error!] RABBIT_REUSE_SWEEP expects edge powers "
+                        "p;p;... (each >=0.1); alpha:power mixing was removed.\n";
+                return 1;
               }
+              cfgs.push_back(pw);
               if (semi == std::string::npos) break;
               p = semi + 1;
             }
@@ -5147,9 +5062,8 @@ static int rb_cmd_bin(int ac, char *av[]) {
         const size_t E = g.getEdgeCount();
         static constexpr StoredDistance SSCR_MAX = 1.0f - 1e-6f;
 
-        // Recompute g.edgeScore from the (reused) g.sComp + depth correlation,
-        // mirroring the production block below, under the current g_w_comp /
-        // g_edge_power globals.
+        // Recompute coverage weights on the reused candidate graph, with the
+        // same scoring function as production and certification.
         auto compute_edgescore = [&]() {
           g.edgeScore.assign(E, 0.0f);
           if (has_depth) {
@@ -5160,19 +5074,7 @@ static int rb_cmd_bin(int ac, char *av[]) {
                 g.edgeScore[e] = (StoredDistance)g_gfa_weight;
                 continue;
               }
-              if (num_depth_samples <= 1) {
-                double w = (double)g.sComp[e];
-                if (g_edge_power != 1.0) w = std::pow(w, g_edge_power);
-                g.edgeScore[e] = (StoredDistance)w;
-              } else {
-                bool depth_ok;
-                double dterm = depth_edge_term(i, j, depth_ok);
-                if (!depth_ok) { g.edgeScore[e] = 0.0f; continue; }
-                double w = g_w_comp * (double)g.sComp[e] + (1.0 - g_w_comp) * dterm;
-                if (!std::isfinite(w) || w < (double)min_edge_weight) w = 0.0;
-                if (g_edge_power != 1.0 && w > 0.0) w = std::pow(w, g_edge_power);
-                g.edgeScore[e] = (StoredDistance)w;
-              }
+              g.edgeScore[e] = depth_graph_edge_score(i, j, g.sComp[e]);
             }
           } else {
             g.edgeScore = g.sComp;
@@ -5242,16 +5144,18 @@ static int rb_cmd_bin(int ac, char *av[]) {
         std::string base = std::string(outFile);
 
         // ── Label-free selection criterion: weighted modularity Q ─────────────
-        // Q is evaluated on the FIXED, parameter-independent composition graph
-        // (weights = g.sComp, identical for every config), so differences in Q
+        // Q is evaluated on the FIXED baseline coverage graph (composition only
+        // for the S<=2 fallback), identical for every config, so differences in Q
         // reflect ONLY how well each config's partition cuts the graph — not the
         // per-config reweighting. This is the no-ground-truth selector: pick the
         // config with the highest Q. Precompute weighted degree + total weight
         // once (O(E)); per-config Q is then O(E + N).
+        compute_edgescore();
+        const std::vector<StoredDistance> reference_weights = g.edgeScore;
         std::vector<double> wdeg(nobs, 0.0);
         double Wtot = 0.0;
         for (size_t e = 0; e < E; ++e) {
-          double w = edge_is_gfa(g.sComp[e]) ? g_gfa_weight : (double)g.sComp[e];
+          double w = (double)reference_weights[e];
           Wtot += w; wdeg[g.from[e]] += w; wdeg[g.to[e]] += w;
         }
         const double invWtot  = Wtot > 0 ? 1.0 / Wtot : 0.0;
@@ -5260,7 +5164,7 @@ static int rb_cmd_bin(int ac, char *av[]) {
           double Wintra = 0.0;
           for (size_t e = 0; e < E; ++e)
             if (mem[g.from[e]] == mem[g.to[e]])
-              Wintra += edge_is_gfa(g.sComp[e]) ? g_gfa_weight : (double)g.sComp[e];
+              Wintra += (double)reference_weights[e];
           std::unordered_map<size_t, double> vol;
           for (size_t i = 0; i < nobs; ++i)
             if (wdeg[i] > 0.0) vol[mem[i]] += wdeg[i];
@@ -5277,8 +5181,7 @@ static int rb_cmd_bin(int ac, char *av[]) {
         size_t best_c = 0; double best_q = -1e300;
         size_t best_qc_c = 0; long best_nc = -1; double best_ncsum = -1.0;
         for (size_t c = 0; c < M; ++c) {
-          g_w_comp     = cfgs[c].first;
-          g_edge_power = cfgs[c].second;
+          g_edge_power = cfgs[c];
           auto t0 = clk::now();
           compute_edgescore();
           double es_ms = ms_since(t0);
@@ -5304,7 +5207,7 @@ static int rb_cmd_bin(int ac, char *av[]) {
             }
           } else if (qc_ready && g_autotune) {
             // --autotune: also sweep split-silhouette and score post-split bins.
-            // Pick (alpha,edge_power,split_sil) by the SCG objective. Reuses
+            // Pick (edge_power,split_sil) by the SCG objective. Reuses
             // g_contig_marker_ids (large).
             static const double sil_grid[] = {0.60, 0.70, 0.80};
             const double invG = (g_marker_set_size > 0) ? 100.0 / g_marker_set_size : 0.0;
@@ -5337,15 +5240,15 @@ static int rb_cmd_bin(int ac, char *av[]) {
           }
           if (dump) {
             char path[4096];
-            snprintf(path, sizeof(path), "%s.reuse.cfg%zu_a%.2f_p%.2f.binning",
-                     base.c_str(), c, cfgs[c].first, cfgs[c].second);
+            snprintf(path, sizeof(path), "%s.reuse.cfg%zu_p%.2f.binning",
+                     base.c_str(), c, cfgs[c]);
             write_binning(mems_all[c], path);
           }
           fprintf(stderr,
-                  "[REUSE] cfg%zu a=%.2f p=%.2f | edgeScore=%.1fms incs=%.1fms "
+                  "[REUSE] cfg%zu p=%.2f | edgeScore=%.1fms incs=%.1fms "
                   "LP=%.1fms pass=%.1fms | bins=%zu binned=%zu Q=%.5f"
                   " HQ~=%ld\n",
-                  c, cfgs[c].first, cfgs[c].second, es_ms, inc_ms, lp_ms,
+                  c, cfgs[c], es_ms, inc_ms, lp_ms,
                   pass_ms, bc.first, bc.second, qscore[c],
                   qc_ready ? qc_nc[c] : -1L);
         }
@@ -5360,9 +5263,9 @@ static int rb_cmd_bin(int ac, char *av[]) {
           fprintf(stderr, "[REUSE] autotune: best split-silhouette=%.2f\n",
                   g_autotune_best_sil);
         }
-        g_w_comp     = cfgs[best_c].first;
-        g_edge_power = cfgs[best_c].second;
+        g_edge_power = cfgs[best_c];
         compute_edgescore();
+        if (has_depth) dump_coverage_edge_scores(g);
         rebuild_incs();
         membership = mems_all[best_c];
         used_no_gold = true;
@@ -5383,15 +5286,15 @@ static int rb_cmd_bin(int ac, char *av[]) {
         }
         if (qc_ready)
           fprintf(stderr,
-                  "[REUSE] SELECTED (max near-complete) = cfg%zu a=%.2f p=%.2f "
+                  "[REUSE] SELECTED (max near-complete) = cfg%zu p=%.2f "
                   "HQ~=%ld%s\n",
-                  best_c, cfgs[best_c].first, cfgs[best_c].second, best_nc,
+                  best_c, cfgs[best_c], best_nc,
                   g_ensemble ? " then ensemble-consensus" : "");
         else
           fprintf(stderr,
-                  "[REUSE] SELECTED (max modularity) = cfg%zu a=%.2f p=%.2f "
+                  "[REUSE] SELECTED (max modularity) = cfg%zu p=%.2f "
                   "Q=%.5f\n",
-                  best_c, cfgs[best_c].first, cfgs[best_c].second, best_q);
+                  best_c, cfgs[best_c], best_q);
 
         // ── Pairwise edge-agreement (diversity proxy; lower = more diverse) ────
         if (dump && M >= 2) {
@@ -5420,7 +5323,7 @@ static int rb_cmd_bin(int ac, char *av[]) {
                 M, tail_total / std::max<size_t>(M, 1), tail_total);
       }  // end --no_gold multi-resolution selection
 
-      // ── 3. Compute depth_matrix graph weights and composite scores ──────────────
+      // ── 3. Score candidate edges (coverage for S>=3; composition for S<=2) ──
       if (!used_no_gold) {
       if (has_depth) {
         verbose_message("Calculating depth_matrix graph [%.1fGb / %.1fGb]               "
@@ -5429,13 +5332,13 @@ static int rb_cmd_bin(int ac, char *av[]) {
         size_t ne = g.getEdgeCount();
         g.edgeScore.resize(ne);
 
-        // Unsupervised edge cutoff only applies to the multi-sample fused-weight
-        // path; for S<=1 (composition-only) the fixed path below is unchanged.
+        // Retain the optional adaptive-cutoff path for S>=2; single-sample
+        // composition weights keep their original cutoff behaviour.
         const int edge_cut_mode =
             (num_depth_samples > 1) ? rb_env_edge_cut_mode() : 0;
 
         if (edge_cut_mode != 0) {
-          // ── Phase A: compute the RAW fused weight for every candidate edge
+          // ── Phase A: compute the RAW weight for every candidate edge
           // (no survival cutoff yet), so its unlabelled distribution can set the
           // cutoff.  GFA edges carry a sentinel (-1) and bypass the cutoff.
           std::vector<float> raw_w(ne, 0.0f);
@@ -5443,10 +5346,7 @@ static int rb_cmd_bin(int ac, char *av[]) {
           for (size_t e = 0; e < ne; ++e) {
             if (edge_is_gfa(g.sComp[e])) { raw_w[e] = -1.0f; continue; }
             size_t i = g.from[e], j = g.to[e];
-            bool depth_ok;
-            double dterm = depth_edge_term(i, j, depth_ok);
-            if (!depth_ok) { raw_w[e] = 0.0f; continue; }
-            double w = g_w_comp * (double)g.sComp[e] + (1.0 - g_w_comp) * dterm;
+            double w = depth_graph_raw_weight(i, j, g.sComp[e]);
             if (!std::isfinite(w) || w < 0.0) w = 0.0;
             raw_w[e] = (float)w;
           }
@@ -5487,53 +5387,10 @@ static int rb_cmd_bin(int ac, char *av[]) {
             g.edgeScore[e] = (StoredDistance)g_gfa_weight;
             continue;
           }
-          if (num_depth_samples <= 1) {
-            double w = (double)g.sComp[e];
-            if (g_edge_power != 1.0) w = std::pow(w, g_edge_power);
-            g.edgeScore[e] = (StoredDistance)w;
-          } else {
-            // Depth term: Spearman corr (default) or weighted Jaccard
-            // (RABBIT_DEPTH_SIM=wjac). depth_edge_term applies the negative-corr
-            // hard-cut for the correlation path; wjac is already in [0,1].
-            bool depth_ok;
-            double dterm = depth_edge_term(i, j, depth_ok);
-            if (!depth_ok) { g.edgeScore[e] = 0.0f; continue; }
-            double sComp_v = g.sComp[e];
-            double min_edge_weight_v = min_edge_weight;
-            double w = g_w_comp * sComp_v + (1.0 - g_w_comp) * dterm;
-            if (!std::isfinite(w) || w < min_edge_weight_v) w = 0.0;
-            // Edge power: raise to p>1 to de-emphasise borderline edges.
-            if (g_edge_power != 1.0 && w > 0.0) w = std::pow(w, g_edge_power);
-            g.edgeScore[e] = (StoredDistance)w;
-          }
+          g.edgeScore[e] = depth_graph_edge_score(i, j, g.sComp[e]);
         }
         }
-        // Optional diagnostic pair dump: emits raw candidate-edge features after
-        // scoring without changing the graph.
-        if (num_depth_samples > 1) {
-          const char *dpath = rb_getenv("RB_PAIR_DUMP");
-          if (dpath && *dpath) {
-            FILE *pf = fopen(dpath, "w");
-            if (pf) {
-              fprintf(pf, "name_i\tname_j\tsComp\tdterm\tok\n");
-              for (size_t e = 0; e < ne; ++e) {
-                if (edge_is_gfa(g.sComp[e])) continue;
-                size_t i = g.from[e], j = g.to[e];
-                if (i >= contig_names.size() || j >= contig_names.size()) continue;
-                bool depth_ok;
-                double dterm = depth_edge_term(i, j, depth_ok);
-                fprintf(pf, "%s\t%s\t%.6f\t%.6f\t%d\n",
-                        contig_names[i].c_str(), contig_names[j].c_str(),
-                        (double)g.sComp[e], dterm, depth_ok ? 1 : 0);
-              }
-              fclose(pf);
-              verbose_message("RB_PAIR_DUMP: wrote %zu candidate pairs to %s\n",
-                              (size_t)ne, dpath);
-            } else {
-              cerr << "[Warn] RB_PAIR_DUMP: cannot open " << dpath << "\n";
-            }
-          }
-        }
+        dump_coverage_edge_scores(g);
       } else {
         g.edgeScore = g.sComp;
         for (auto &s : g.edgeScore) {
@@ -5543,6 +5400,14 @@ static int rb_cmd_bin(int ac, char *av[]) {
       }
 
       rb_phase("graph+edgescore done");
+
+      if (!g_audit_graph_gold.empty()) {
+        const std::string report = g_audit_graph_out.empty()
+                                       ? outFile + ".graph_audit.tsv"
+                                       : g_audit_graph_out;
+        if (rb_audit_production_graph(g, g_audit_graph_gold, report) != 0)
+          return 1;
+      }
 
       // ── 3b. Optional SNN edge reinforcement (RABBIT_SNN=1) ──────────────
       // Multiply each surviving edge weight by (Jaccard overlap of the two
@@ -5729,7 +5594,7 @@ static int rb_cmd_bin(int ac, char *av[]) {
       }
     } // graph g destroyed here
 
-    if (g_simple_refinement || g_fixed_core_recruit || no_recruit) break;
+    if (no_recruit) break;
 
     // ── 7. Recruit lost and small contigs ─────────────────────────────────
     std::vector<size_t> leftovers;
@@ -5890,7 +5755,7 @@ static int rb_cmd_bin(int ac, char *av[]) {
       if (c) c->freeRegisters();
 
     // ── Recruit leftovers + small contigs ─────────────────────────────────
-    // Preferred path: length-calibrated abundance T2 (same model as bin merge).
+    // Preferred path: length-calibrated abundance T2.
     // A contig is recruited to the unique eligible bin whose coverage profile is
     // consistent with it (T2 <= chi2 critical value).  Short contigs automatically
     // receive a wider tolerance through sigma^2(L)=a+b/L, which is what the old
@@ -5934,7 +5799,6 @@ static int rb_cmd_bin(int ac, char *av[]) {
       }
 
       double alpha = g_abd_alpha;
-      if (const char *e = getenv("RABBIT_BIN_RECRUIT_ALPHA")) alpha = atof(e);
       const double crit = rb_chi2_crit(ABD_Sloc, alpha, 1);
       verbose_message("Stat recruit (chi2_%zu crit=%.1f alpha=%.3g): %zu eligible "
                       "bins [%.1fGb / %.1fGb]\n",
@@ -6033,8 +5897,8 @@ static int rb_cmd_bin(int ac, char *av[]) {
               for (size_t e = 0; e < numElig; ++e) {
                 if (contig_bin_passes(contig_y.data(), contig_v.data(), e)) {
                   ++n_pass;
-                  if (n_pass == 1) best_e = (int)e;
-                  else { best_e = -1; break; }
+                  if (n_pass > 1) { best_e = -1; break; }
+                  best_e = (int)e;
                 }
               }
               if (g_small_prof) {
@@ -6218,8 +6082,7 @@ static int rb_cmd_bin(int ac, char *av[]) {
                       (int)minContig);
 
   } while (false);
-  rb_phase((g_simple_refinement || g_fixed_core_recruit)
-               ? "initial bins done" : "recruit done");
+  rb_phase("recruit done");
 
   // Release centroid sketches
   for (auto *p : g_centroids) delete p;
@@ -6229,8 +6092,7 @@ static int rb_cmd_bin(int ac, char *av[]) {
   for (auto *p : g_sketches) delete p;
   g_sketches.clear();
 
-  if (!g_simple_refinement && !g_fixed_core_recruit &&
-      !g_no_singleton_rescue) {
+  if (!g_no_singleton_rescue) {
     verbose_message("Rescuing singleton large contigs\n");
     promote_singleton_bins(cls);
     rb_phase("  promote singletons");
@@ -6247,47 +6109,18 @@ static int rb_cmd_bin(int ac, char *av[]) {
   // ── Phase 2: split contaminated/multi-modal bins (+ optional purify) ──────
   // An explicit --marker-seed takes priority (marker-guided); otherwise the
   // default marker-free abundance split runs (disable with --no-split).
-  // --simple-refinement evaluates the proposed split-first/frozen-core flow.
-  // The established refinement remains the default because cross-dataset ablation
-  // currently shows a recovery regression for the simplified path.
   auto do_refine = [&](BinMap &c) {
-    const size_t merge_floor = min_bin_bp;
     if (!marker_seed_file.empty()) {
       verbose_message("Marker-guided bin splitting...\n");
       marker_guided_split(c);
     } else if (g_split_abundance) {
       verbose_message("Abundance-guided bin splitting (marker-free)...\n");
-      if (g_simple_refinement) abundance_guided_split_simple(c);
-      else                     abundance_guided_split_current(c);
+      abundance_guided_split_current(c);
     }
     rb_phase("  split: abundance");
-    if (g_simple_refinement) {
-      recruit_to_frozen_cores(c, merge_floor);
-      rb_phase("  recruit: fixed cores");
-      if (!g_no_singleton_rescue) {
-        verbose_message("Rescuing singleton large contigs\n");
-        promote_singleton_bins(c);
-        rb_phase("  promote singletons");
-      }
-    } else {
-      if (g_fixed_core_recruit) {
-        recruit_to_frozen_cores(c, merge_floor);
-        rb_phase("  recruit: fixed cores");
-      }
-      if (g_bin_merge) consolidate_bins(c, merge_floor);
-      rb_phase("  split: consolidate");
-      if (g_bin_recruit) recruit_unbinned_to_cores(c, merge_floor);
-      rb_phase("  split: bin-recruit");
-      // In the hybrid fixed-core ablation, leave candidates unassigned until
-      // both established recovery passes have had a chance to inspect them.
-      if (g_fixed_core_recruit && !g_no_singleton_rescue) {
-        verbose_message("Rescuing singleton large contigs\n");
-        const size_t saved_floor = min_bin_bp;
-        min_bin_bp = merge_floor;
-        promote_singleton_bins(c);
-        min_bin_bp = saved_floor;
-        rb_phase("  promote singletons");
-      }
+    if (g_bin_recruit) {
+      recruit_unbinned_to_cores(c, min_bin_bp);
+      rb_phase("  recruit: post-split cores");
     }
     if (g_purify) {
       verbose_message("Contamination-aware purification...\n");
@@ -6309,6 +6142,7 @@ static int rb_cmd_bin(int ac, char *av[]) {
   }
 
   if (g_resolutions.empty()) {
+    rb_phase("refinement start");
     do_refine(cls);
     rb_phase("refinement done");
     verbose_message("Outputting bins\n");
@@ -6344,14 +6178,15 @@ static int rb_cmd_bin(int ac, char *av[]) {
       outFile = base + "." + std::get<0>(r);
       verbose_message("[resolution %s] min-bin-bp=%zu split-sil=%.2f\n",
                       std::get<0>(r).c_str(), min_bin_bp, g_split_sil);
+      rb_phase(("resolution " + std::get<0>(r) + " start").c_str());
       do_refine(c);
+      rb_phase(("resolution " + std::get<0>(r) + " refinement done").c_str());
       output_bins(c);
+      rb_phase(("resolution " + std::get<0>(r) + " output done").c_str());
     }
     outFile = base; min_bin_bp = saved_min; g_split_sil = saved_sil;
   }
   rb_phase("output done");
-
-  std::vector<float>().swap(g_merge_tnf);        // release recruit TNF vectors
 
   verbose_message("Finished\n");
   return 0;

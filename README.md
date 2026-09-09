@@ -1,10 +1,17 @@
 # RabbitBin
 
 Fast, sketch-based metagenome binning. The default RabbitBin pipeline uses
-4-mer weighted ProbMinHash (PMH) sketches to construct a mutual-nearest-neighbour
-candidate graph, weights candidate edges by contig composition and coverage
-agreement, clusters the graph with Fisher label propagation, and then recruits
-short contigs and re-splits multi-modal bins.
+canonical, count-weighted 4-mer ProbMinHash (PMH) sketches to construct a
+bounded mutual-nearest-neighbour candidate graph, uses abundance profiles as
+the edge evidence in the standard multi-sample setting, clusters the retained
+graph with Fisher label propagation, and then recruits short contigs and
+re-splits multi-modal bins. A final selective pass recovers remaining long
+contigs against the split, frozen bin cores. In other words, PMH proposes where
+to look; it does not by itself determine the final biological grouping.
+
+RabbitBin uses [RabbitBAM](https://github.com/RabbitBio/RabbitBAM/tree/sortedbam)
+for parallel BAM I/O. The `sortedbam` branch provides the BAM reading, sorting,
+and indexing modules.
 
 RabbitBin uses [RabbitBAM](https://github.com/RabbitBio/RabbitBAM/tree/sortedbam)
 for parallel BAM I/O. The `sortedbam` branch provides the BAM reading, sorting,
@@ -47,17 +54,24 @@ rm -rf build && mkdir build && cd build && cmake .. && make -j
 ## Input modes
 
 `rabbitbin bin` accepts coverage in one of two forms, or none at all. The mode
-is inferred from the flags and echoed in the log line beginning `Fusion:`.
+is inferred from the flags and echoed in the log line beginning `Edge weighting:`.
 
 | Mode | Flags | Edge weight | Abundance stages |
 |------|-------|-------------|------------------|
-| BAM/CRAM | `--fasta` + `--bam`/`--bam-list` | composition + coverage (depth computed in-process) | enabled |
-| Precomputed depth | `--assembly` + `--depth` | composition + coverage | enabled |
+| BAM/CRAM | `--fasta` + `--bam`/`--bam-list` | coverage only for `S >= 3`; composition for `S <= 2` (depth computed in-process) | enabled |
+| Precomputed depth | `--assembly` + `--depth` | coverage only for `S >= 3`; composition for `S <= 2` | enabled |
 | Sequence-only | `--assembly` alone | composition only | **disabled** |
 
-With one or two coverage samples, edge weights fall back to composition alone,
-but the coverage values still drive recruitment and bin splitting. From three
-samples on, coverage drives the edge weights (see *Edge weighting* below).
+The manuscript's multi-sample method uses PMH to select candidate neighbours
+and coverage alone to weight their edges when `S >= 3`.
+
+For one or two coverage samples, the original composition-weighted fallback is
+retained; coverage still drives recruitment and splitting. In the two-sample
+path, the existing negative-correlation gate and minimum-edge cutoff still
+filter candidates before composition weights are used. Spearman is undefined with one
+observation and, without ties, is restricted to +1 or -1 with two. Three
+observations are the first sample count with non-binary rank-correlation
+resolution. This fallback is separate from the manuscript's `S >= 3` method.
 
 **Sequence-only mode runs, but it is not the configuration used for the reported
 benchmarks.** Without coverage there is no abundance signal, so contig
@@ -137,19 +151,67 @@ Both bounds are user-settable: `--min-contig` accepts any value ≥ 1500 and
 1. **4-mer PMH sketching.** Each large contig is represented by a weighted
    ProbMinHash sketch over canonical 4-mer counts, with `--sketch-m`
    (default 500) registers.
-2. **Mutual top-N candidate graph.** PMH similarity retrieves at most
-   `--max-edges` (default 200) neighbours per contig; an undirected candidate
-   edge is retained only when the neighbour relation is mutual.
-3. **Edge weighting.** Surviving edges get
-   `w = α · s_comp + (1 − α) · d`, and edges below `--min-edge-score`
-   (default 0.70) are dropped. `s_comp` is the PMH composition similarity.
-   `d` *(needs coverage)* is the conjunctive `min` of the Spearman rank
-   correlation and the weighted Jaccard similarity of the two coverage
-   profiles, with a hard cut on strongly negative correlation. `α` is chosen
-   from the number of coverage samples `S`: `α = 1` for `S ≤ 2`, because a
-   correlation over ≤ 2 paired observations has ≤ 0 degrees of freedom and
-   carries no information, and `α = 0` for `S ≥ 3`, where PMH acts purely as a
-   candidate filter. Override with `RABBIT_W_COMP`.
+2. **Bounded mutual candidate graph.** In the standard multi-sample path, an
+   exact abundance-feasibility bound first removes pairs that cannot pass the
+   final edge threshold. PMH similarity then retains at most `--max-edges`
+   (default 200) neighbours per contig from the feasible pairs; the calibrated
+   production candidate graph keeps a pair only when the neighbour relation is
+   mutual. This order prevents abundance-incompatible high-PMH pairs from
+   consuming the bounded neighbourhood.
+3. **Coverage-only edge weighting.** In the default method with `S >= 3`,
+   each candidate edge receives
+
+   $$w_{ij}=\min\{\max(\rho_{ij},0),J^{\mathrm{cov}}_{ij}\}.$$
+
+   Here `rho` is the Spearman correlation of the contigs' coverage profiles
+   across samples. `Jcov = sum_s min(x_is, x_js) / sum_s max(x_is, x_js)` is
+   weighted Jaccard on per-sample mean depths. By default, `x_is` is divided
+   by the mean depth of sample `s` across the retained large contigs, so library
+   size differences do not dominate this magnitude term. Constant rank profiles
+   have zero correlation support; an all-zero Jaccard denominator gives zero
+   support. PMH composition similarity does not enter `w`.
+
+   Edges with `w < 0.70` are dropped by default (`--min-edge-score 70`, expressed
+   as a percentage). This is a survival threshold on the coverage weight, not a
+   mixing coefficient. No edge-power transform is applied by default. The former
+   `RABBIT_W_COMP` override is ignored, with a message when it is set.
+
+   Optional coverage-metric ablations (`RABBIT_DEPTH_SIM`, `RABBIT_DEPTH_FUSE`),
+   edge-power/SNN transforms, and auxiliary GFA/SNV evidence are separate from
+   this default formula. Parameter search and certification also use coverage
+   weights for `S >= 3`; they never reintroduce composition mixing.
+
+### PMH representation validation
+
+`--validate-pmh-gold` is a terminal, gold-aware diagnostic for testing the PMH
+candidate representation independently of abundance and clustering. It samples
+large contigs under `--seed`, computes their exact sequence-only PMH top-N lists
+from the same packed winner representation used by graph construction, writes a
+TSV, and exits before constructing the production graph. Gold labels never enter
+the normal binning path.
+
+```bash
+rabbitbin bin \
+  --assembly contigs.fa \
+  --output validation/run \
+  --sketch-m 500 \
+  --seed 42 \
+  --validate-pmh-gold gold.binning \
+  --validate-pmh-queries 1000 \
+  --validate-pmh-top 400
+```
+
+The report includes candidate precision, recall against all recoverable
+same-genome contigs, the fractions of queries with at least 1, 5, and 10
+same-genome neighbours, and MRR at N = 50, 100, 200, and 400. This mode is for
+controlled evaluation only and requires CAMI/bioboxes-style gold assignments.
+
+`--audit-graph-gold` is the complementary production-path diagnostic. It loads
+gold labels only after candidate generation and abundance edge scoring, reports
+true/false candidate and retained edges plus per-contig true-neighbour coverage,
+and then lets the unchanged binning path continue. The pure-PMH and production
+reports must not be conflated: the latter also reflects the abundance-feasibility
+gate, calibrated PMH cutoff, and mutual-neighbour requirement.
 
 **Clustering**
 
@@ -161,6 +223,10 @@ Both bounds are user-settable: `--min-contig` accepts any value ≥ 1500 and
    cycles. Propagation stops after a complete round with no label changes.
 
 **Post-processing**
+
+The default refinement path is: initial coverage recruitment → singleton
+rescue → abundance-guided splitting → selective post-split recruitment →
+output-size filtering.
 
 5. **Contig recruitment** *(needs coverage)*. Unbinned large contigs, then
    small contigs, are tested against the initial bins with a length-aware
@@ -174,15 +240,19 @@ Both bounds are user-settable: `--min-contig` accepts any value ≥ 1500 and
    split accepted only when the best silhouette ≥ `--split-silhouette`
    (default 0.70). Disable with `--no-split`. Supplying `--marker-seed`
    replaces this with marker-guided splitting.
-8. **Consolidate / secondary recruit** *(needs coverage)*. Same-genome
-   fragments are merged and unbinned tails are compared with frozen bin cores
-   using co-abundance shape and TNF. Confidence is the ratio of runner-up to
-   winning cosine residuals, so absolute fit and separation form one statistic.
-   Its boundary is learned per run from actual correct and incorrect leave-one-out
-   core predictions (ROC/Youden); no fixed cosine or best-minus-second cutoff is
-   used. Paired-end support is reported as corroborating evidence but cannot
-   redirect the feature winner. Disable these stages with `RABBIT_BIN_MERGE=0`
-   and `RABBIT_BIN_RECRUIT=0`.
+   Silhouette is averaged over contigs, using a random subset of up to 600
+   contigs for large bins. Singleton observations contribute zero and remain
+   in the average. For threshold sweeps, `--resolutions` reuses the full
+   in-memory state and starts each refinement from the same pre-split bins;
+   `RB_SPLIT_AUDIT=1` writes per-parent decisions to `.split_audit.tsv`.
+8. **Selective post-split recruitment** *(needs coverage)*. The split bins at
+   least `--min-bin-size` long are frozen as cores. Remaining unbinned large
+   contigs are compared with every core using their coverage trajectories.
+   RabbitBin learns one confidence boundary per run from leave-one-out
+   predictions of existing core members using the ROC/Youden operating point,
+   then assigns only candidates above that boundary. The pass never moves an
+   already binned contig and does not merge bins. Set `RABBIT_BIN_RECRUIT=0`
+   for an ablation without this pass.
 9. **Output size filter.** Bins smaller than `--min-bin-size` (default
    200 000 bp) are not emitted.
 
@@ -190,36 +260,20 @@ The default workflow performs no marker-free subtraction/decontamination pass.
 Heterogeneous bins are handled by splitting; marker-backed purification remains
 available explicitly through `--markers ... --purify`.
 
-### Experimental split-first refinement
-
-`--simple-refinement` replaces post-processing stages 5–8 with a smaller,
-order-independent workflow:
-
-1. Split the initial large-contig bins using `log1p(coverage)`, seeded k-means
-   with multiple initializations, and the best silhouette over `K=2…6`.
-2. Reject a proposed partition in full if any child is smaller than
-   `--split-min-sub-contigs` or `--split-min-sub-bp`.
-3. Freeze the accepted, output-eligible bin cores that have at least
-   `--min-recruit-cluster` valid coverage profiles. Compute each core's mean
-   pairwise Spearman correlation once.
-4. Assign unbinned long contigs in one batch, then short contigs in a second
-   batch. Both batches compare only with the frozen cores, and a contig is
-   assigned only when exactly one core's threshold is met.
-
-This mode intentionally skips the default consolidate and secondary composition
-recruitment passes. It is available for controlled ablation; it is not the
-default quality preset.
-
-Additional single-factor ablation controls are `--fixed-core-recruitment`
-(fixed cores followed by the established refinement tail),
-`--no-singleton-rescue`, `--stable-split-kmeans`, and
-`--split-reject-small-children`. They are off by default.
-
 Off by default, all requiring an explicit flag: SCG quality annotation
 (`--qc`), purification (`--purify`), HQ-only output (`--keep-hq-only`),
 composition-based recruitment (`--recruit-cutoff`), parameter search
 (`--auto`, `--autotune`), consensus (`--ensemble`), and multi-resolution
 output (`--resolutions`).
+
+The optional graph-reuse search sweeps edge powers (`--no_gold`,
+`--auto`, `--ensemble`, `--autotune`); `--autotune` also searches split
+silhouettes. Its default powers are 1, 1.25, 1.5, 2 and 3. A custom
+`RABBIT_REUSE_SWEEP="1.0;1.5;2.0"` lists powers only; the former `alpha:power`
+syntax is rejected. Label-free modularity is measured on the fixed baseline
+coverage graph for `S >= 3` (the composition fallback for `S <= 2`). Rebuild
+candidate caches when changing graph-construction settings: cached topology is
+reused, while edge weights are recomputed.
 
 ## Outputs (`bin`)
 
@@ -242,21 +296,20 @@ output (`--resolutions`).
 | `-m, --min-contig` | 2500 | Minimum length of a clustered contig (must be ≥1500) |
 | `--min-small-contig` | 1000 | Minimum length of a recruitable short contig (must be ≥500); shorter contigs are discarded |
 | `-s, --min-bin-size` | 200000 | Minimum output bin size (bp) |
-| `--min-edge-score` | 70 | Minimum edge weight, percent (1–99) |
-| `--max-edges` | 200 | Maximum PMH neighbours per contig before mutual filtering |
+| `--min-edge-score` | 70 | Minimum edge weight, percent (2–99); coverage weight for `S >= 3` |
+| `--max-edges` | 200 | Maximum PMH neighbours per contig among production-feasible pairs, before mutual filtering |
 | `--sketch-m` | 500 | Number of ProbMinHash registers |
+| `--validate-pmh-gold` | — | Evaluate sequence-only PMH top-N neighbourhoods against CAMI gold, write TSV, and exit |
+| `--validate-pmh-queries` | 1000 | Seed-controlled labelled queries used by PMH validation |
+| `--validate-pmh-top` | 400 | Largest neighbourhood retained by PMH validation |
+| `--audit-graph-gold` | — | Audit production candidate and abundance-retained edges against CAMI gold without changing binning |
+| `--audit-graph-out` | `<output>.graph_audit.tsv` | Output TSV for `--audit-graph-gold` |
 | `--no-recruit` | off | Disable leftover/short-contig recruitment |
-| `--simple-refinement` | off | Use experimental split-first, frozen-core batch recruitment |
-| `--fixed-core-recruitment` | off | Test fixed-core recruitment while retaining the established refinement tail |
 | `--no-singleton-rescue` | off | Disable promotion of output-sized unassigned long contigs |
 | `--no-split` | off | Disable abundance-guided bin splitting |
 | `--split-silhouette` | 0.70 | Minimum mean silhouette to accept a split |
 | `--split-max-k` | 6 | Maximum sub-clusters per split bin |
-| `--split-min-sub-contigs` | 3 | In simple refinement, reject a split with a smaller child |
-| `--split-min-sub-bp` | 0 (off) | In simple refinement, reject a split with a shorter child |
 | `--split-kmeans-restarts` | 10 | K-means initializations tested for each K |
-| `--stable-split-kmeans` | off | Seed splitting from canonical bin membership rather than transient bin order |
-| `--split-reject-small-children` | off | Apply the minimum-child guards to the established splitter |
 | `--percent-identity` | 97 | Min read identity when reading BAMs |
 | `--markers` | — | Contig→marker map, required by `--qc`/`--purify`/`--auto`/`--autotune` |
 | `--qc` | off | Annotate `bins.tsv` with SCG completeness/contamination + MIMAG tier |

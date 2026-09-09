@@ -1,6 +1,20 @@
 
 set(CTEST_OUTPUT_ON_FAILURE 1)
 
+add_executable(test_silhouette test_silhouette.cpp)
+add_test(NAME test_silhouette COMMAND test_silhouette)
+
+find_package(PythonInterp 3 QUIET)
+if(PYTHONINTERP_FOUND)
+  add_test(NAME test_coverage_edges
+           COMMAND ${PYTHON_EXECUTABLE}
+                   ${CMAKE_CURRENT_SOURCE_DIR}/test_coverage_edges.py
+                   ${CMAKE_BINARY_DIR}/src/rabbitbin
+                   ${CMAKE_BINARY_DIR}/test-coverage-edges)
+else()
+  message(STATUS "Python 3 unavailable; coverage edge integration test not registered")
+endif()
+
 file(MAKE_DIRECTORY  ${CMAKE_BINARY_DIR}/test-each)
 add_test(NAME test_depths
          COMMAND ${CMAKE_BINARY_DIR}/src/rabbit_depth --referenceFasta ${CMAKE_CURRENT_SOURCE_DIR}/contigs.fa --outputDepth contigs_depth.txt ${CMAKE_CURRENT_SOURCE_DIR}/contigs-1000.fastq.bam

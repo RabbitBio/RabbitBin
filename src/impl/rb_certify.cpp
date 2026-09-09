@@ -36,19 +36,7 @@ static void certify_stability(Graph &g, const std::vector<size_t> &baseline,
       for (size_t e = 0; e < E; ++e) {
         size_t i = g.from[e], j = g.to[e];
         if (edge_is_gfa(g.sComp[e])) { g.edgeScore[e] = (StoredDistance)g_gfa_weight; continue; }
-        if (num_depth_samples <= 1) {
-          double w = (double)g.sComp[e];
-          if (g_edge_power != 1.0) w = std::pow(w, g_edge_power);
-          g.edgeScore[e] = (StoredDistance)w;
-        } else {
-          bool depth_ok;
-          double dterm = depth_edge_term(i, j, depth_ok);
-          if (!depth_ok) { g.edgeScore[e] = 0.0f; continue; }
-          double w = g_w_comp * (double)g.sComp[e] + (1.0 - g_w_comp) * dterm;
-          if (!std::isfinite(w) || w < (double)min_edge_weight) w = 0.0;
-          if (g_edge_power != 1.0 && w > 0.0) w = std::pow(w, g_edge_power);
-          g.edgeScore[e] = (StoredDistance)w;
-        }
+        g.edgeScore[e] = depth_graph_edge_score(i, j, g.sComp[e]);
       }
     } else {
       g.edgeScore = g.sComp;
@@ -83,35 +71,34 @@ static void certify_stability(Graph &g, const std::vector<size_t> &baseline,
     return mem;
   };
 
-  // Perturbation grid around the baseline (composition weight, edge power,
-  // min-edge-score, seed).  ~10 runs; clamps keep params in-range.
-  struct Cfg { double wc, ep, mew; unsigned sd; };
-  const double bwc = g_w_comp, bep = g_edge_power, bmew = (double)min_edge_weight;
+  // Perturb coverage edge power, min-edge-score and seed.  No composition
+  // mixing is introduced into any certification run.
+  struct Cfg { double ep, mew; unsigned sd; };
+  const double bep = g_edge_power, bmew = (double)min_edge_weight;
   const unsigned bsd = (unsigned)seed;
-  auto clampd = [](double x, double lo, double hi) { return x < lo ? lo : (x > hi ? hi : x); };
   std::vector<Cfg> cfgs = {
-    {clampd(bwc - 0.10, 0.0, 1.0), bep, bmew, bsd},
-    {clampd(bwc + 0.10, 0.0, 1.0), bep, bmew, bsd},
-    {bwc, bep, std::max(0.01, bmew - 0.03), bsd},
-    {bwc, bep, bmew + 0.03, bsd},
-    {bwc, (bep == 1.0 ? 1.5 : 1.0), bmew, bsd},
-    {bwc, bep, bmew, bsd * 2u + 1u},
-    {bwc, bep, bmew, bsd * 7u + 13u},
-    {clampd(bwc - 0.10, 0.0, 1.0), bep, bmew, bsd * 3u + 5u},
-    {clampd(bwc + 0.10, 0.0, 1.0), bep, bmew, bsd * 5u + 9u},
-    {bwc, bep, std::max(0.01, bmew - 0.03), bsd * 11u + 1u},
+    {bep, bmew, bsd},
+    {bep + 1.0, bmew, bsd},
+    {bep, std::max(0.01, bmew - 0.03), bsd},
+    {bep, std::min(0.99, bmew + 0.03), bsd},
+    {(bep == 1.0 ? 1.5 : 1.0), bmew, bsd},
+    {bep, bmew, bsd * 2u + 1u},
+    {bep, bmew, bsd * 7u + 13u},
+    {bep, bmew, bsd * 3u + 5u},
+    {bep, bmew, bsd * 5u + 9u},
+    {bep, std::max(0.01, bmew - 0.03), bsd * 11u + 1u},
   };
 
   std::vector<std::vector<size_t>> runs;
   runs.reserve(cfgs.size() + 6);
   for (const Cfg &cf : cfgs) {
-    g_w_comp = cf.wc; g_edge_power = cf.ep; min_edge_weight = (Similarity)cf.mew;
+    g_edge_power = cf.ep; min_edge_weight = (Similarity)cf.mew;
     compute_es();
     rebuild_incs();
     runs.push_back(run_lp(cf.sd));
   }
   // Restore baseline params before the jackknife (which keeps them fixed).
-  g_w_comp = bwc; g_edge_power = bep; min_edge_weight = (Similarity)bmew;
+  g_edge_power = bep; min_edge_weight = (Similarity)bmew;
 
   // ── Sample jackknife ──────────────────────────────────────────────────────
   // Drop one depth sample at a time, rebuild the depth-derived edge weights, and
