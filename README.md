@@ -4,10 +4,10 @@ Fast, sketch-based metagenome binning. The default RabbitBin pipeline uses
 canonical, count-weighted 4-mer ProbMinHash (PMH) sketches to construct a
 bounded mutual-nearest-neighbour candidate graph, uses abundance profiles as
 the edge evidence in the standard multi-sample setting, clusters the retained
-graph with Fisher label propagation, and then recruits short contigs and
-re-splits multi-modal bins. A final selective pass recovers remaining long
-contigs against the split, frozen bin cores. In other words, PMH proposes where
-to look; it does not by itself determine the final biological grouping.
+graph with Fisher label propagation, and re-splits multi-modal bins. One final
+coverage-based pass recruits all remaining long and short contigs against the
+split, frozen bin cores. In other words, PMH proposes where to look; it does not
+by itself determine the final biological grouping.
 
 RabbitBin uses [RabbitBAM](https://github.com/RabbitBio/RabbitBAM/tree/sortedbam)
 for parallel BAM I/O. The `sortedbam` branch provides the BAM reading, sorting,
@@ -224,17 +224,12 @@ gate, calibrated PMH cutoff, and mutual-neighbour requirement.
 
 **Post-processing**
 
-The default refinement path is: initial coverage recruitment → singleton
-rescue → abundance-guided splitting → selective post-split recruitment →
-output-size filtering.
+The default refinement path is: singleton rescue → abundance-guided splitting
+→ one selective coverage recruitment → output-size filtering.
 
-5. **Contig recruitment** *(needs coverage)*. Unbinned large contigs, then
-   small contigs, are tested against the initial bins with a length-aware
-   abundance model and assigned only when exactly one bin passes. Disable with
-   `--no-recruit`.
-6. **Singleton rescue.** Large contigs left unbinned are promoted to their own
+5. **Singleton rescue.** Large contigs left unbinned are promoted to their own
    single-contig bins, subject to the output size filter.
-7. **Abundance-guided bin splitting** *(needs coverage)*. Bins that are
+6. **Abundance-guided bin splitting** *(needs coverage)*. Bins that are
    multi-modal in per-sample log-abundance are re-split by k-means, with `k`
    chosen by mean silhouette over `k = 2 … --split-max-k` (default 6) and the
    split accepted only when the best silhouette ≥ `--split-silhouette`
@@ -245,15 +240,16 @@ output-size filtering.
    in the average. For threshold sweeps, `--resolutions` reuses the full
    in-memory state and starts each refinement from the same pre-split bins;
    `RB_SPLIT_AUDIT=1` writes per-parent decisions to `.split_audit.tsv`.
-8. **Selective post-split recruitment** *(needs coverage)*. The split bins at
-   least `--min-bin-size` long are frozen as cores. Remaining unbinned large
-   contigs are compared with every core using their coverage trajectories.
+7. **Selective post-split recruitment** *(needs coverage)*. The split bins at
+   least `--min-bin-size` long are frozen as cores. All remaining unbinned long
+   and short contigs are compared with every core using their coverage
+   trajectories.
    RabbitBin learns one confidence boundary per run from leave-one-out
    predictions of existing core members using the ROC/Youden operating point,
    then assigns only candidates above that boundary. The pass never moves an
-   already binned contig and does not merge bins. Set `RABBIT_BIN_RECRUIT=0`
-   for an ablation without this pass.
-9. **Output size filter.** Bins smaller than `--min-bin-size` (default
+   already binned contig and does not merge bins. Disable it with `--no-recruit`
+   or set `RABBIT_BIN_RECRUIT=0` for an environment-controlled ablation.
+8. **Output size filter.** Bins smaller than `--min-bin-size` (default
    200 000 bp) are not emitted.
 
 The default workflow performs no marker-free subtraction/decontamination pass.
@@ -262,9 +258,8 @@ available explicitly through `--markers ... --purify`.
 
 Off by default, all requiring an explicit flag: SCG quality annotation
 (`--qc`), purification (`--purify`), HQ-only output (`--keep-hq-only`),
-composition-based recruitment (`--recruit-cutoff`), parameter search
-(`--auto`, `--autotune`), consensus (`--ensemble`), and multi-resolution
-output (`--resolutions`).
+parameter search (`--auto`, `--autotune`), consensus (`--ensemble`), and
+multi-resolution output (`--resolutions`).
 
 The optional graph-reuse search sweeps edge powers (`--no_gold`,
 `--auto`, `--ensemble`, `--autotune`); `--autotune` also searches split
@@ -304,7 +299,7 @@ reused, while edge weights are recomputed.
 | `--validate-pmh-top` | 400 | Largest neighbourhood retained by PMH validation |
 | `--audit-graph-gold` | — | Audit production candidate and abundance-retained edges against CAMI gold without changing binning |
 | `--audit-graph-out` | `<output>.graph_audit.tsv` | Output TSV for `--audit-graph-gold` |
-| `--no-recruit` | off | Disable leftover/short-contig recruitment |
+| `--no-recruit` | off | Disable the post-split long/short-contig coverage recruitment |
 | `--no-singleton-rescue` | off | Disable promotion of output-sized unassigned long contigs |
 | `--no-split` | off | Disable abundance-guided bin splitting |
 | `--split-silhouette` | 0.70 | Minimum mean silhouette to accept a split |

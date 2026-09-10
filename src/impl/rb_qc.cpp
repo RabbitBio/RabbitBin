@@ -378,8 +378,6 @@ void rb_purify_bins(BinMap &cls) {
       return (double)depth_matrix(c, i);
     }
     size_t s = c - nobs;
-    if (!g_small_means.empty() && s * (size_t)num_depth_samples + i < g_small_means.size())
-      return (double)g_small_means[s * num_depth_samples + i];
     return (double)small_depth_matrix(s, i);
   };
   size_t n_removed = 0, n_bins_touched = 0;

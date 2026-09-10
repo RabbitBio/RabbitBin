@@ -124,7 +124,7 @@ static std::string depth_file;
 // Cache mode (Priority 2): --save-cache writes the post-graph state to disk
 // after the expensive feature construction (parse/sketch/depth/graph) and then
 // continues normally; --load-cache skips all of that and re-runs only the cheap
-// tail (edgeScore -> incidence -> label propagation -> recruit -> split ->
+// tail (edgeScore -> incidence -> label propagation -> split -> recruit ->
 // output) so parameter sweeps (min-bin-size, split-silhouette, min-edge-score,
 // etc.) cost seconds instead of a full rebuild.
 static std::string cache_save_file;
@@ -156,9 +156,6 @@ static bool no_recruit = false;
 static bool no_gold = false;
 static size_t min_small_contig =
     1000;          // minimum contig size for small contig binning
-size_t minCS = 10; // minimum cluster size for additional recruiting
-static bool recruit_to_depth_centroid = false;
-static Distance recruitSimFactor = 0.0;
 static size_t numThreads = 0;
 static Similarity calib_connected_pct = 95;
 static Similarity min_edge_weight = 60;
@@ -215,7 +212,6 @@ typedef boost::numeric::ublas::matrix_row<Matrix> MatrixRowType;
 
 static Matrix depth_matrix;
 static Matrix depth_var_matrix;
-static Matrix depth_centroids;
 static Matrix small_depth_matrix;
 
 static size_t num_depth_samples = 0;
@@ -487,8 +483,7 @@ int  rb_bin_taxon(const ContigVector &contigs);
 // duplicated single-copy markers. Operates on cls in place.
 void rb_purify_bins(BinMap &cls);
 size_t calibrate_sim_cutoff(Distance coverage = 1., bool full = false);
-double cal_depth_corr(size_t r1, size_t r2, bool second_is_small = false,
-                    bool first_is_centroid = false);
+double cal_depth_corr(size_t r1, size_t r2, bool second_is_small = false);
 // bool is_small = false, bool is_centroid = false);
 
 #endif
