@@ -352,42 +352,21 @@ static void abundance_guided_split_current(BinMap &cls) {
       g_split_sil, kept, split, dropped, dropped_children, next);
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// Every post-clustering stage answers the same question: are these two sets of
-// contigs samples of ONE genome's coverage profile?  A fixed correlation cutoff
-// answers it badly, because the correlation a set attains depends on how many
-// contigs it holds and how long they are — coverage estimated over 1 kb is far
-// noisier than over 100 kb, so a true member is penalised for being short, and a
-// large set is penalised for averaging over more noise.  Model the noise instead.
-//
-// For contig i of length L_i in sample k let y_ik = log1p(depth_ik).  Within one
-// genome
-//        y_ik ~ N( mu_k , sigma_k^2(L_i) ),   sigma_k^2(L) = a_k + b_k / L
-// a length-independent term (strain heterogeneity, GC / mappability bias) plus a
-// sampling term decaying as 1/L, because a coverage mean over L positions has
-// variance proportional to 1/L.  (a_k, b_k) are estimated from the within-bin
-// scatter of the current partition, so the noise scale is calibrated to the data
-// rather than assumed.
-//
-// With inverse-variance weights w_ik = 1/sigma_k^2(L_i) a set A has weighted mean
-// mu_Ak = (sum w_ik y_ik)/W_Ak and Var(mu_Ak) = 1/W_Ak, W_Ak = sum w_ik.  Under
-// the hypothesis that A and B come from the same genome
-//        T2(A,B) = sum_k (mu_Ak - mu_Bk)^2 / (1/W_Ak + 1/W_Bk)   ~   chi2_S
-// A single contig tested against a bin is the same expression with A = {i}, so
-// statistical recruitment reduces to one statistic against one
-// chi-square critical value.  The bar follows from the sample count S and a significance
-// level; short contigs receive exactly the wider tolerance the model implies.
-
 // Selectively attach all unassigned large and short contigs to immutable
 // output-sized cores after abundance splitting.
-// Recruitment uses coverage only, matching the coverage-driven graph weighting.
-// A leave-one-out classification of the core members supplies positive and
-// negative predictions, from which the run learns one ROC/Youden confidence
-// boundary.  No reference labels or dataset-specific cutoffs are used.
+// Recruitment uses rank-cosine coverage similarity for S>=3 and magnitude-aware
+// weighted Jaccard for S<=2.  Leave-one-out winner confidence supplies the ROC
+// classes.  If all predictions have the same outcome, paired source-core and
+// strongest-wrong-core counterfactuals supply the missing class, avoiding a
+// fixed fallback cutoff.  No reference labels are used.
+#include "rb_recruit.h"
+
 static void recruit_unbinned_to_cores(BinMap &cls, size_t floor) {
   if (!g_bin_recruit) return;
+  if (num_depth_samples < 1) return;
   const size_t samples = (size_t)num_depth_samples;
-  if (samples < 2 || g_depth_unit.size() < nobs * samples) return;
+  const bool use_rank_profiles = samples >= 3;
+  if (use_rank_profiles && g_depth_unit.size() < nobs * samples) return;
   const size_t candidate_count = nobs + nobs1;
 
   std::vector<ContigVector *> bins;
@@ -456,40 +435,78 @@ static void recruit_unbinned_to_cores(BinMap &cls, size_t floor) {
     return result;
   };
 
-  const std::vector<float> depth_norms =
-      row_norms(g_depth_unit, nobs, samples);
-  const CoreFeatures depth_cores =
-      build_core_features(g_depth_unit, depth_norms, samples);
+  std::vector<float> depth_norms;
+  CoreFeatures depth_cores;
+  std::vector<float> small_unit, small_norms;
+  if (use_rank_profiles) {
+    depth_norms = row_norms(g_depth_unit, nobs, samples);
+    depth_cores = build_core_features(g_depth_unit, depth_norms, samples);
 
-  // Short contigs were excluded from graph construction. Build their rank-based
-  // coverage vectors here so long and short candidates use the same score and
-  // the same learned confidence boundary.
-  std::vector<float> small_unit(nobs1 * samples, 0.0f);
+    // Short contigs were excluded from graph construction. Build the same
+    // centered unit-rank representation used by long contigs.
+    small_unit.assign(nobs1 * samples, 0.0f);
 #pragma omp parallel num_threads(numThreads)
-  {
-    std::vector<StoredDistance> row(samples);
+    {
+      std::vector<StoredDistance> row(samples);
 #pragma omp for schedule(static)
-    for (size_t s = 0; s < nobs1; ++s) {
-      for (size_t k = 0; k < samples; ++k)
-        row[k] = small_depth_matrix(s, k);
-      rank(row, row);
-      double mean = 0.0;
-      for (size_t k = 0; k < samples; ++k) mean += row[k];
-      mean /= (double)samples;
-      double sum_squares = 0.0;
-      for (size_t k = 0; k < samples; ++k) {
-        const double d = (double)row[k] - mean;
-        sum_squares += d * d;
+      for (size_t s = 0; s < nobs1; ++s) {
+        for (size_t k = 0; k < samples; ++k)
+          row[k] = small_depth_matrix(s, k);
+        rank(row, row);
+        double mean = 0.0;
+        for (size_t k = 0; k < samples; ++k) mean += row[k];
+        mean /= (double)samples;
+        double sum_squares = 0.0;
+        for (size_t k = 0; k < samples; ++k) {
+          const double d = (double)row[k] - mean;
+          sum_squares += d * d;
+        }
+        if (!(sum_squares > 1e-30)) continue;
+        const double inv = 1.0 / std::sqrt(sum_squares);
+        float *out = small_unit.data() + s * samples;
+        for (size_t k = 0; k < samples; ++k)
+          out[k] = (float)(((double)row[k] - mean) * inv);
       }
-      if (!(sum_squares > 1e-30)) continue;
-      const double inv = 1.0 / std::sqrt(sum_squares);
-      float *out = small_unit.data() + s * samples;
-      for (size_t k = 0; k < samples; ++k)
-        out[k] = (float)(((double)row[k] - mean) * inv);
+    }
+    small_norms = row_norms(small_unit, nobs1, samples);
+  }
+
+  auto magnitude_at = [&](size_t c, size_t k) {
+    double value = 0.0;
+    if (c < nobs) {
+      const size_t offset = c * samples + k;
+      if (offset < g_depth_raw.size())
+        value = (double)g_depth_raw[offset];
+      else if (offset < g_large_means.size())
+        value = (double)g_large_means[offset];
+      else
+        value = (double)depth_matrix(c, k);
+    } else {
+      value = (double)small_depth_matrix(c - nobs, k);
+    }
+    if (!g_depth_colnorm.empty()) value *= g_depth_colnorm[k];
+    return std::max(0.0, value);
+  };
+
+  struct MagnitudeCores {
+    std::vector<double> sums;
+    std::vector<size_t> counts;
+  } magnitude_cores;
+  if (!use_rank_profiles) {
+    magnitude_cores.sums.assign(core_count * samples, 0.0);
+    magnitude_cores.counts.assign(core_count, 0);
+    for (size_t ci = 0; ci < core_count; ++ci) {
+      double *sum = magnitude_cores.sums.data() + ci * samples;
+      for (size_t c : *bins[core_bins[ci]]) {
+        if (c >= nobs) continue;
+        double total = 0.0;
+        for (size_t k = 0; k < samples; ++k) total += magnitude_at(c, k);
+        if (!(total > 1e-30)) continue;
+        for (size_t k = 0; k < samples; ++k) sum[k] += magnitude_at(c, k);
+        ++magnitude_cores.counts[ci];
+      }
     }
   }
-  const std::vector<float> small_norms =
-      row_norms(small_unit, nobs1, samples);
 
   auto feature_cosine = [](size_t c, size_t ci,
                            const std::vector<float> &features,
@@ -514,32 +531,43 @@ static void recruit_unbinned_to_cores(BinMap &cls, size_t floor) {
     return std::max(-1.0, std::min(1.0, dot / std::sqrt(sum_squares)));
   };
 
+  auto magnitude_score = [&](size_t c, size_t ci, bool leave_self_out) {
+    size_t count = magnitude_cores.counts[ci];
+    if (leave_self_out) {
+      if (c >= nobs || count == 0)
+        return -std::numeric_limits<double>::infinity();
+      --count;
+    }
+    if (count == 0) return -std::numeric_limits<double>::infinity();
+    const double *sum = magnitude_cores.sums.data() + ci * samples;
+    double intersection = 0.0, union_sum = 0.0, contig_total = 0.0;
+    for (size_t k = 0; k < samples; ++k) {
+      const double value = magnitude_at(c, k);
+      const double core_sum = sum[k] - (leave_self_out ? value : 0.0);
+      const double centroid = std::max(0.0, core_sum / (double)count);
+      intersection += std::min(value, centroid);
+      union_sum += std::max(value, centroid);
+      contig_total += value;
+    }
+    if (!(contig_total > 1e-30) || !(union_sum > 1e-30))
+      return -std::numeric_limits<double>::infinity();
+    return intersection / union_sum;
+  };
+
   auto depth_score = [&](size_t c, size_t ci, bool leave_self_out) {
+    if (!use_rank_profiles) return magnitude_score(c, ci, leave_self_out);
     if (c >= nobs)
       return feature_cosine(c - nobs, ci, small_unit, small_norms,
                             depth_cores, false);
     return feature_cosine(c, ci, g_depth_unit, depth_norms, depth_cores,
                           leave_self_out);
   };
-  auto log_residual_ratio = [](double best, double second) {
-    if (!std::isfinite(best) || !std::isfinite(second))
-      return -std::numeric_limits<double>::infinity();
-    const double winner_distance = std::max(0.0, 1.0 - best);
-    const double runner_distance = std::max(0.0, 1.0 - second);
-    if (winner_distance == 0.0)
-      return runner_distance > 0.0
-                 ? std::numeric_limits<double>::infinity() : 0.0;
-    if (runner_distance == 0.0) return 0.0;
-    return std::log(runner_distance / winner_distance);
-  };
 
-  struct Evidence { double confidence; bool positive; };
-  std::vector<std::vector<Evidence>> evidence(core_count);
+  std::vector<std::vector<RbRecruitEvidence>> evidence(core_count);
 #pragma omp parallel for schedule(dynamic, 4) num_threads(numThreads)
   for (size_t ci = 0; ci < core_count; ++ci) {
     for (size_t c : *bins[core_bins[ci]]) {
-      if (c >= nobs || !(depth_norms[c] > 0.0f))
-        continue;
+      if (c >= nobs) continue;
       const double own = depth_score(c, ci, true);
       double best_other = -std::numeric_limits<double>::infinity();
       double second_other = -std::numeric_limits<double>::infinity();
@@ -553,20 +581,23 @@ static void recruit_unbinned_to_cores(BinMap &cls, size_t floor) {
           second_other = score;
         }
       }
-      if (!std::isfinite(second_other)) continue;
-      if (own > best_other) {
-        evidence[ci].push_back({log_residual_ratio(own, best_other), true});
-      } else if (best_other > own) {
-        evidence[ci].push_back(
-            {log_residual_ratio(best_other, std::max(own, second_other)), false});
-      }
+      RbRecruitEvidence item;
+      if (rb_make_recruit_evidence(own, best_other, second_other, item))
+        evidence[ci].push_back(item);
     }
   }
 
   std::vector<double> positives, negatives;
+  std::vector<double> fallback_positives, fallback_negatives;
   for (const auto &core_evidence : evidence)
-    for (const Evidence &item : core_evidence)
-      (item.positive ? positives : negatives).push_back(item.confidence);
+    for (const RbRecruitEvidence &item : core_evidence) {
+      if (item.outcome > 0) positives.push_back(item.winner);
+      if (item.outcome < 0) negatives.push_back(item.winner);
+      fallback_positives.push_back(item.source_counterfactual);
+      fallback_negatives.push_back(item.wrong_counterfactual);
+    }
+  if (positives.empty()) positives.swap(fallback_positives);
+  if (negatives.empty()) negatives.swap(fallback_negatives);
   if (positives.empty() || negatives.empty()) return;
 
   struct RocPoint { double value; bool positive; };
@@ -580,7 +611,9 @@ static void recruit_unbinned_to_cores(BinMap &cls, size_t floor) {
   size_t true_positive = 0, false_positive = 0;
   double boundary = std::numeric_limits<double>::infinity();
   double boundary_tpr = 0.0, boundary_fpr = 0.0;
-  double best_youden = -std::numeric_limits<double>::infinity();
+  // Include the ROC origin (reject everything, J=0). If the internally
+  // calibrated score has no positive discrimination, recruitment stays off.
+  double best_youden = 0.0;
   for (size_t i = 0; i < points.size();) {
     size_t next = i;
     while (next < points.size() && points[next].value == points[i].value) {
@@ -623,13 +656,20 @@ static void recruit_unbinned_to_cores(BinMap &cls, size_t floor) {
 #pragma omp parallel for schedule(dynamic, 256) num_threads(numThreads) \
     reduction(+:candidates,rejected)
   for (size_t c = 0; c < candidate_count; ++c) {
-    const bool has_profile = c < nobs ? depth_norms[c] > 0.0f
-                                      : small_norms[c - nobs] > 0.0f;
+    bool has_profile = false;
+    if (use_rank_profiles) {
+      has_profile = c < nobs ? depth_norms[c] > 0.0f
+                             : small_norms[c - nobs] > 0.0f;
+    } else {
+      for (size_t k = 0; k < samples; ++k)
+        has_profile = has_profile || magnitude_at(c, k) > 0.0;
+    }
     if (binned[c] || !has_profile)
       continue;
     ++candidates;
     const Choice choice = choose_core(c);
-    const double confidence = log_residual_ratio(choice.best, choice.second);
+    const double confidence =
+        rb_recruit_confidence(choice.best, choice.second);
     if (choice.core < 0 || !(confidence >= boundary)) {
       ++rejected;
       continue;
@@ -645,11 +685,12 @@ static void recruit_unbinned_to_cores(BinMap &cls, size_t floor) {
     if (c < nobs) ++recruited_large; else ++recruited_small;
   }
   verbose_message(
-      "Post-split coverage recruit (leave-one-out ROC/Youden "
-      "log residual ratio>=%.4g [TPR=%.3g,FPR=%.3g]): %zu/%zu unbinned "
+      "Post-split coverage recruit (%s, leave-one-out ROC/Youden "
+      "confidence>=%.4g [TPR=%.3g,FPR=%.3g]): %zu/%zu unbinned "
       "contigs recruited (%zu large, %zu short; %zu rejected; "
-      "calibration=%zu)\n",
+      "calibration=%zu positive/%zu negative)\n",
+      use_rank_profiles ? "rank-cosine" : "magnitude Jaccard",
       boundary, boundary_tpr, boundary_fpr, recruited, candidates,
       recruited_large, recruited_small, rejected,
-      positives.size() + negatives.size());
+      positives.size(), negatives.size());
 }

@@ -4667,7 +4667,9 @@ static int rb_cmd_bin(int ac, char *av[]) {
   // cache (g_large_means/g_depth_raw cached, depth_matrix already ranked) so it
   // is skipped entirely.
   if (!from_cache) {
-  if ((!marker_seed_file.empty() || g_split_abundance) && num_depth_samples >= 1) {
+  if ((!marker_seed_file.empty() || g_split_abundance ||
+       (g_bin_recruit && num_depth_samples <= 2)) &&
+      num_depth_samples >= 1) {
     g_large_means.assign((size_t)nobs * num_depth_samples, 0.0f);
     for (size_t r = 0; r < nobs; ++r)
       for (size_t i = 0; i < (size_t)num_depth_samples; ++i)

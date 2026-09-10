@@ -4,6 +4,9 @@ set(CTEST_OUTPUT_ON_FAILURE 1)
 add_executable(test_silhouette test_silhouette.cpp)
 add_test(NAME test_silhouette COMMAND test_silhouette)
 
+add_executable(test_recruitment test_recruitment.cpp)
+add_test(NAME test_recruitment COMMAND test_recruitment)
+
 find_package(PythonInterp 3 QUIET)
 if(PYTHONINTERP_FOUND)
   add_test(NAME test_coverage_edges
