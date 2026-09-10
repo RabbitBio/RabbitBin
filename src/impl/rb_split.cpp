@@ -47,8 +47,8 @@ static void marker_guided_split(BinMap &cls) {
     return;
   }
 
-  // Both depth_matrix and small_depth_matrix are rank-transformed in place during the pipeline,
-  // so read the raw-mean snapshots taken before those transforms.
+  // Large-contig depth is rank-transformed for graph scoring; short-contig
+  // depth remains raw until the final recruitment pass.
   auto depth_at = [&](size_t c, size_t i) -> double {
     if (c < nobs) {
       if (!g_large_means.empty() && c * (size_t)num_depth_samples + i < g_large_means.size())
@@ -56,8 +56,6 @@ static void marker_guided_split(BinMap &cls) {
       return (double)depth_matrix(c, i);
     }
     size_t s = c - nobs;
-    if (!g_small_means.empty() && s * (size_t)num_depth_samples + i < g_small_means.size())
-      return (double)g_small_means[s * num_depth_samples + i];
     return (double)small_depth_matrix(s, i);
   };
 
@@ -152,8 +150,6 @@ static void abundance_guided_split_current(BinMap &cls) {
       return (double)depth_matrix(c, i);
     }
     const size_t s = c - nobs;
-    const size_t off = s * (size_t)num_depth_samples + i;
-    if (off < g_small_means.size()) return (double)g_small_means[off];
     return (double)small_depth_matrix(s, i);
   };
   auto bin_bp = [&](const ContigVector &contigs) -> size_t {
@@ -382,164 +378,8 @@ static void abundance_guided_split_current(BinMap &cls) {
 // chi-square critical value.  The bar follows from the sample count S and a significance
 // level; short contigs receive exactly the wider tolerance the model implies.
 
-// Raw per-sample mean depth of a contig (large or small).  depth_matrix and
-// small_depth_matrix are rank-transformed in place during the pipeline, so read
-// the raw-mean snapshots taken before those transforms.
-static inline double rb_depth_at(size_t c, size_t k) {
-  const size_t S = (size_t)num_depth_samples;
-  if (c < nobs) {
-    if (!g_large_means.empty() && c * S + k < g_large_means.size())
-      return (double)g_large_means[c * S + k];
-    return (double)depth_matrix(c, k);
-  }
-  const size_t s = c - nobs;
-  if (!g_small_means.empty() && s * S + k < g_small_means.size())
-    return (double)g_small_means[s * S + k];
-  return (double)small_depth_matrix(s, k);
-}
-
-static inline double rb_contig_len(size_t c) {
-  return (double)((c < nobs) ? seq_lens[c] : small_seq_lens[c - nobs]);
-}
-
-// sigma_k^2(L) = a[k] + b[k]/L, fitted once per run.
-struct RbAbdVar {
-  std::vector<double> a, b;
-  bool ok = false;
-};
-static RbAbdVar g_abd_var;
-
-static inline double rb_abd_w(size_t c, size_t k) {
-  const double v = g_abd_var.a[k] + g_abd_var.b[k] / std::max(rb_contig_len(c), 1.0);
-  return v > 1e-12 ? 1.0 / v : 0.0;
-}
-static inline double rb_abd_y(size_t c, size_t k) {
-  return std::log1p(std::max(rb_depth_at(c, k), 0.0));
-}
-
-// Estimate (a_k, b_k) from the within-bin scatter of log-depth against 1/L.
-// Bins of the current partition act as (imperfect) samples of single genomes;
-// a single trimming pass removes the contribution of members that sit far
-// outside the fitted band, so residual cross-genome contamination in the input
-// partition does not inflate the noise scale.
-static bool rb_fit_abd_var(const BinMap &cls) {
-  const size_t S = (size_t)num_depth_samples;
-  g_abd_var.ok = false;
-  if (S < 1) return false;
-
-  std::vector<const ContigVector *> use;
-  for (auto &kv : cls) {
-    size_t n = 0;
-    for (size_t c : kv.second) if (c < nobs && ++n >= 8) break;
-    if (n >= 8) use.push_back(&kv.second);
-  }
-  if (use.empty()) return false;
-
-  constexpr size_t CAP = 128;         // members sampled per bin
-  g_abd_var.a.assign(S, 0.0);
-  g_abd_var.b.assign(S, 0.0);
-
-  // Two passes: pass 0 fits on all sampled residuals, pass 1 refits after
-  // trimming residuals above 3 sigma of the pass-0 band.
-  for (int pass = 0; pass < 2; ++pass) {
-    const int nthr = (int)std::max<size_t>(1, numThreads);
-    // Per-thread accumulators of the 2x2 normal equations, per sample.
-    std::vector<std::vector<double>> acc(nthr, std::vector<double>(S * 5, 0.0));
-#pragma omp parallel num_threads(numThreads)
-    {
-      int tid = omp_get_thread_num();
-      if (tid >= nthr) tid = nthr - 1;
-      double *A = acc[tid].data();
-      std::vector<size_t> mem;
-      std::vector<double> mu(S);
-#pragma omp for schedule(dynamic, 16)
-      for (size_t u = 0; u < use.size(); ++u) {
-        mem.clear();
-        for (size_t c : *use[u]) if (c < nobs) mem.push_back(c);
-        if (mem.size() < 8) continue;
-        if (mem.size() > CAP) {
-          const double step = (double)mem.size() / (double)CAP;
-          std::vector<size_t> s(CAP);
-          for (size_t t = 0; t < CAP; ++t) s[t] = mem[(size_t)(t * step)];
-          mem.swap(s);
-        }
-        const double n = (double)mem.size();
-        // Unbiased within-bin scatter: E[(y-mean)^2] = sigma^2 (n-1)/n.
-        const double corr = n / (n - 1.0);
-        for (size_t k = 0; k < S; ++k) {
-          double s = 0.0;
-          for (size_t c : mem) s += rb_abd_y(c, k);
-          mu[k] = s / n;
-        }
-        for (size_t c : mem) {
-          const double x = 1.0 / std::max(rb_contig_len(c), 1.0);
-          for (size_t k = 0; k < S; ++k) {
-            const double d = rb_abd_y(c, k) - mu[k];
-            const double d2 = d * d * corr;
-            if (pass == 1) {
-              const double band = g_abd_var.a[k] + g_abd_var.b[k] * x;
-              if (band > 0.0 && d2 > 9.0 * band) continue;   // >3 sigma → trim
-            }
-            double *Ak = A + k * 5;
-            Ak[0] += 1.0; Ak[1] += x; Ak[2] += x * x; Ak[3] += d2; Ak[4] += d2 * x;
-          }
-        }
-      }
-    }
-    for (size_t k = 0; k < S; ++k) {
-      double n = 0, Sx = 0, Sxx = 0, Sd = 0, Sdx = 0;
-      for (int t = 0; t < nthr; ++t) {
-        const double *Ak = acc[t].data() + k * 5;
-        n += Ak[0]; Sx += Ak[1]; Sxx += Ak[2]; Sd += Ak[3]; Sdx += Ak[4];
-      }
-      if (n < 4.0) { g_abd_var.a[k] = 1e-4; g_abd_var.b[k] = 0.0; continue; }
-      const double det = n * Sxx - Sx * Sx;
-      double a = 0.0, b = 0.0;
-      if (std::fabs(det) > 1e-30) {
-        a = (Sd * Sxx - Sdx * Sx) / det;
-        b = (n * Sdx - Sx * Sd) / det;
-      }
-      if (!(a > 0.0) || !std::isfinite(a) || !std::isfinite(b)) { a = Sd / n; b = 0.0; }
-      if (b < 0.0) b = 0.0;
-      g_abd_var.a[k] = std::max(a, 1e-6);
-      g_abd_var.b[k] = b;
-    }
-  }
-  g_abd_var.ok = true;
-  return true;
-}
-
-// Sufficient statistics of a contig set: W[k] = sum of weights, Z[k] = sum w*y.
-static inline void rb_suff_add(const ContigVector &cs, double *W, double *Z, size_t S) {
-  for (size_t c : cs) {
-    const double L = std::max(rb_contig_len(c), 1.0);
-    for (size_t k = 0; k < S; ++k) {
-      const double v = g_abd_var.a[k] + g_abd_var.b[k] / L;
-      if (!(v > 1e-12)) continue;
-      const double w = 1.0 / v;
-      W[k] += w;
-      Z[k] += w * rb_abd_y(c, k);
-    }
-  }
-}
-
-// chi2_S critical value at family-wise level alpha over n_tests comparisons
-// (Bonferroni).  alpha is a significance level, not a per-dataset constant: the
-// resulting bar adapts to the sample count and to how many comparisons the
-// stage actually performs.
-static double rb_chi2_crit(size_t S, double alpha, size_t n_tests) {
-  if (S < 1) return 0.0;
-  double q = alpha / (double)std::max<size_t>(n_tests, 1);
-  if (!(q > 0.0)) q = 1e-300;
-  if (q >= 1.0) q = std::nextafter(1.0, 0.0);
-  boost::math::chi_squared_distribution<double> d((double)S);
-  return boost::math::quantile(boost::math::complement(d, q));
-}
-
-// Family-wise significance level used by statistical recruitment.
-static double g_abd_alpha = 0.05;
-
-// Selectively attach unbinned large contigs to immutable output-sized cores.
+// Selectively attach all unassigned large and short contigs to immutable
+// output-sized cores after abundance splitting.
 // Recruitment uses coverage only, matching the coverage-driven graph weighting.
 // A leave-one-out classification of the core members supplies positive and
 // negative predictions, from which the run learns one ROC/Youden confidence
@@ -548,6 +388,7 @@ static void recruit_unbinned_to_cores(BinMap &cls, size_t floor) {
   if (!g_bin_recruit) return;
   const size_t samples = (size_t)num_depth_samples;
   if (samples < 2 || g_depth_unit.size() < nobs * samples) return;
+  const size_t candidate_count = nobs + nobs1;
 
   std::vector<ContigVector *> bins;
   bins.reserve(cls.size());
@@ -561,11 +402,11 @@ static void recruit_unbinned_to_cores(BinMap &cls, size_t floor) {
   };
 
   std::vector<size_t> core_bins;
-  std::vector<char> binned(nobs, 0);
+  std::vector<char> binned(candidate_count, 0);
   for (size_t b = 0; b < bins.size(); ++b) {
     if (bin_bp(*bins[b]) >= floor) core_bins.push_back(b);
     for (size_t c : *bins[b])
-      if (c < nobs) binned[c] = 1;
+      if (c < candidate_count) binned[c] = 1;
   }
   if (core_bins.size() < 2) return;
   const size_t core_count = core_bins.size();
@@ -576,10 +417,11 @@ static void recruit_unbinned_to_cores(BinMap &cls, size_t floor) {
     std::vector<double> norms;
   };
 
-  auto row_norms = [](const std::vector<float> &features, size_t dimension) {
-    std::vector<float> norms(nobs, 0.0f);
+  auto row_norms = [](const std::vector<float> &features, size_t rows,
+                      size_t dimension) {
+    std::vector<float> norms(rows, 0.0f);
 #pragma omp parallel for schedule(static) num_threads(numThreads)
-    for (size_t c = 0; c < nobs; ++c) {
+    for (size_t c = 0; c < rows; ++c) {
       const float *row = features.data() + c * dimension;
       double sum_squares = 0.0;
       for (size_t k = 0; k < dimension; ++k)
@@ -614,9 +456,40 @@ static void recruit_unbinned_to_cores(BinMap &cls, size_t floor) {
     return result;
   };
 
-  const std::vector<float> depth_norms = row_norms(g_depth_unit, samples);
+  const std::vector<float> depth_norms =
+      row_norms(g_depth_unit, nobs, samples);
   const CoreFeatures depth_cores =
       build_core_features(g_depth_unit, depth_norms, samples);
+
+  // Short contigs were excluded from graph construction. Build their rank-based
+  // coverage vectors here so long and short candidates use the same score and
+  // the same learned confidence boundary.
+  std::vector<float> small_unit(nobs1 * samples, 0.0f);
+#pragma omp parallel num_threads(numThreads)
+  {
+    std::vector<StoredDistance> row(samples);
+#pragma omp for schedule(static)
+    for (size_t s = 0; s < nobs1; ++s) {
+      for (size_t k = 0; k < samples; ++k)
+        row[k] = small_depth_matrix(s, k);
+      rank(row, row);
+      double mean = 0.0;
+      for (size_t k = 0; k < samples; ++k) mean += row[k];
+      mean /= (double)samples;
+      double sum_squares = 0.0;
+      for (size_t k = 0; k < samples; ++k) {
+        const double d = (double)row[k] - mean;
+        sum_squares += d * d;
+      }
+      if (!(sum_squares > 1e-30)) continue;
+      const double inv = 1.0 / std::sqrt(sum_squares);
+      float *out = small_unit.data() + s * samples;
+      for (size_t k = 0; k < samples; ++k)
+        out[k] = (float)(((double)row[k] - mean) * inv);
+    }
+  }
+  const std::vector<float> small_norms =
+      row_norms(small_unit, nobs1, samples);
 
   auto feature_cosine = [](size_t c, size_t ci,
                            const std::vector<float> &features,
@@ -642,6 +515,9 @@ static void recruit_unbinned_to_cores(BinMap &cls, size_t floor) {
   };
 
   auto depth_score = [&](size_t c, size_t ci, bool leave_self_out) {
+    if (c >= nobs)
+      return feature_cosine(c - nobs, ci, small_unit, small_norms,
+                            depth_cores, false);
     return feature_cosine(c, ci, g_depth_unit, depth_norms, depth_cores,
                           leave_self_out);
   };
@@ -742,12 +618,14 @@ static void recruit_unbinned_to_cores(BinMap &cls, size_t floor) {
     return choice;
   };
 
-  std::vector<int> assignments(nobs, -1);
+  std::vector<int> assignments(candidate_count, -1);
   size_t candidates = 0, rejected = 0;
 #pragma omp parallel for schedule(dynamic, 256) num_threads(numThreads) \
     reduction(+:candidates,rejected)
-  for (size_t c = 0; c < nobs; ++c) {
-    if (binned[c] || !(depth_norms[c] > 0.0f))
+  for (size_t c = 0; c < candidate_count; ++c) {
+    const bool has_profile = c < nobs ? depth_norms[c] > 0.0f
+                                      : small_norms[c - nobs] > 0.0f;
+    if (binned[c] || !has_profile)
       continue;
     ++candidates;
     const Choice choice = choose_core(c);
@@ -759,16 +637,19 @@ static void recruit_unbinned_to_cores(BinMap &cls, size_t floor) {
     assignments[c] = (int)core_bins[(size_t)choice.core];
   }
 
-  size_t recruited = 0;
-  for (size_t c = 0; c < nobs; ++c) {
+  size_t recruited = 0, recruited_large = 0, recruited_small = 0;
+  for (size_t c = 0; c < candidate_count; ++c) {
     if (assignments[c] < 0) continue;
     bins[(size_t)assignments[c]]->push_back(c);
     ++recruited;
+    if (c < nobs) ++recruited_large; else ++recruited_small;
   }
   verbose_message(
       "Post-split coverage recruit (leave-one-out ROC/Youden "
       "log residual ratio>=%.4g [TPR=%.3g,FPR=%.3g]): %zu/%zu unbinned "
-      "large contigs recruited (%zu rejected; calibration=%zu)\n",
-      boundary, boundary_tpr, boundary_fpr, recruited, candidates, rejected,
+      "contigs recruited (%zu large, %zu short; %zu rejected; "
+      "calibration=%zu)\n",
+      boundary, boundary_tpr, boundary_fpr, recruited, candidates,
+      recruited_large, recruited_small, rejected,
       positives.size() + negatives.size());
 }

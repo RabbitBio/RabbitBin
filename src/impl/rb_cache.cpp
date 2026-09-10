@@ -4,8 +4,8 @@
 //
 // The expensive stages — FASTA parse, PMH sketch, depth load + rank transform,
 // and the O(N^2) similarity-graph construction — produce a compact state that
-// the cheap tail (edgeScore -> incidence -> label propagation -> recruit ->
-// split -> output) consumes.  rb_write_cache() snapshots exactly that state to a
+// the cheap tail (edgeScore -> incidence -> label propagation -> split ->
+// recruit -> output) consumes.  rb_write_cache() snapshots exactly that state to a
 // little-endian binary file; rb_load_cache() restores it so a subsequent run
 // skips straight to the cheap tail under different parameters.
 //
@@ -18,8 +18,7 @@
 //
 // NOT cached (recomputed at load, kept derivable to keep the file small and
 // avoid staleness): g_depth_unit, the small-contig unit vectors, the anynz
-// cache, g_small_means (recruit rebuilds it from the raw small_depth_matrix),
-// and edgeScore / incidence (the cheap tail).  Contig sequences are likewise
+// cache, and edgeScore / incidence (the cheap tail). Contig sequences are likewise
 // not cached, so a --load-cache run emits the membership tables (the default
 // output) but not per-bin FASTA / unbinned FASTA.
 

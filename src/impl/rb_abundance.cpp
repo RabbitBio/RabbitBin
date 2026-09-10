@@ -142,10 +142,9 @@ double _cal_depth_corr(size_t r1, size_t r2, const Matrix &depth1,
   return r;
 }
 
-double cal_depth_corr(size_t r1, size_t r2, bool second_is_small,
-                    bool first_is_centroid) {
+double cal_depth_corr(size_t r1, size_t r2, bool second_is_small) {
   return _cal_depth_corr<CALC_TYPE>(r1, r2,
-                                  first_is_centroid ? depth_centroids : depth_matrix,
+                                  depth_matrix,
                                   second_is_small   ? small_depth_matrix     : depth_matrix);
 }
 
@@ -188,4 +187,3 @@ static std::string rb_unbinned_path() {
   if (!onlyLabel) p += ".fa";
   return p;
 }
-

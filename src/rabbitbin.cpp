@@ -9,7 +9,7 @@
  * (embedded in rabbit_sketch.h / probmh.h; no external sketch library).
  *
  * Pipeline: FASTA + depth TSV → sketch → graph → label propagation →
- *           recruit small contigs → optional abundance split → output bins.
+ *           abundance split → coverage recruitment → output bins.
  *
  * Tune via RABBIT_* environment variables (see README).
  */
@@ -127,10 +127,6 @@ static bool        g_no_singleton_rescue  = false; // single-factor ablation con
 static bool        g_bin_recruit          = true;
 static double      g_split_sil      = 0.70;  // silhouette threshold (RABBIT_SPLIT_SIL)
 static size_t      g_sil_sample_cap = 600;   // sample cap for O(n^2) silhouette
-// Raw per-sample mean depths of small contigs, snapshotted BEFORE small_depth_matrix is
-// rank-transformed in place during recruitment, so marker_guided_split sees the
-// same coverage values as the large-contig depth_matrix (means, not ranks).
-static std::vector<float> g_small_means;  // nobs1 × num_depth_samples (means)
 static std::vector<float> g_large_means;  // nobs  × num_depth_samples (means, pre-rank)
 
 // ── Abundance edge-similarity metric (RABBIT_DEPTH_SIM) ────────────────────
@@ -186,9 +182,6 @@ static const size_t RB_SIM_FLOOR = 50;
 
 // Per-contig KMV sketches (indexed 0..nobs-1)
 static std::vector<rabbit_sketch::KmerSketch *> g_sketches;
-
-// Per-cluster centroid sketches (indexed by cluster slot, built on demand)
-static std::vector<rabbit_sketch::KmerSketch *> g_centroids;
 
 // Contiguous signature flat array: g_sig_flat[i * g_sig_nw * g_sig_np ... ]
 // Laid out as: sketch i, plane p, word w → g_sig_flat[i*(nw*np) + p*nw + w]
@@ -3307,12 +3300,9 @@ static int rb_cmd_bin(int ac, char *av[]) {
       ("validate-pmh-top", po::value<size_t>(&g_validate_pmh_top)->default_value(400), "[--validate-pmh-gold] Largest top-N neighbourhood retained")
       ("audit-graph-gold", po::value<std::string>(&g_audit_graph_gold), "Diagnostic only: audit production candidate/retained edges against CAMI gold without affecting binning")
       ("audit-graph-out", po::value<std::string>(&g_audit_graph_out), "[--audit-graph-gold] Output TSV (default: <output>.graph_audit.tsv)")
-      ("no-recruit", po::value<bool>(&no_recruit)->zero_tokens(), "Disable small-contig recruiting")
+      ("no-recruit", po::value<bool>(&no_recruit)->zero_tokens(), "Disable post-split coverage recruitment")
       ("no-singleton-rescue", po::value<bool>(&g_no_singleton_rescue)->zero_tokens(), "Ablation: do not promote unassigned long contigs to singleton bins")
       ("no_gold", po::value<bool>(&no_gold)->zero_tokens(), "Label-free multi-resolution: sweep edge power on the reused graph, auto-select max-modularity partition (no ground truth needed)")
-      ("min-recruit-cluster", po::value<size_t>(&minCS)->default_value(10), "Min cluster size for recruiting")
-      ("recruit-abd-centroid", po::value<bool>(&recruit_to_depth_centroid)->default_value(false)->zero_tokens(), "Recruit using abundance centroid")
-      ("recruit-cutoff", po::value<Distance>(&recruitSimFactor)->default_value(0.0), "Recruit sim factor x sim-cutoff (0=off)")
       ("depth-no-variance", po::value<bool>(&cvExt)->zero_tokens(), "Depth file has no variance columns")
       ("full-header", po::value<bool>(&fullHeader)->zero_tokens(), "Keep full FASTA headers")
       ("min-coverage,x", po::value<Distance>(&minCV)->default_value(1), "Min per-sample mean coverage")
@@ -3650,7 +3640,6 @@ static int rb_cmd_bin(int ac, char *av[]) {
   // depth_future: asynchronously parse a depth file, or compute a structured
   // depth matrix from BAM. Launched before FASTA work so the two overlap.
   {
-  g_bin_recruit = has_depth && rb_env_bin_recruit();
   if (!has_depth)
     verbose_message("No --depth/--bam: composition-only binning "
                     "(abundance split/recruit disabled).\n");
@@ -3895,12 +3884,11 @@ static int rb_cmd_bin(int ac, char *av[]) {
         if (const char *e = rb_getenv("RABBIT_NOSTORE_SEQS")) return e[0] == '1';
         // Auto-drop: the stored contig bytes (≈ the whole assembly — the single
         // largest RAM consumer) are read again ONLY to write per-bin/unbinned
-        // FASTA, to feed composition-sketch recruitment, or for the RB_SEQHASH
+        // FASTA or for the RB_SEQHASH
         // debug.  When PMH winners are built during this parse and none of those
         // consumers is active, the bytes are dead weight, so we skip storing them
         // and cut peak RSS by roughly the input size.  Bit-identical results.
         return stream_pmh_mmap && noBinOut && !outUnbinned &&
-               recruitSimFactor <= 0.0 &&
                getenv("RB_SEQHASH") == nullptr &&
                !g_mge_scan &&  // --mge-scan needs sequences resident for DTR detection
                !(g_certify && g_cert_core_fasta);  // core_bins/ FASTA needs sequences
@@ -4187,11 +4175,10 @@ static int rb_cmd_bin(int ac, char *av[]) {
         // huge assemblies); forces label-only output since sequences are gone.
         if (const char *e = rb_getenv("RABBIT_NOSTORE_SEQS")) return e[0] == '1';
         // Auto-drop when sequences have no downstream consumer (no per-bin/
-        // unbinned FASTA, no composition-sketch recruit, no RB_SEQHASH) and PMH
+        // unbinned FASTA, no RB_SEQHASH) and PMH
         // winners are produced during this streaming parse — bit-identical, and
         // removes the dominant (~assembly-sized) memory cost.
         return stream_pmh && noBinOut && !outUnbinned &&
-               recruitSimFactor <= 0.0 &&
                getenv("RB_SEQHASH") == nullptr &&
                !g_mge_scan &&  // --mge-scan needs sequences resident for DTR detection
                !(g_certify && g_cert_core_fasta);  // core_bins/ FASTA needs sequences
@@ -4552,6 +4539,7 @@ static int rb_cmd_bin(int ac, char *av[]) {
   }
   }  // end else (non-cache feature construction)
   rb_phase("depth merge done");
+  g_bin_recruit = has_depth && !no_recruit && rb_env_bin_recruit();
 
   verbose_message("Number of target contigs: %d of large (>= %d) and %d of "
                   "small ones (>=%d & <%d). \n",
@@ -4648,10 +4636,10 @@ static int rb_cmd_bin(int ac, char *av[]) {
   // ── Fusion B+E: sketch update + buildSig + sig_flat copy + freeReg
   //               + abundance ranking, ALL in ONE parallel loop ─────────────
   // In weighted-ProbMinHash mode the OPH (k=21) b-bit sketch is never read
-  // (graph_sim uses the PMH winners), so skip building it entirely unless an
-  // OPH-consuming option is active (inverted index or composition-min recruitment).
+  // (graph_sim uses the PMH winners), so skip building it unless the inverted
+  // index is active.
   // This removes a full per-contig MinHash pass + 30k heap allocations.
-  const bool oph_needed = !g_pmh_mode || build_index || (recruitSimFactor > 0.0);
+  const bool oph_needed = !g_pmh_mode || build_index;
 
   g_sig_nw = (sketch_size + 63) / 64;
   g_sig_np = sketch_bits;
@@ -4736,11 +4724,7 @@ static int rb_cmd_bin(int ac, char *av[]) {
                     sig_stride * sizeof(uint64_t));                   // bits_[]→g_sig_flat
         // The inverted-index graph build re-derives keys via getKeys() (reads
         // reg_[]) at graph time, so keep reg_[] alive when indexing.
-        // Composition-based recruiting (--recruit-cutoff) likewise needs reg_[]
-        // later: it copy-constructs and merge()s these sketches into per-bin
-        // centroids, and both read reg_ directly, so freeing here left the
-        // centroid build copying from a null register array.
-        if (!build_index && recruitSimFactor <= 0.0)
+        if (!build_index)
           g_sketches[r]->freeRegisters();                             // free reg_[]
       }
 
@@ -4997,7 +4981,7 @@ static int rb_cmd_bin(int ac, char *av[]) {
       // edge_power settings, and select the partition with the highest
       // weighted modularity on the fixed coverage graph — a quality
       // signal that needs NO ground truth. The selected membership then flows
-      // into the normal recruit/split/output pipeline (no early exit), so the
+      // into the normal split/recruit/output pipeline (no early exit), so the
       // final bins are a complete, auto-resolution result.
       // Trigger: --no_gold (default grid) or RABBIT_REUSE_SWEEP="p;p;..."
       // for a custom grid. RABBIT_NO_GOLD_DUMP=1 additionally writes per-config
@@ -5255,7 +5239,7 @@ static int rb_cmd_bin(int ac, char *av[]) {
 
         // ── Selection: QC near-complete count (--auto/--ensemble) else Q ──────
         // Re-materialise the selected config's edgeScore + incidence so the
-        // downstream collect-bins / recruit / split / output stages operate on
+        // downstream collect-bins / split / recruit / output stages operate on
         // exactly the chosen partition. membership is the selected LP labelling.
         if (qc_ready) best_c = best_qc_c;
         if (qc_ready && g_autotune) {
@@ -5319,7 +5303,7 @@ static int rb_cmd_bin(int ac, char *av[]) {
         fprintf(stderr,
                 "[REUSE] SUMMARY: 1 graph build reused for %zu LP passes; "
                 "per-pass tail avg=%.1fms (total %.1fms). Selected partition "
-                "flows into recruit/split/output below.\n",
+                "flows into split/recruit/output below.\n",
                 M, tail_total / std::max<size_t>(M, 1), tail_total);
       }  // end --no_gold multi-resolution selection
 
@@ -5594,499 +5578,7 @@ static int rb_cmd_bin(int ac, char *av[]) {
       }
     } // graph g destroyed here
 
-    if (no_recruit) break;
-
-    // ── 7. Recruit lost and small contigs ─────────────────────────────────
-    std::vector<size_t> leftovers;
-    {
-      std::unordered_set<size_t> binned;
-      for (auto &kv : cls) for (auto c : kv.second) binned.insert(c);
-      for (size_t i = 0; i < nobs; ++i)
-        if (binned.find(i) == binned.end()) leftovers.push_back(i);
-    }
-
-    verbose_message("Calculating Spearman corr for small and leftover "
-                    "contigs [%.1fGb / %.1fGb]\n",
-                    getUsedPhysMem(), getTotalPhysMem() / 1024 / 1024);
-
-    // This rank-transformed copy is consumed ONLY by the abundance-centroid
-    // recruit path (recruit_to_depth_centroid, default off).  depth_matrix was
-    // already rank-transformed in place during the sketch loop, so building it
-    // unconditionally was both a redundant second ranking and a wasted nobs×S
-    // matrix in the default path.  Build it only when actually used.
-    Matrix spearman;
-    if (recruit_to_depth_centroid) {
-      // Allocated (matching the original (nobs,S) shape) whenever the centroid
-      // reader below runs, so its row access stays in-bounds even for a single
-      // depth sample.  The rank fill only applies for multi-sample depth.
-      spearman.resize(nobs, num_depth_samples);
-      if (num_depth_samples > 1) {
-#pragma omp parallel for schedule(dynamic, 1)
-        for (size_t r = 0; r < nobs; ++r) {
-          auto &rowMat = threadRowMat[omp_get_thread_num()];
-          const MatrixRowType rRow(depth_matrix, r);
-          std::copy(rRow.begin(), rRow.end(), rowMat.begin());
-          rank(rowMat, rowMat);
-          MatrixRowType sRow(spearman, r);
-          std::copy(rowMat.begin(), rowMat.end(), sRow.begin());
-        }
-      }
-    }
-    verbose_message("Calculated %d spearman corr for small and leftover "
-                    "contigs\n", nobs);
-
-    // ── Precompute centered + L2-normalised unit depth vectors ─────────────
-    // Pearson/Spearman correlation between two contigs equals the dot product
-    // of their centered+normalised depth vectors (same identity used by the
-    // abdfirst prune in build_similarity_graph).  Replacing the per-pair scalar
-    // Welford cal_depth_corr in the recruit loops below with a dot product
-    // removes the per-element divisions and the two per-pair sqrt calls.  Built
-    // only for multi-sample depth (cal_depth_corr requires num_depth_samples>1);
-    // the lambdas fall back to cal_depth_corr when the vectors are absent.
-    const uint32_t ABD_S = (uint32_t)num_depth_samples;
-    // Large-contig unit vectors already live in the global g_depth_unit (built
-    // once before the graph loop); reuse it here instead of rebuilding an
-    // identical nobs×S array.  Only the small-contig unit vectors are local.
-    std::vector<float> unit_small;
-    auto build_unit = [&](std::vector<float>& out, const Matrix& m, size_t rows) {
-      out.assign(rows * ABD_S, 0.0f);
-#pragma omp parallel for schedule(static)
-      for (size_t r = 0; r < rows; ++r) {
-        double mean = 0.0;
-        for (uint32_t k = 0; k < ABD_S; ++k) mean += m(r, k);
-        mean /= ABD_S;
-        double ss = 0.0;
-        for (uint32_t k = 0; k < ABD_S; ++k) { double d = (double)m(r, k) - mean; ss += d * d; }
-        if (ss > 0.0) {
-          const double inv = 1.0 / std::sqrt(ss);
-          float* u = out.data() + r * ABD_S;
-          for (uint32_t k = 0; k < ABD_S; ++k)
-            u[k] = (float)(((double)m(r, k) - mean) * inv);
-        }
-      }
-    };
-    // Large-large correlation: reuse the global g_depth_unit rows (identical to
-    // the old locally-rebuilt unit_large).  Kept as the original float scalar dot
-    // (NOT depth_corr_fast) so the accumulation order — and therefore every
-    // borderline recruit decision — is bit-identical to before; this commit only
-    // removes the redundant nobs×S rebuild, it must not perturb results.
-    auto dcorr_ll = [&](size_t a, size_t b) -> double {
-      if (g_depth_unit.empty()) return cal_depth_corr(a, b);
-      const float* ua = g_depth_unit.data() + a * (size_t)ABD_S;
-      const float* ub = g_depth_unit.data() + b * (size_t)ABD_S;
-      float c = 0.0f;
-      for (uint32_t k = 0; k < ABD_S; ++k) c += ua[k] * ub[k];
-      return (double)c;
-    };
-    auto dcorr_ls = [&](size_t a, size_t s) -> double {
-      if (g_depth_unit.empty() || unit_small.empty()) return cal_depth_corr(a, s, true);
-      const float* ua = g_depth_unit.data() + a * (size_t)ABD_S;
-      const float* us = unit_small.data() + s * (size_t)ABD_S;
-      float c = 0.0f;
-      for (uint32_t k = 0; k < ABD_S; ++k) c += ua[k] * us[k];
-      return (double)c;
-    };
-
-    // ── Build cluster → index mapping ─────────────────────────────────────
-    std::unordered_map<size_t, size_t> cls_id_to_idx;
-    std::vector<size_t> clsIds;
-    if (recruitSimFactor > 0.0 || recruit_to_depth_centroid) {
-      auto sz = cls.size();
-      cls_id_to_idx.reserve(sz);
-      clsIds.reserve(sz);
-      int idx = 0;
-      for (auto &[clsId, contigIds] : cls) {
-        cls_id_to_idx[clsId] = idx++;
-        clsIds.push_back(clsId);
-      }
-    }
-
-    // ── Build abundance centroids ─────────────────────────────────────────
-    if (recruit_to_depth_centroid) {
-      depth_centroids.resize(cls.size(), num_depth_samples, false);
-      verbose_message("Calculating centroid abundances of existing %d bins "
-                      "[%.1fGb / %.1fGb]\n",
-                      cls.size(), getUsedPhysMem(),
-                      getTotalPhysMem() / 1024 / 1024);
-      for (auto &[clsId, contigIds] : cls) {
-        std::vector<double> tmp_centroid(num_depth_samples, 0.0);
-        for (auto contigId : contigIds)
-          for (auto i = 0; i < (int)num_depth_samples; i++)
-            tmp_centroid[i] += spearman(contigId, i);
-        for (auto i = 0; i < (int)num_depth_samples; i++)
-          depth_centroids(cls_id_to_idx[clsId], i) = tmp_centroid[i];
-      }
-    }
-
-    // ── Build centroid sketches for composition-based recruitment ──────────
-    if (recruitSimFactor > 0.0) {
-      auto sz = cls.size();
-      g_centroids.assign(sz, nullptr);
-      verbose_message("Building centroid sketches for existing %d bins "
-                      "[%.1fGb / %.1fGb]\n",
-                      sz, getUsedPhysMem(), getTotalPhysMem() / 1024 / 1024);
-
-      assert(sz == clsIds.size());
-#pragma omp parallel for schedule(dynamic, 1)
-      for (int idx = 0; idx < (int)sz; idx++) {
-        auto &clsId     = clsIds[idx];
-        auto &contigIds = cls[clsId];
-        if (contigIds.empty()) continue;
-        // Union merge of all contig sketches in the cluster
-        rabbit_sketch::KmerSketch merged(*g_sketches[contigIds[0]]);
-        for (size_t ci = 1; ci < contigIds.size(); ++ci)
-          merged = merged.merge(*g_sketches[contigIds[ci]]);
-        g_centroids[idx] = new rabbit_sketch::KmerSketch(std::move(merged));
-      }
-      // Pre-build centroid signatures (single producer per object) before any
-      // concurrent jaccard() in the parallel recruitment loops below.
-#pragma omp parallel for schedule(dynamic)
-      for (int idx = 0; idx < (int)sz; idx++)
-        if (g_centroids[idx]) (void)g_centroids[idx]->getSignature();
-    }
-
-    // The reg_[] arrays in g_sketches (and g_centroids) are no longer needed
-    // after signatures are built: all subsequent similarity calls use bits_[].
-    // Free them now to reduce peak RSS during the recruitment/output phase.
-#pragma omp parallel for schedule(static)
-    for (int r = 0; r < (int)nobs; ++r)
-      if (g_sketches[r]) g_sketches[r]->freeRegisters();
-    for (auto *c : g_centroids)
-      if (c) c->freeRegisters();
-
-    // ── Recruit leftovers + small contigs ─────────────────────────────────
-    // Preferred path: length-calibrated abundance T2.
-    // A contig is recruited to the unique eligible bin whose coverage profile is
-    // consistent with it (T2 <= chi2 critical value).  Short contigs automatically
-    // receive a wider tolerance through sigma^2(L)=a+b/L, which is what the old
-    // "mean within-bin Spearman" threshold denied them.  The legacy unique-winner
-    // correlation path remains as a fallback when raw means are unavailable.
-    BinMap cls_leftovers;
-    BinMap cls_small;
-    const bool use_stat_recruit =
-        !g_large_means.empty() && num_depth_samples > 1 &&
-        !recruit_to_depth_centroid && recruitSimFactor <= 0.0 &&
-        !getenv("RABBIT_NO_STAT_RECRUIT");
-    bool did_stat_recruit = false;
-
-    if (use_stat_recruit && rb_fit_abd_var(cls)) {
-      const size_t ABD_Sloc = (size_t)num_depth_samples;
-      std::vector<int> recruit_clsid;
-      recruit_clsid.reserve(cls.size());
-      for (auto &kv : cls)
-        if (kv.second.size() >= minCS) recruit_clsid.push_back((int)kv.first);
-      const size_t numElig = recruit_clsid.size();
-      std::vector<double> binW(numElig * ABD_Sloc, 0.0), binZ(numElig * ABD_Sloc, 0.0);
-#pragma omp parallel for schedule(dynamic, 64)
-      for (size_t e = 0; e < numElig; ++e)
-        rb_suff_add(cls.find(recruit_clsid[e])->second,
-                    binW.data() + e * ABD_Sloc, binZ.data() + e * ABD_Sloc, ABD_Sloc);
-
-      // The hot recruit loops compare millions of contigs with thousands of
-      // eligible bins.  Convert the bin sufficient statistics once instead of
-      // repeating Z/W and 1/W for every (contig, bin, sample) triple.  Reusing
-      // the two existing arrays avoids growing the working set:
-      //   binZ -> weighted mean, binW -> inverse total weight.
-#pragma omp parallel for schedule(static)
-      for (size_t q = 0; q < numElig * ABD_Sloc; ++q) {
-        const double W = binW[q];
-        if (W > 0.0) {
-          binZ[q] /= W;
-          binW[q] = 1.0 / W;
-        } else {
-          binW[q] = 0.0;
-        }
-      }
-
-      double alpha = g_abd_alpha;
-      const double crit = rb_chi2_crit(ABD_Sloc, alpha, 1);
-      verbose_message("Stat recruit (chi2_%zu crit=%.1f alpha=%.3g): %zu eligible "
-                      "bins [%.1fGb / %.1fGb]\n",
-                      ABD_Sloc, crit, alpha, numElig,
-                      getUsedPhysMem(), getTotalPhysMem() / 1024 / 1024);
-
-      // Prepare the two contig-only terms once per contig.  Previously this
-      // work (including the costly log1p) was repeated for every eligible bin.
-      auto prepare_contig = [&](size_t c, double *y, double *v) {
-        const double L = std::max(rb_contig_len(c), 1.0);
-        for (size_t k = 0; k < ABD_Sloc; ++k) {
-          y[k] = rb_abd_y(c, k);
-          v[k] = g_abd_var.a[k] + g_abd_var.b[k] / L;
-        }
-      };
-      auto contig_bin_passes = [&](const double *y, const double *v,
-                                   size_t e) -> bool {
-        const double *invW = binW.data() + e * ABD_Sloc;
-        const double *mu   = binZ.data() + e * ABD_Sloc;
-        double t2 = 0.0;
-        for (size_t k = 0; k < ABD_Sloc; ++k) {
-          if (!(invW[k] > 0.0) || !(v[k] > 1e-12)) continue;
-          const double d = y[k] - mu[k];
-          t2 += d * d / (v[k] + invW[k]);
-          // Every term is non-negative.  Once the partial sum is over the
-          // chi-square bar this bin cannot pass, so the remaining samples are
-          // dead work.  Keep the original sample order for candidates that can
-          // pass, preserving their floating-point result exactly.
-          if (t2 > crit) return false;
-        }
-        return t2 <= crit;
-      };
-
-      verbose_message("Binning lost contigs over %d leftovers and %d bins...      "
-                      "          \n",
-                      leftovers.size(), cls.size());
-      ProgressTracker lost_progress(leftovers.size());
-#pragma omp parallel num_threads(numThreads)
-      {
-        std::vector<double> contig_y(ABD_Sloc), contig_v(ABD_Sloc);
-#pragma omp for schedule(dynamic, 64)
-        for (size_t l = 0; l < leftovers.size(); ++l) {
-          lost_progress.track();
-          if (verbose && omp_get_thread_num() == 0 && lost_progress.isStepMarker())
-            verbose_message("Finding lost contigs %s\r", lost_progress.getProgress());
-          prepare_contig(leftovers[l], contig_y.data(), contig_v.data());
-          int n_pass = 0, best_e = -1;
-          for (size_t e = 0; e < numElig; ++e) {
-            if (contig_bin_passes(contig_y.data(), contig_v.data(), e)) {
-              ++n_pass;
-              if (n_pass > 1) { best_e = -1; break; }
-              best_e = (int)e;
-            }
-          }
-          if (n_pass == 1 && best_e >= 0) {
-#pragma omp critical(ADD_LEFTOVER_CONTIGS)
-            cls_leftovers[recruit_clsid[best_e]].push_back(leftovers[l]);
-          }
-        }
-      }
-
-      if (nobs1 > 0) {
-        for (auto &a : g_small_ncand) a.store(0, std::memory_order_relaxed);
-        verbose_message("Binning %d small contigs...                              "
-                        "         \n", nobs1);
-        if ((!marker_seed_file.empty() || g_split_abundance) && num_depth_samples >= 1) {
-          g_small_means.assign(nobs1 * (size_t)num_depth_samples, 0.0f);
-          for (size_t r = 0; r < nobs1; ++r)
-            for (size_t i = 0; i < (size_t)num_depth_samples; ++i)
-              g_small_means[r * num_depth_samples + i] = (float)small_depth_matrix(r, i);
-        }
-        if (num_depth_samples > 1) {
-#pragma omp parallel for schedule(dynamic, 1)
-          for (size_t r = 0; r < small_depth_matrix.size1(); ++r) {
-            auto &rowMat = threadRowMat[omp_get_thread_num()];
-            MatrixRowType rRow(small_depth_matrix, r);
-            std::copy(rRow.begin(), rRow.end(), rowMat.begin());
-            rank(rowMat, rowMat);
-            std::copy(rowMat.begin(), rowMat.end(), rRow.begin());
-          }
-          verbose_message("Finished %d spearman corr calcs\n", small_depth_matrix.size1());
-        }
-        threadRowMat.clear();
-
-        ProgressTracker small_progress(nobs1);
-        constexpr size_t SB = 64;
-#pragma omp parallel num_threads(numThreads)
-        {
-          std::vector<double> contig_y(ABD_Sloc), contig_v(ABD_Sloc);
-#pragma omp for schedule(dynamic)
-          for (size_t s0 = 0; s0 < nobs1; s0 += SB) {
-            const size_t s1 = std::min(s0 + SB, nobs1);
-            for (size_t s = s0; s < s1; ++s) {
-              prepare_contig(s + nobs, contig_y.data(), contig_v.data());
-              int n_pass = 0, best_e = -1;
-              for (size_t e = 0; e < numElig; ++e) {
-                if (contig_bin_passes(contig_y.data(), contig_v.data(), e)) {
-                  ++n_pass;
-                  if (n_pass > 1) { best_e = -1; break; }
-                  best_e = (int)e;
-                }
-              }
-              if (g_small_prof) {
-                const int bucket = n_pass == 0 ? 0 : (n_pass == 1 ? 1 : 2);
-                g_small_ncand[bucket].fetch_add(1, std::memory_order_relaxed);
-              }
-              if (n_pass == 1 && best_e >= 0) {
-#pragma omp critical(ADD_SMALL_CONTIGS)
-                cls_small[recruit_clsid[best_e]].push_back(s + nobs);
-              }
-            }
-            small_progress.track(s1 - s0);
-            if (verbose && omp_get_thread_num() == 0 && small_progress.isStepMarker())
-              verbose_message("Binning small contigs %s\r", small_progress.getProgress());
-          }
-        }
-        if (g_small_prof) {
-          const uint64_t n0 = g_small_ncand[0].load(), n1 = g_small_ncand[1].load(),
-                         n2 = g_small_ncand[2].load();
-          const uint64_t tt = n0 + n1 + n2;
-          if (tt)
-            fprintf(stderr,
-                    "[RB_SMALL_PROF] %llu small contigs: no bin cleared %llu "
-                    "(%.1f%%), exactly one %llu (%.1f%%), ambiguous(>=2) %llu "
-                    "(%.1f%%)\n",
-                    (unsigned long long)tt, (unsigned long long)n0,
-                    100.0 * n0 / tt, (unsigned long long)n1,
-                    100.0 * n1 / tt, (unsigned long long)n2,
-                    100.0 * n2 / tt);
-        }
-      }
-      did_stat_recruit = true;
-    }
-
-    if (!did_stat_recruit) {
-      verbose_message("[Warn] Stat recruit unavailable; falling back to Spearman "
-                      "unique-winner recruit\n");
-      // Minimal fallback: keep previous fast Spearman unique-winner path by
-      // computing cls_corr + centroids.  (Full legacy body retained via env
-      // RABBIT_NO_STAT_RECRUIT only when means exist but user forces off.)
-      std::unordered_map<size_t, StoredDistance> cls_corr;
-#pragma omp parallel
-#pragma omp single
-      for (auto it = cls.begin(); it != cls.end(); ++it) {
-        size_t kk = it->first;
-        size_t cs = it->second.size();
-        if (cs >= minCS && cs < 250) {
-#pragma omp task
-          {
-            double corr = 0.;
-            const auto &c = it->second;
-            for (size_t i = 0; i < cs; ++i)
-              for (size_t j = i + 1; j < cs; ++j)
-                corr += dcorr_ll(c[i], c[j]);
-            StoredDistance x = corr / (cs * (cs - 1) / 2);
-#pragma omp critical(CALC_MEAN_CORR)
-            cls_corr[kk] = x;
-          }
-        } else if (cs >= 250) {
-          double corr = 0.;
-          const auto &c = it->second;
-#pragma omp parallel for schedule(dynamic, 1) reduction(+:corr)
-          for (size_t i = 0; i < cs; ++i)
-            for (size_t j = i + 1; j < cs; ++j)
-              corr += dcorr_ll(c[i], c[j]);
-          cls_corr[kk] = corr / (cs * (cs - 1) / 2);
-        }
-      }
-      std::vector<int> recruit_clsid;
-      std::vector<float> recruit_centroid, recruit_thresh;
-      const bool fast_recruit =
-          !recruit_to_depth_centroid && recruitSimFactor <= 0.0 &&
-          num_depth_samples > 1 && !g_depth_unit.empty();
-      if (fast_recruit) {
-        for (auto &kv : cls)
-          if (kv.second.size() >= minCS) recruit_clsid.push_back(kv.first);
-        const size_t numElig = recruit_clsid.size();
-        recruit_centroid.assign(numElig * (size_t)ABD_S, 0.0f);
-        recruit_thresh.assign(numElig, std::numeric_limits<float>::max());
-#pragma omp parallel for schedule(dynamic, 64)
-        for (size_t e = 0; e < numElig; ++e) {
-          const auto &c = cls.find(recruit_clsid[e])->second;
-          float *cen = recruit_centroid.data() + e * (size_t)ABD_S;
-          for (size_t i = 0; i < c.size(); ++i) {
-            const float *ui = g_depth_unit.data() + c[i] * (size_t)ABD_S;
-            for (uint32_t k = 0; k < ABD_S; ++k) cen[k] += ui[k];
-          }
-          const float inv = 1.0f / (float)c.size();
-          for (uint32_t k = 0; k < ABD_S; ++k) cen[k] *= inv;
-          auto itc = cls_corr.find(recruit_clsid[e]);
-          if (itc != cls_corr.end()) recruit_thresh[e] = (float)itc->second;
-        }
-      }
-#pragma omp parallel for schedule(dynamic, 1)
-      for (size_t l = 0; l < leftovers.size(); ++l) {
-        int best_cls = -1;
-        if (fast_recruit) {
-          const float *ul = g_depth_unit.data() + leftovers[l] * (size_t)ABD_S;
-          for (size_t e = 0; e < recruit_clsid.size(); ++e) {
-            const float *cen = recruit_centroid.data() + e * (size_t)ABD_S;
-            float corr = 0.0f;
-            for (uint32_t k = 0; k < ABD_S; ++k) corr += cen[k] * ul[k];
-            if (corr >= recruit_thresh[e]) {
-              if (best_cls > -1) { best_cls = -1; break; }
-              best_cls = recruit_clsid[e];
-            }
-          }
-        }
-        if (best_cls > -1) {
-#pragma omp critical(ADD_LEFTOVER_CONTIGS)
-          cls_leftovers[best_cls].push_back(leftovers[l]);
-        }
-      }
-      if (nobs1 > 0) {
-        if ((!marker_seed_file.empty() || g_split_abundance) && num_depth_samples >= 1) {
-          g_small_means.assign(nobs1 * (size_t)num_depth_samples, 0.0f);
-          for (size_t r = 0; r < nobs1; ++r)
-            for (size_t i = 0; i < (size_t)num_depth_samples; ++i)
-              g_small_means[r * num_depth_samples + i] = (float)small_depth_matrix(r, i);
-        }
-        if (num_depth_samples > 1) {
-#pragma omp parallel for schedule(dynamic, 1)
-          for (size_t r = 0; r < small_depth_matrix.size1(); ++r) {
-            auto &rowMat = threadRowMat[omp_get_thread_num()];
-            MatrixRowType rRow(small_depth_matrix, r);
-            std::copy(rRow.begin(), rRow.end(), rowMat.begin());
-            rank(rowMat, rowMat);
-            std::copy(rowMat.begin(), rowMat.end(), rRow.begin());
-          }
-        }
-        threadRowMat.clear();
-        if (num_depth_samples > 1) build_unit(unit_small, small_depth_matrix, nobs1);
-        if (fast_recruit) {
-          constexpr size_t SB = 64;
-#pragma omp parallel for schedule(dynamic)
-          for (size_t s0 = 0; s0 < nobs1; s0 += SB) {
-            const size_t s1 = std::min(s0 + SB, nobs1);
-            for (size_t s = s0; s < s1; ++s) {
-              int best_cls = -1, n_pass = 0;
-              const float *us = unit_small.data() + s * (size_t)ABD_S;
-              for (size_t e = 0; e < recruit_clsid.size(); ++e) {
-                const float *cen = recruit_centroid.data() + e * (size_t)ABD_S;
-                float corr = 0.0f;
-                for (uint32_t k = 0; k < ABD_S; ++k) corr += cen[k] * us[k];
-                if (corr >= recruit_thresh[e]) {
-                  ++n_pass;
-                  if (n_pass > 1) { best_cls = -1; break; }
-                  best_cls = recruit_clsid[e];
-                }
-              }
-              if (best_cls > -1) {
-#pragma omp critical(ADD_SMALL_CONTIGS)
-                cls_small[best_cls].push_back(s + nobs);
-              }
-            }
-          }
-        }
-      }
-    }
-
-    for (auto it = cls_leftovers.begin(); it != cls_leftovers.end(); ++it) {
-      size_t kk = it->first;
-      auto &add = it->second;
-      std::sort(add.begin(), add.end());
-      cls[kk].insert(cls[kk].end(), add.begin(), add.end());
-    }
-
-    // Apply small contig recruits.  Each contig already passed a per-contig
-    // consistency test; no global base-fraction cap.
-    unsigned long long added_sum = 0;
-    for (auto it = cls_small.begin(); it != cls_small.end(); ++it) {
-      size_t kk = it->first;
-      auto &add = it->second;
-      std::sort(add.begin(), add.end());
-      for (auto c : add) added_sum += small_seq_lens[c - nobs];
-      cls[kk].insert(cls[kk].end(), add.begin(), add.end());
-    }
-    if (added_sum > 0 && totalSize1 > 0)
-      verbose_message("Recruited %lld bases (%.2f%%) of small (<%d) contigs\n",
-                      added_sum, 100.0 * (double)added_sum / (double)totalSize1,
-                      (int)minContig);
-
   } while (false);
-  rb_phase("recruit done");
-
-  // Release centroid sketches
-  for (auto *p : g_centroids) delete p;
-  g_centroids.clear();
 
   // Release per-contig sketches (if not already released above)
   for (auto *p : g_sketches) delete p;
@@ -6120,7 +5612,7 @@ static int rb_cmd_bin(int ac, char *av[]) {
     rb_phase("  split: abundance");
     if (g_bin_recruit) {
       recruit_unbinned_to_cores(c, min_bin_bp);
-      rb_phase("  recruit: post-split cores");
+      rb_phase("  recruit: long+short post-split cores");
     }
     if (g_purify) {
       verbose_message("Contamination-aware purification...\n");
