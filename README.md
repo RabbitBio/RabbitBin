@@ -13,10 +13,6 @@ RabbitBin uses [RabbitBAM](https://github.com/RabbitBio/RabbitBAM/tree/sortedbam
 for parallel BAM I/O. The `sortedbam` branch provides the BAM reading, sorting,
 and indexing modules.
 
-RabbitBin uses [RabbitBAM](https://github.com/RabbitBio/RabbitBAM/tree/sortedbam)
-for parallel BAM I/O. The `sortedbam` branch provides the BAM reading, sorting,
-and indexing modules.
-
 | Command | What it does |
 |---------|--------------|
 | `rabbitbin bin`    | Bin contigs into genomes (the main pipeline) |
@@ -243,12 +239,25 @@ The default refinement path is: singleton rescue → abundance-guided splitting
 7. **Selective post-split recruitment** *(needs coverage)*. The split bins at
    least `--min-bin-size` long are frozen as cores. All remaining unbinned long
    and short contigs are compared with every core using their coverage
-   trajectories.
-   RabbitBin learns one confidence boundary per run from leave-one-out
-   predictions of existing core members using the ROC/Youden operating point,
-   then assigns only candidates above that boundary. The pass never moves an
-   already binned contig and does not merge bins. Disable it with `--no-recruit`
-   or set `RABBIT_BIN_RECRUIT=0` for an environment-controlled ablation.
+   trajectories. RabbitBin rank-transforms and normalizes each coverage profile,
+   represents each core by the normalized sum of its member profiles, and uses
+   cosine similarity to score contig-core matches (equivalent to correlation on
+   ranks for individual profiles). If the best and second-best core scores are
+   `s_best` and `s_second`, the recruitment confidence is
+
+   $$C=\log\frac{1-s_{\mathrm{second}}}{1-s_{\mathrm{best}}}.$$
+
+   RabbitBin learns one acceptance boundary per run without reference labels.
+   Each existing core member is temporarily left out of its own centroid and
+   classified against the frozen cores. A return to its source core supplies a
+   positive prediction; a different winning core supplies a negative
+   prediction. The resulting confidence values form an internal ROC curve, and
+   RabbitBin selects the boundary that maximizes Youden's
+   `J = TPR - FPR`. An unassigned contig is recruited into its best-scoring core
+   only when `C` reaches that boundary. The same learned boundary and scoring
+   rule are used for long and short contigs. This pass never moves an already
+   binned contig and does not merge bins. Disable it with `--no-recruit` or set
+   `RABBIT_BIN_RECRUIT=0` for an environment-controlled ablation.
 8. **Output size filter.** Bins smaller than `--min-bin-size` (default
    200 000 bp) are not emitted.
 
