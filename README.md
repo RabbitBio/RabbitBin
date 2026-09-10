@@ -220,11 +220,12 @@ gate, calibrated PMH cutoff, and mutual-neighbour requirement.
 
 **Post-processing**
 
-The default refinement path is: singleton rescue → abundance-guided splitting
-→ one selective coverage recruitment → output-size filtering.
+The default refinement path is: singleton output safeguard → abundance-guided
+splitting → one selective coverage recruitment → output-size filtering.
 
-5. **Singleton rescue.** Large contigs left unbinned are promoted to their own
-   single-contig bins, subject to the output size filter.
+5. **Singleton output safeguard.** Before splitting, an unassigned large contig
+   that is itself at least `--min-bin-size` long is retained as a single-contig
+   bin. This is an output safeguard, not a recruitment pass.
 6. **Abundance-guided bin splitting** *(needs coverage)*. Bins that are
    multi-modal in per-sample log-abundance are re-split by k-means, with `k`
    chosen by mean silhouette over `k = 2 … --split-max-k` (default 6) and the
@@ -239,25 +240,34 @@ The default refinement path is: singleton rescue → abundance-guided splitting
 7. **Selective post-split recruitment** *(needs coverage)*. The split bins at
    least `--min-bin-size` long are frozen as cores. All remaining unbinned long
    and short contigs are compared with every core using their coverage
-   trajectories. RabbitBin rank-transforms and normalizes each coverage profile,
-   represents each core by the normalized sum of its member profiles, and uses
-   cosine similarity to score contig-core matches (equivalent to correlation on
-   ranks for individual profiles). If the best and second-best core scores are
-   `s_best` and `s_second`, the recruitment confidence is
+   trajectories. With at least three samples, RabbitBin rank-transforms and
+   normalizes each coverage profile, represents each core by the normalized sum
+   of its member profiles, and uses cosine similarity to score contig-core
+   matches (equivalent to correlation on ranks for individual profiles). With
+   one or two samples, for which rank correlation is undefined or nearly binary,
+   it instead uses weighted Jaccard between the contig's normalized raw coverage
+   and the core's mean coverage, preserving abundance magnitude. If the best and
+   second-best core scores are `s_best` and `s_second`, the recruitment
+   confidence is
 
    $$C=\log\frac{1-s_{\mathrm{second}}}{1-s_{\mathrm{best}}}.$$
 
    RabbitBin learns one acceptance boundary per run without reference labels.
    Each existing core member is temporarily left out of its own centroid and
-   classified against the frozen cores. A return to its source core supplies a
-   positive prediction; a different winning core supplies a negative
-   prediction. The resulting confidence values form an internal ROC curve, and
-   RabbitBin selects the boundary that maximizes Youden's
+   classified against the frozen cores. Correct returns to the source core and
+   incorrect returns to another core supply the positive and negative confidence
+   distributions. Only the best other core is required, so calibration also
+   works with exactly two cores. If one outcome class is absent, RabbitBin uses
+   the paired source-core and strongest-wrong-core counterfactual scores from
+   the same leave-one-out members to supply that class instead of applying a
+   fixed cutoff. The resulting values form an internal ROC curve, and RabbitBin
+   selects the boundary that maximizes Youden's
    `J = TPR - FPR`. An unassigned contig is recruited into its best-scoring core
-   only when `C` reaches that boundary. The same learned boundary and scoring
-   rule are used for long and short contigs. This pass never moves an already
-   binned contig and does not merge bins. Disable it with `--no-recruit` or set
-   `RABBIT_BIN_RECRUIT=0` for an environment-controlled ablation.
+   only when its confidence reaches that boundary. The same learned boundary
+   and scoring rule are used for long and short contigs. This pass
+   never moves an already binned contig and does not merge bins. Disable it with
+   `--no-recruit` or set `RABBIT_BIN_RECRUIT=0` for an environment-controlled
+   ablation.
 8. **Output size filter.** Bins smaller than `--min-bin-size` (default
    200 000 bp) are not emitted.
 
