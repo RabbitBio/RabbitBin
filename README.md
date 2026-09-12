@@ -152,9 +152,8 @@ Both bounds are user-settable: `--min-contig` accepts any value ≥ 1500 and
    final edge threshold. PMH similarity then retains at most `--max-edges`
    (default 200) neighbours per contig from the feasible pairs. The production
    candidate graph keeps a pair only when the neighbour relation is mutual.
-   No absolute PMH similarity cutoff is applied. This order prevents
-   abundance-incompatible high-PMH pairs from consuming the bounded
-   neighbourhood.
+   This order prevents abundance-incompatible high-PMH pairs from consuming
+   the bounded neighbourhood.
 3. **Coverage-only edge weighting.** In the default method with `S >= 3`,
    each candidate edge receives
 
