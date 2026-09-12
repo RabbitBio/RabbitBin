@@ -92,8 +92,8 @@ def main():
     work.mkdir(parents=True, exist_ok=True)
     env = {k: v for k, v in os.environ.items()
            if not k.startswith(("RABBIT_", "RB_", "OMP_"))}
-    # A low manual candidate cutoff and uncorrected PMH keep the small fixture's
-    # candidate pairs visible, including negative and zero coverage support.
+    # Uncorrected PMH keeps the small fixture's candidate pairs visible,
+    # including negative and zero coverage support.
     env["RABBIT_PMH_BASE"] = "0"
     rng = random.Random(42)
     sequence = "".join(rng.choice("ACGT") for _ in range(3200))
@@ -122,7 +122,7 @@ def main():
         dump = work / f"{label}.pairs.tsv"
         cmd = [str(binary), "bin", "--output", str(prefix), "--seed", "42",
                "--threads", str(threads), "--min-bin-size", "0", "--no-recruit",
-               "--no-split", "--no-bin-fasta", "--sim-cutoff", "1"]
+               "--no-split", "--no-bin-fasta"]
         if cache:
             cmd += ["--load-cache", str(cache)]
         else:

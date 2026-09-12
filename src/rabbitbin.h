@@ -157,9 +157,7 @@ static bool no_gold = false;
 static size_t min_small_contig =
     1000;          // minimum contig size for small contig binning
 static size_t numThreads = 0;
-static Similarity calib_connected_pct = 95;
 static Similarity min_edge_weight = 60;
-static Similarity simCutoff = 0;
 static Distance minCV = 1.0;
 static Distance minCVSum = 1;
 static bool saveCls = false;
@@ -296,7 +294,7 @@ public:
   }
 };
 
-void build_similarity_graph(Graph &g, Similarity cutoff);
+void build_similarity_graph(Graph &g);
 
 static void trim_fasta_label(std::string &label) {
   size_t pos = label.find_first_of(" \t");
@@ -482,7 +480,6 @@ int  rb_bin_taxon(const ContigVector &contigs);
 // SCG-contamination-aware purification: drop depth-outlier contigs that carry
 // duplicated single-copy markers. Operates on cls in place.
 void rb_purify_bins(BinMap &cls);
-size_t calibrate_sim_cutoff(Distance coverage = 1., bool full = false);
 double cal_depth_corr(size_t r1, size_t r2, bool second_is_small = false);
 // bool is_small = false, bool is_centroid = false);
 

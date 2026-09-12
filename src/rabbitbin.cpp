@@ -176,10 +176,6 @@ static std::vector<StoredDistance> g_cache_scomp;
 static unsigned long long          g_cache_seed = 0;
 static bool                        g_cache_has_depth = false;
 
-// Minimum similarity floor (×1000) used during auto-calibration.
-// Sketch Jaccard on short metagenomic contigs typically spans 0–0.3.
-static const size_t RB_SIM_FLOOR = 50;
-
 // Per-contig KMV sketches (indexed 0..nobs-1)
 static std::vector<rabbit_sketch::KmerSketch *> g_sketches;
 
@@ -193,8 +189,8 @@ static uint32_t g_sig_np = 0;  // bit-planes per sketch (b_)
 static uint32_t g_sig_m  = 0;  // m_ (bucket count)
 
 // ── Weighted ProbMinHash4 path (RABBIT_PMH=1) ─────────────────────────────
-// When enabled, the large-contig similarity graph + sim-cutoff auto-calibration
-// use a frequency-weighted ProbMinHash4 sketch (small k, k-mer counts as weights)
+// When enabled, the large-contig similarity graph uses a frequency-weighted
+// ProbMinHash4 sketch (small k, k-mer counts as weights)
 // instead of the OPH b-bit signature.  This estimates the weighted Jaccard
 // Σmin(wA,wB)/Σmax(wA,wB) over the small-k composition spectrum.
 //
@@ -210,7 +206,6 @@ static uint64_t g_pmh_seed = 42;
 // the PMH phase and the sketch setup to skip g_win_flat re-allocation.
 static bool     g_pmh_built_streaming = false;
 static std::vector<uint32_t> g_win_flat;  // nobs × g_pmh_m winner identities (folded 64→32-bit, for SIMD sim kernel)
-static std::vector<uint64_t> g_win64_flat; // nobs × g_pmh_m full 64-bit winners (for inverted-index key lookup)
 // 16-bit packed winners (default kernel input): each 32-bit folded winner is
 // XOR-folded to 16 bits.  Halves the (post-seq-drop dominant) winner array and
 // lets the SIMD match kernel compare 32 lanes/AVX-512 op.  The extra 1/65536
@@ -423,7 +418,7 @@ static double rb_env_neg_depth_thr() {
 // Shared-nearest-neighbour reinforcement uses local graph structure as an
 // independent support signal for an edge.
 // RABBIT_SNN=1 reweights each surviving edge by w' = w * (jaccard(N_i,N_j))^p
-// where N are the endpoints' neighbour sets on the SURVIVING (post-cutoff) graph
+// where N are the endpoints' neighbour sets on the surviving weighted graph
 // and p = RABBIT_SNN_POW (default 0.5, a geometric-mean-style blend). This has
 // It is a monotone reshaping of existing weights by a quantity computed from the
 // graph itself and only down-weights structurally unsupported edges.
@@ -1255,7 +1250,7 @@ static inline double pmh_sim_rows(const uint32_t *__restrict__ a,
 // Estimate the chance-collision baseline b0 = median raw winner-match over
 // random (mostly unrelated) contig pairs.  With ~10^3 genomes the chance two
 // random contigs share a genome is <1%, so the median is firmly the unrelated
-// mode.  Cheap (sampled), called once before calibration.
+// mode. Cheap (sampled), called once before graph construction.
 // Forward declaration needed by estimate_pmh_baseline (defined below graph_sim)
 static inline double k4_cosine_sim(const float * __restrict__ a,
                                    const float * __restrict__ b);
@@ -1320,8 +1315,8 @@ static inline double k4_cosine_sim(const float * __restrict__ a,
   return (s < 0.0) ? 0.0 : (s > 1.0) ? 1.0 : s;
 }
 
-// Unified pairwise similarity dispatcher used by calibration + the all-pairs
-// graph build.  Selects the weighted-ProbMinHash winners path (RABBIT_PMH=1),
+// Unified pairwise similarity dispatcher used by graph construction. Selects
+// the weighted-ProbMinHash winners path (RABBIT_PMH=1),
 // exact k=4 cosine similarity (RABBIT_EXACT_COS=1), or the default OPH path.
 static inline double graph_sim(size_t i, size_t j) {
   if (g_exact_cos_cmp && !g_k4cosine_flat.empty()) {
@@ -1515,13 +1510,6 @@ static void build_pmh_winners(const char *seq, size_t len, int k, uint32_t m,
 // Nullptr when not in use (default: all-pairs path).
 static std::unique_ptr<rabbit_invidx::InvertedIndex> g_inv_idx;
 
-// PMH-winner inverted index (RABBIT_PMH=1, default ON).
-// Key = ((uint64_t)register_pos << 32) | folded_winner_32bit.
-// Collision count between two contigs = PMH match numerator → raw_sim = count/m.
-// Built inline during sketch loop, used for both calibration and graph build.
-// Eliminates both O(N²) calibration sweeps and the all-pairs graph scan.
-static std::unique_ptr<rabbit_invidx::InvertedIndex> g_pmh_idx;
-
 // ── OMP reduction operators (must be visible before parallel loops) ───────
 #pragma omp declare reduction (merge_size_t : std::vector<size_t> : omp_out.insert(omp_out.end(), omp_in.begin(), omp_in.end()) )
 #pragma omp declare reduction (merge_graphnode : std::vector<GraphNodeId> : omp_out.insert(omp_out.end(), omp_in.begin(), omp_in.end()) )
@@ -1690,9 +1678,7 @@ static void rb_write_certification(
 bool is_nz(size_t r1, size_t r2);
 static void build_anynz_cache();
 std::istream &safeGetline(std::istream &is, std::string &t);
-size_t   calibrate_sim_cutoff(Distance coverage, bool full);
-static Distance calibrate_sim_cutoff_fused(Distance coverage);
-static Distance gen_fused_calib_graph(Graph &g, Distance coverage);
+static void gen_fused_graph(Graph &g);
 
 // ═══════════════════════════════════════════════════════════════════════════
 // filesize  (unchanged)
@@ -3270,7 +3256,6 @@ static int rb_cmd_bin(int ac, char *av[]) {
       ("add-depth", po::value<std::string>(&g_add_depth_file), "Incremental multi-sample: with --load-cache, append this depth file's samples as NEW samples on the cached composition graph (no re-sketch)")
       ("min-contig,m", po::value<size_t>(&minContig)->default_value(2500), "Minimum contig length (>=1500)")
       ("min-small-contig", po::value<size_t>(&min_small_contig)->default_value(1000), "Min length for small-contig recruiting")
-      ("max-posterior", po::value<Similarity>(&calib_connected_pct)->default_value(95), "Well-connected contig percent for calibration")
       ("min-edge-score", po::value<Similarity>(&min_edge_weight)->default_value(70), "Minimum edge weight (2-99, percent); coverage only for >=3 samples. Default 70.")
       ("gfa", po::value<std::string>(&g_gfa_file), "Assembly graph (GFA) whose L-links/P-paths are injected as high-weight same-genome edges")
       ("gfa-weight", po::value<double>(&g_gfa_weight)->default_value(0.90), "Edge weight assigned to GFA links (0,1)")
@@ -3290,7 +3275,6 @@ static int rb_cmd_bin(int ac, char *av[]) {
       ("cert-fraction", po::value<double>(&g_cert_frac_thr)->default_value(0.80), "[--certify] Min stable-core length fraction to certify a bin")
       ("cert-core-fasta", po::value<bool>(&g_cert_core_fasta)->zero_tokens(), "[--certify] Also write each certified bin's stable-core contigs to <prefix>.core_bins/ (keeps sequences in RAM)")
       ("max-edges", po::value<size_t>(&maxEdges)->default_value(200), "Max neighbors per contig")
-      ("sim-cutoff", po::value<Similarity>(&simCutoff)->default_value(0), "Composition similarity cutoff x100 (0=auto)")
       ("sketch-k", po::value<int>(&sketch_kmer_size)->default_value(8), "Sketch k-mer size")
       ("sketch-m", po::value<uint32_t>(&sketch_size)->default_value(500), "Sketch size (PMH registers)")
       ("sketch-b", po::value<uint32_t>(&sketch_bits)->default_value(2), "MinHash bucket bits")
@@ -3478,14 +3462,8 @@ static int rb_cmd_bin(int ac, char *av[]) {
   if (seed == 0) seed = time(0);
   srand(seed);
 
-  if (calib_connected_pct <= 0 || calib_connected_pct >= 100) {
-    cerr << "[Error!] calib_connected_pct should be > 0 and < 100\n"; return 1;
-  }
   if (min_edge_weight <= 1 || min_edge_weight >= 100) {
     cerr << "[Error!] min_edge_weight should be > 1 and < 100\n"; return 1;
-  }
-  if (simCutoff < 0 || simCutoff >= 100) {
-    cerr << "[Error!] --sim-cutoff should be >= 0 and < 100\n"; return 1;
   }
   if (minContig < 1500) {
     cerr << "[Error!] Contig length < 1500 is not allowed.\n"; return 1;
@@ -3538,12 +3516,12 @@ static int rb_cmd_bin(int ac, char *av[]) {
   }
 
   print_message("RabbitBin (%s) using minContig %d, minCV %2.1f, "
-                "minCVSum %2.1f, calib_connected_pct %2.0f%%, min_edge_weight %2.0f, maxEdges %d, "
+                "minCVSum %2.1f, min_edge_weight %2.0f, maxEdges %d, "
                 "min_bin_bp %d, sketch-k %d, sketch-m %d, seed=%lld\n",
-                version.c_str(), minContig, minCV, minCVSum, calib_connected_pct, min_edge_weight,
+                version.c_str(), minContig, minCV, minCVSum, min_edge_weight,
                 maxEdges, min_bin_bp, sketch_kmer_size, sketch_size, seed);
 
-  calib_connected_pct /= 100.;  min_edge_weight /= 100.;
+  min_edge_weight /= 100.;
 
   // Thread count: honor the user's explicit `-t N`, capping only to the number
   // of CPUs physically online on the host. We deliberately IGNORE the OMP-based
@@ -4590,12 +4568,6 @@ static int rb_cmd_bin(int ac, char *av[]) {
   g_gc_norm     = rb_env_gc_norm();
   g_gc_norm_cap = [] { const char *e = rb_getenv("RABBIT_GC_NORM_CAP"); double v = e ? std::atof(e) : 20.0;
                        return (v < 1.0) ? 20.0 : v; }();
-  // PMH winner-identity inverted index: a diagnostic-only structure (the graph
-  // build uses the all-pairs SIMD kernel, not the index — see the reset at the
-  // end of the sketch section).  Building it costs the full 64-bit winner array
-  // + ~m hash-map insertions per contig, all immediately discarded, so it is
-  // OFF unless RABBIT_PMH_INDEX is set.
-  const bool pmh_index_on = g_pmh_mode && !from_cache && (getenv("RABBIT_PMH_INDEX") != nullptr);
   if (g_pmh_mode && !from_cache) {
     g_pmh_m    = sketch_size;
     g_inv_pmh_m = (g_pmh_m > 0) ? (1.0 / (double)g_pmh_m) : 0.0;
@@ -4608,12 +4580,6 @@ static int rb_cmd_bin(int ac, char *av[]) {
                       g_win_flat.size() / g_pmh_m);
     } else {
       g_win_flat.assign((size_t)nobs * g_pmh_m, 0u);
-      // Full 64-bit winners are ONLY needed to feed the (diagnostic, off-by-
-      // default) PMH inverted index.  The similarity kernel uses the 32-bit
-      // folded winners in g_win_flat, so skip the 64-bit array (≈8 B/register ×
-      // nobs × m — e.g. ~300 MB on plant) unless the index is explicitly asked
-      // for.  See pmh_index_on below.
-      if (pmh_index_on) g_win64_flat.assign((size_t)nobs * g_pmh_m, 0ULL);
     }
     verbose_message("RABBIT_PMH=1: weighted ProbMinHash4 graph metric "
                     "(k=%d, m=%u, count-weighted Jaccard, baseline_corr=%d)\n",
@@ -4624,13 +4590,6 @@ static int rb_cmd_bin(int ac, char *av[]) {
   std::unique_ptr<rabbit_invidx::InvertedIndexBuilder> idx_builder;
   if (build_index)
     idx_builder = std::make_unique<rabbit_invidx::InvertedIndexBuilder>(
-        (int)numThreads);
-
-  // PMH-winner inverted index builder (RABBIT_PMH_INDEX only; see pmh_index_on).
-  // Built in the same parallel loop — no extra pass over seqs[].
-  std::unique_ptr<rabbit_invidx::InvertedIndexBuilder> pmh_idx_builder;
-  if (pmh_index_on)
-    pmh_idx_builder = std::make_unique<rabbit_invidx::InvertedIndexBuilder>(
         (int)numThreads);
 
   // ── Fusion B+E: sketch update + buildSig + sig_flat copy + freeReg
@@ -4656,7 +4615,6 @@ static int rb_cmd_bin(int ac, char *av[]) {
   // Per-thread reusable k-mer code buffer for the weighted ProbMinHash path.
   std::vector<std::vector<uint64_t>> threadPmhScratch(numThreads);
   // Per-thread key buffer for the PMH winner inverted index.
-  std::vector<std::vector<uint64_t>> threadPmhKeys(numThreads);
 
   g_sketches.resize(nobs, nullptr);
 
@@ -4737,19 +4695,9 @@ static int rb_cmd_bin(int ac, char *av[]) {
       if (g_pmh_mode && !g_pmh_built_streaming) {
         const int tid = omp_get_thread_num();
         uint32_t *wrow32 = g_win_flat.data() + (size_t)r * g_pmh_m;
-        if (pmh_index_on) {
-          uint64_t *wrow64 = g_win64_flat.data() + (size_t)r * g_pmh_m;
-          build_pmh_winners(seqs[r].data(), seqs[r].size(), g_pmh_k, g_pmh_m,
-                            g_pmh_seed, wrow32, threadPmhScratch[tid],
-                            wrow64, &threadPmhKeys[tid]);
-          for (uint64_t key : threadPmhKeys[tid])
-            pmh_idx_builder->insert(tid, key, (uint32_t)r);
-        } else {
-          // Default: only the 32-bit folded winners (consumed by the kernel).
-          build_pmh_winners(seqs[r].data(), seqs[r].size(), g_pmh_k, g_pmh_m,
-                            g_pmh_seed, wrow32, threadPmhScratch[tid],
-                            /*out64=*/nullptr, /*out_keys=*/nullptr);
-        }
+        build_pmh_winners(seqs[r].data(), seqs[r].size(), g_pmh_k, g_pmh_m,
+                          g_pmh_seed, wrow32, threadPmhScratch[tid],
+                          /*out64=*/nullptr, /*out_keys=*/nullptr);
       }
 
       // ── Spearman ranking (Fusion E): rank depth_matrix[r] in-place per thread
@@ -4780,15 +4728,6 @@ static int rb_cmd_bin(int ac, char *av[]) {
                     "[%.1fGb / %.1fGb]\n",
                     g_inv_idx->totalPostings, g_inv_idx->postIdx.size(),
                     getUsedPhysMem(), getTotalPhysMem() / 1024 / 1024);
-  }
-
-  // The PMH-winner inverted index (RABBIT_PMH_INDEX) is diagnostic only: the
-  // graph build uses the all-pairs SIMD kernel, not the index (small-k → dense
-  // postings → all-pairs is faster), so free the builder + 64-bit winners now.
-  // When the index is off (default) neither was ever allocated.
-  if (pmh_idx_builder) {
-    pmh_idx_builder.reset();  // free builder thread-maps; index not needed
-    g_win64_flat.clear(); g_win64_flat.shrink_to_fit(); // not queried at run time
   }
 
   rb_phase("comp sketch loop done");
@@ -4839,8 +4778,8 @@ static int rb_cmd_bin(int ac, char *av[]) {
     }
   }
 
-  // Estimate the winner-match baseline b0 before calibration so that both the
-  // pSim auto-calibration and the graph edge weights see the stretched scale.
+  // Estimate the winner-match baseline b0 before graph construction so that
+  // composition similarities use the corrected scale.
   // In --load-cache mode b0 (and g_inv_one_minus_b0) were restored from the
   // cache, and the winner array is gone, so skip re-estimation.
   if (g_pmh_mode && g_pmh_base_on && !from_cache) {
@@ -4919,39 +4858,20 @@ static int rb_cmd_bin(int ac, char *av[]) {
     {
       Graph g(nobs);
 
-      // ── 1+2. Fusion D: single O(N²/2) pass for calib + graph ───────────
-      // For PMH mode with auto-calibration and large N, one tiled pass
-      // simultaneously accumulates calibration maxsim[] and per-contig
-      // neighbor heaps, then calibrates, then emits edges.
-      // Replaces 771M (calib) + 475M (graph) = 1,246M pair-sims with 475M.
+      // Large PMH datasets use one tiled O(N²/2) pass to maintain each
+      // contig's bounded top-neighbour heap before mutual filtering.
       if (from_cache) {
-        // Topology (from/to/sComp) was loaded from the cache; calibration is
-        // already baked into simCutoff/g_pmh_baseline. Skip the O(N^2) build.
+        // Topology (from/to/sComp) was loaded from the cache. Skip graph build.
         g.from  = std::move(g_cache_from);
         g.to    = std::move(g_cache_to);
         g.sComp = std::move(g_cache_scomp);
         verbose_message("Reusing cached similarity graph: %zu edges "
                         "[%.1fGb / %.1fGb]\n", g.getEdgeCount(),
                         getUsedPhysMem(), getTotalPhysMem() / 1024 / 1024);
-      } else if (simCutoff < 1. && g_pmh_mode && nobs > 25000) {
-        simCutoff = gen_fused_calib_graph(g, calib_connected_pct);
+      } else if (g_pmh_mode && nobs > 25000) {
+        gen_fused_graph(g);
       } else {
-        // ── Original sequential path (non-PMH, manual simCutoff, or small N) ──
-        if (simCutoff < 1.) {
-          if (nobs <= 25000) {
-            simCutoff = calibrate_sim_cutoff(calib_connected_pct, true);
-          } else {
-            verbose_message("Running fused 10-round calibration (Fusion C)...\n");
-            simCutoff = calibrate_sim_cutoff_fused(calib_connected_pct);
-          }
-        } else {
-          simCutoff *= 10;
-        }
-        verbose_message(
-            "Finished Preparing Similarity Graph Building [pSim = %2.2f] "
-            "[%.1fGb / %.1fGb]                                            \n",
-            simCutoff / 10., getUsedPhysMem(), getTotalPhysMem() / 1024 / 1024);
-        build_similarity_graph(g, simCutoff / 1000.);
+        build_similarity_graph(g);
       }
 
       // PMH winner arrays fed only graph construction and can be released
@@ -5343,9 +5263,8 @@ static int rb_cmd_bin(int ac, char *av[]) {
             if (raw_w[e] > 0.0f) pos.push_back(raw_w[e]);
           double adaptive_cut = (edge_cut_mode == 1) ? rb_otsu_threshold(pos)
                                                      : rb_gmm2_threshold(pos);
-          // Never drop below the composition calibration floor (0.05); a
-          // degenerate all-connected graph is never desirable.
-          const double floorcut = (double)RB_SIM_FLOOR / 1000.0;
+          // Retain a small safety floor for optional adaptive edge filtering.
+          const double floorcut = 0.05;
           if (!(adaptive_cut > floorcut)) adaptive_cut = floorcut;
           verbose_message(
               "Adaptive edge cutoff (%s) = %.4f (fixed default %.4f; %zu positive "

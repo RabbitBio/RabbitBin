@@ -150,10 +150,11 @@ Both bounds are user-settable: `--min-contig` accepts any value ≥ 1500 and
 2. **Bounded mutual candidate graph.** In the standard multi-sample path, an
    exact abundance-feasibility bound first removes pairs that cannot pass the
    final edge threshold. PMH similarity then retains at most `--max-edges`
-   (default 200) neighbours per contig from the feasible pairs; the calibrated
-   production candidate graph keeps a pair only when the neighbour relation is
-   mutual. This order prevents abundance-incompatible high-PMH pairs from
-   consuming the bounded neighbourhood.
+   (default 200) neighbours per contig from the feasible pairs. The production
+   candidate graph keeps a pair only when the neighbour relation is mutual.
+   No absolute PMH similarity cutoff is applied. This order prevents
+   abundance-incompatible high-PMH pairs from consuming the bounded
+   neighbourhood.
 3. **Coverage-only edge weighting.** In the default method with `S >= 3`,
    each candidate edge receives
 
@@ -207,7 +208,7 @@ gold labels only after candidate generation and abundance edge scoring, reports
 true/false candidate and retained edges plus per-contig true-neighbour coverage,
 and then lets the unchanged binning path continue. The pure-PMH and production
 reports must not be conflated: the latter also reflects the abundance-feasibility
-gate, calibrated PMH cutoff, and mutual-neighbour requirement.
+gate and mutual-neighbour requirement.
 
 **Clustering**
 
