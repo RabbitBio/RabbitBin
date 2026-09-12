@@ -122,7 +122,8 @@ bool rb_write_cache(const std::string &path, const Graph &g, bool has_depth) {
   rbc_wr_pod(f, v_seed);
   rbc_wr_pod(f, v_ts);
   rbc_wr_pod(f, v_ts1);
-  double v_sim = (double)simCutoff, v_b0 = g_pmh_baseline;
+  // Keep the retired similarity-cutoff slot for cache-format compatibility.
+  double v_sim = 0.0, v_b0 = g_pmh_baseline;
   rbc_wr_pod(f, v_sim);
   rbc_wr_pod(f, v_b0);
   uint64_t v_mc = minContig, v_msc = min_small_contig;
@@ -235,7 +236,7 @@ bool rb_load_cache(const std::string &path) {
   g_cache_seed = v_seed;
   totalSize = v_ts;
   totalSize1 = v_ts1;
-  simCutoff = (Similarity)v_sim;
+  (void)v_sim;
   g_pmh_baseline = v_b0;
   g_cache_has_depth = (v_hd != 0);
   (void)v_mc;  // build-time minContig (informational; downstream uses CLI value)

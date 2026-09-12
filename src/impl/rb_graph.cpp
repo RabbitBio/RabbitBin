@@ -4,7 +4,7 @@
 // build_similarity_graph  –  build edge list using KmerSketch Jaccard
 // ═══════════════════════════════════════════════════════════════════════════
 // Reference all-pairs graph build (O(N^2) Jaccard); used when inverted index is off.
-static void build_graph_allpairs(Graph &g, Similarity cutoff) {
+static void build_graph_allpairs(Graph &g) {
   ProgressTracker progress(nobs);
   std::vector<GraphNodeId> &from = g.from;
   std::vector<GraphNodeId> &to   = g.to;
@@ -39,7 +39,7 @@ static void build_graph_allpairs(Graph &g, Similarity cutoff) {
         for (size_t j = jj; j < j_stop; ++j) {
           if (i == j || !is_nz(i, j)) continue;
           StoredDistance sv = (StoredDistance)graph_sim(i, j);
-          if (sv > cutoff &&
+          if (sv > 0.0f &&
               (edges.size() < maxEdges ||
                (edges.size() == maxEdges && sv > edges.top().second))) {
             if (edges.size() == maxEdges) edges.pop();
@@ -71,142 +71,12 @@ static void build_graph_allpairs(Graph &g, Similarity cutoff) {
   g.sComp.shrink_to_fit(); g.to.shrink_to_fit(); g.from.shrink_to_fit();
 }
 
-// ── PMH-winner inverted-index graph build ─────────────────────────────────
-// Replaces the all-pairs PMH winner-match scan.  For each contig i:
-//   1. Walk its m winners → look up posting lists → accumulate hit counts.
-//   2. Hit count for candidate j  ==  PMH match numerator (= #shared winners).
-//   3. raw_sim  = count / m;  corrected sim = (raw - b0)/(1 - b0)
-//   4. Only candidates with corrected_sim > cutoff are inserted as edges.
-// Complexity: O(N × avg_posting_size × avg_candidates), typically sub-quadratic.
-// Average posting size for k=6 ≈ nobs/4096 ≈ 7.5 → very short lists.
-static void gen_pmh_graph_index(Graph &g, Similarity cutoff) {
-  if (!g_pmh_idx) {
-    verbose_message("WARN: PMH index not ready, falling back to all-pairs\n");
-    build_graph_allpairs(g, cutoff); return;
-  }
-  const rabbit_invidx::InvertedIndex &idx = *g_pmh_idx;
-  const uint32_t *csrPtr = idx.csrPosts.data();
-  const double    Md     = (double)g_pmh_m;
-
-  // Minimum raw match count guaranteed to yield corrected_sim > cutoff.
-  // corrected = (raw/m - b0)/(1-b0) > cutoff  ↔  raw > m*(cutoff*(1-b0)+b0)
-  // Use a small safety margin (0.95×) to avoid false-negative edge loss
-  // from estimator variance around the threshold.
-  double b0 = (g_pmh_base_on && g_pmh_baseline > 0.0 && g_pmh_baseline < 1.0)
-              ? g_pmh_baseline : 0.0;
-  size_t minCount = (size_t)std::floor(Md * (cutoff * (1.0 - b0) + b0) * 0.95);
-  if (minCount < 1) minCount = 1;
-
-  verbose_message("Starting Building Similarity Graph (PMH winner index). "
-                  "nobs=%zu cutoff=%.4f b0=%.4f minCount=%zu "
-                  "postings=%zu keys=%zu\n",
-                  nobs, (double)cutoff, b0, minCount,
-                  idx.totalPostings, idx.postIdx.size());
-
-  std::vector<GraphNodeId>    &from  = g.from;
-  std::vector<GraphNodeId>    &to    = g.to;
-  std::vector<StoredDistance> &sComp  = g.sComp;
-
-  std::vector<std::vector<GraphNodeId>>    tl_from(numThreads);
-  std::vector<std::vector<GraphNodeId>>    tl_to(numThreads);
-  std::vector<std::vector<StoredDistance>> tl_sComp(numThreads);
-
-  ProgressTracker progress(nobs);
-
-#pragma omp parallel num_threads(numThreads)
-  {
-    const int tid = omp_get_thread_num();
-    // Per-thread epoch-stamped scratch (stamp-based clear → O(candidates), not O(N)).
-    std::vector<int>      stamp(nobs, 0);
-    std::vector<uint32_t> isect(nobs, 0);  // collision count; bounded by m
-    int ep = 0;
-    std::vector<size_t> cand;
-    cand.reserve(8192);
-    std::priority_queue<Edge, std::vector<Edge>, CompareEdge> heap;
-
-    auto &lf = tl_from[tid], &lt = tl_to[tid];
-    std::vector<StoredDistance> &ls = tl_sComp[tid];
-
-#pragma omp for schedule(dynamic, 8)
-    for (size_t i = 0; i < nobs; ++i) {
-      cand.clear();
-      if (++ep == INT_MAX) { std::fill(stamp.begin(), stamp.end(), 0); ep = 1; }
-
-      // Walk every non-zero winner register of contig i.
-      // Look up winner-index keys using the full 64-bit g_win64_flat.
-      // Key = winners64[pos] XOR (pos * GOLDEN) — must match getWinnerIndexKeys().
-      static constexpr uint64_t GOLDEN = UINT64_C(0x9E3779B97F4A7C15);
-      const uint64_t *wi64 = g_win64_flat.data() + i * g_pmh_m;
-      for (uint32_t pos = 0; pos < g_pmh_m; ++pos) {
-        if (wi64[pos] == 0ULL) continue;
-        const uint64_t key = wi64[pos] ^ ((uint64_t)pos * GOLDEN);
-        auto it = idx.postIdx.find(key);
-        if (it == idx.postIdx.end()) continue;
-        const uint32_t *pl = csrPtr + it->second.off;
-        const uint32_t  sz = it->second.cnt;
-        for (uint32_t pi = 0; pi < sz; ++pi) {
-          size_t j = pl[pi];
-          if (j == i) continue;
-          if (stamp[j] != ep) { stamp[j] = ep; isect[j] = 1; cand.push_back(j); }
-          else                 { ++isect[j]; }
-        }
-      }
-
-      // Score candidates; only emit i<j edges above cutoff.
-      while (!heap.empty()) heap.pop();
-      for (size_t j : cand) {
-        if (isect[j] < (uint32_t)minCount) continue;
-        if (!is_nz(i, j)) continue;
-        StoredDistance sim = (StoredDistance)graph_sim(i, j);
-        if (sim > (Similarity)cutoff &&
-            (heap.size() < (size_t)maxEdges ||
-             (heap.size() == (size_t)maxEdges && sim > heap.top().second))) {
-          if (heap.size() == (size_t)maxEdges) heap.pop();
-          heap.push(std::make_pair(j, sim));
-        }
-      }
-      while (!heap.empty()) {
-        auto e = heap.top(); heap.pop();
-        if (i < e.first) { ls.push_back(e.second); lf.push_back(i); lt.push_back(e.first); }
-      }
-
-      if (verbose && tid == 0) {
-        progress.track(numThreads);
-        if (progress.isStepMarker())
-          verbose_message("Building Similarity Graph %s [%.1fGb / %.1fGb]\r",
-                          progress.getProgress(),
-                          getUsedPhysMem(), getTotalPhysMem() / 1024 / 1024);
-      }
-    }
-  }
-
-  // Merge per-thread edge lists.
-  size_t total = 0;
-  for (int t = 0; t < (int)numThreads; ++t) total += tl_from[t].size();
-  from.reserve(total); to.reserve(total); sComp.reserve(total);
-  for (int t = 0; t < (int)numThreads; ++t) {
-    from.insert(from.end(), tl_from[t].begin(), tl_from[t].end());
-    to  .insert(to  .end(), tl_to[t]  .begin(), tl_to[t]  .end());
-    sComp.insert(sComp.end(), tl_sComp[t].begin(), tl_sComp[t].end());
-  }
-  verbose_message("Finished Building Similarity Graph (%zu edges) "
-                  "[%.1fGb / %.1fGb]                         \n",
-                  g.getEdgeCount(),
-                  getUsedPhysMem(), getTotalPhysMem() / 1024 / 1024);
-  g.sComp.shrink_to_fit(); g.to.shrink_to_fit(); g.from.shrink_to_fit();
-}
-
-void build_similarity_graph(Graph &g, Similarity cutoff) {
+void build_similarity_graph(Graph &g) {
   std::vector<GraphNodeId> &from = g.from;
   std::vector<GraphNodeId> &to   = g.to;
   auto &sComp = g.sComp;
 
   if (nobs == 0) return;
-
-  // NOTE: the PMH winner index (g_pmh_idx) is NOT used for graph build.
-  // With k=6 there are only 4096 distinct k-mers, so posting lists average
-  // ~1748 contigs — dense, not sparse. Candidate-gen work exceeds the all-pairs
-  // SIMD kernel. The all-pairs AVX-512 path (below) is optimal for this regime.
 
   // Default to the all-pairs b-bit popcount build: the OPH signature is so
   // compact (m/8 bytes, cache-resident) that the all-pairs SIMD popcount kernel
@@ -217,26 +87,13 @@ void build_similarity_graph(Graph &g, Similarity cutoff) {
   bool use_index = false;
   if (const char *e = rb_getenv("RABBIT_GRAPH_INDEX"))
     use_index = (e[0] == '1');
-  if (!use_index) { build_graph_allpairs(g, cutoff); return; }
+  if (!use_index) { build_graph_allpairs(g); return; }
 
-  // Number of OPH buckets m (= sketch size). The collision count between two
-  // sketches divided by m is the Jaccard estimate, so an edge with similarity
-  // > cutoff requires at least ceil(cutoff * m) colliding buckets. That lower
-  // bound drives the inverted index: only pairs sharing >= minCommon buckets
-  // are even considered, replacing the O(N^2) all-pairs Jaccard scan.
+  // The optional inverted-index path considers pairs sharing at least one
+  // sketch bucket. RABBIT_MINCOMMON can request a stricter experimental
+  // prefilter without changing the production default.
   const uint32_t M = g_sketches[0]->getK();
-  const double   Md = (double)M;
-  // A pair whose true Jaccard exceeds `cutoff` collides in roughly cutoff*m
-  // buckets. We relax this lower bound by a safety margin so estimator noise
-  // can't drop a genuine edge below the candidate threshold; the exact Jaccard
-  // (same metric the cutoff was calibrated against) is then evaluated only for
-  // the surviving candidates — never for all N^2 pairs.
-  size_t minCommon = (size_t)std::floor((double)cutoff * Md * 0.7);
-  if (minCommon < 1) minCommon = 1;
-  // The cutoff-derived bound assumes the candidate metric is
-  // the OPH Jaccard, but in PMH mode the index is only a sparse k-mer prefilter
-  // (candidate = shares >= minCommon exact OPH buckets) and the edge weight is
-  // the PMH winner-match. An explicit minCommon override is available.
+  size_t minCommon = 1;
   if (const char *e = rb_getenv("RABBIT_MINCOMMON")) {
     long v = std::atol(e);
     if (v >= 1) minCommon = (size_t)v;
@@ -245,14 +102,14 @@ void build_similarity_graph(Graph &g, Similarity cutoff) {
   // ── Use the index that was built inline during sketch construction ────────
   if (!g_inv_idx) {
     verbose_message("WARN: inverted index not ready, falling back to all-pairs\n");
-    build_graph_allpairs(g, cutoff); return;
+    build_graph_allpairs(g); return;
   }
   const rabbit_invidx::InvertedIndex& idx = *g_inv_idx;
 
   verbose_message("Starting Building Similarity Graph (inverted index). "
-                  "nobs=%d maxEdges=%d buckets=%d cutoff=%.4f minCommon=%d "
+                  "nobs=%d maxEdges=%d buckets=%d minCommon=%d "
                   "postings=%zu keys=%zu\n",
-                  nobs, maxEdges, M, (double)cutoff, minCommon,
+                  nobs, maxEdges, M, minCommon,
                   idx.totalPostings, idx.postIdx.size());
 
   // ── Posting-list traversal: count collisions per candidate, keep the
@@ -331,7 +188,7 @@ void build_similarity_graph(Graph &g, Similarity cutoff) {
         if (common < minCommon) continue;
         if (!is_nz(i, j)) continue;
         StoredDistance sim = (StoredDistance)graph_sim(i, j);
-        if (sim > cutoff &&
+        if (sim > 0.0f &&
             (heap.size() < maxEdges ||
              (heap.size() == maxEdges && sim > heap.top().second))) {
           if (heap.size() == maxEdges) heap.pop();
@@ -382,101 +239,10 @@ void build_similarity_graph(Graph &g, Similarity cutoff) {
   g.from.shrink_to_fit();
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// ── calibrate_sim_cutoff_converge ──────────────────────────────────────────
-// Inner: given maxsim[] for _nobs sampled contigs, binary-search for the
-// similarity cutoff p such that exactly coverage fraction are "connected"
-// (i.e. have at least one neighbour ≥ cutoff). Returns p×1000.
-static size_t calib_converge(const std::vector<Similarity>& maxsim,
-                              Distance coverage) {
-  size_t _nobs = maxsim.size();
-  size_t p = 999, pp = 1000;
-  Distance cov = 0, pcov = 0;
-  for (; p > RB_SIM_FLOOR;) {
-    Distance cutoff = (Distance)p / 1000.;
-    size_t counton = 0;
-    for (size_t i = 0; i < _nobs; ++i)
-      if (maxsim[i] >= cutoff) counton++;
-    cov = (Distance)counton / _nobs;
-    if (cov >= coverage) {
-      if (cov - coverage > coverage - pcov) { p = pp; cov = pcov; }
-      break;
-    } else {
-      verbose_message("Preparing Similarity Graph Building [pSim = %2.1f; "
-                      "%zu / %zu (P = %2.2f%%)]               \r",
-                      p / 10., counton, _nobs, cov * 100.);
-    }
-    pp = p; pcov = cov;
-    if (p > 990)       p -= rand() % 3 + 1;
-    else if (p > 900)  p -= rand() % 3 + 3;
-    else               p -= rand() % 3 + 9;
-  }
-  return p;
-}
-
-// pmh_calib_maxsim – compute maxsim[] for a sample of contigs using the PMH
-// winner index.  For each sampled contig, walks its winner registers, accumulates
-// hit counts per candidate, and records the maximum corrected similarity.
-// O(sample × avg_posting_size) instead of O(sample × N).
-static void pmh_calib_maxsim(const std::vector<size_t>& sample,
-                              std::vector<Similarity>& maxsim) {
-  const rabbit_invidx::InvertedIndex &idx = *g_pmh_idx;
-  const uint32_t *csrPtr = idx.csrPosts.data();
-  const double    Md     = (double)g_pmh_m;
-  const double    b0     = (g_pmh_base_on && g_pmh_baseline > 0.0 && g_pmh_baseline < 1.0)
-                           ? g_pmh_baseline : 0.0;
-  const size_t    S      = sample.size();
-
-#pragma omp parallel num_threads(numThreads)
-  {
-    std::vector<int>      stamp(nobs, 0);
-    std::vector<uint32_t> isect(nobs, 0);
-    int ep = 0;
-    std::vector<size_t> cand;
-    cand.reserve(8192);
-
-#pragma omp for schedule(dynamic, 8)
-    for (size_t si = 0; si < S; ++si) {
-      const size_t i = sample[si];
-      cand.clear();
-      if (++ep == INT_MAX) { std::fill(stamp.begin(), stamp.end(), 0); ep = 1; }
-
-      static constexpr uint64_t GOLDEN_C = UINT64_C(0x9E3779B97F4A7C15);
-      const uint64_t *wi64 = g_win64_flat.data() + i * g_pmh_m;
-      for (uint32_t pos = 0; pos < g_pmh_m; ++pos) {
-        if (wi64[pos] == 0ULL) continue;
-        const uint64_t key = wi64[pos] ^ ((uint64_t)pos * GOLDEN_C);
-        auto it = idx.postIdx.find(key);
-        if (it == idx.postIdx.end()) continue;
-        const uint32_t *pl = csrPtr + it->second.off;
-        const uint32_t  sz = it->second.cnt;
-        for (uint32_t pi = 0; pi < sz; ++pi) {
-          size_t j = pl[pi];
-          if (j == i) continue;
-          if (stamp[j] != ep) { stamp[j] = ep; isect[j] = 1; cand.push_back(j); }
-          else                 { ++isect[j]; }
-        }
-      }
-
-      // maxsim = highest corrected similarity among all candidates.
-      uint32_t best = 0;
-      for (size_t j : cand) if (isect[j] > best) best = isect[j];
-      double raw = (double)best / Md;
-      double sim = (b0 < 1.0) ? (raw - b0) / (1.0 - b0) : 0.0;
-      if (sim < 0.0) sim = 0.0;
-      if (sim > 1.0 - 1e-6) sim = 1.0 - 1e-6;
-      maxsim[si] = (Similarity)sim;
-    }
-  }
-}
-
-// ── Fused calibration + graph build ───────────────────────────────────────
-// Replaces two sequential O(N²) passes with one tiled pass.
-// A single tiled N²/2 pass simultaneously:
-//   1. Accumulates per-contig top-maxEdges neighbor heaps (uncutoff).
-//   2. Accumulates maxsim[] for 10 × 2500 calibration samples.
-// Then calibrates (→ simCutoff) and emits edges from stored heaps.
-// Returns the calibrated simCutoff×10 and fills Graph g with edges.
+// ── Fused top-k graph build ─────────────────────────────────────────────
+// A tiled N²/2 pass accumulates the top-maxEdges PMH neighbours for every
+// contig. Candidate pairs must pass the coverage feasibility checks below;
+// graph emission subsequently applies the mutual-neighbour rule.
 // ── Winner-banding LSH candidate generation (RABBIT_LSH=1) ─────────────────
 // The O(N²/2) all-pairs scan is compute-bound and scales out to the core count,
 // so the only way to go faster is to evaluate fewer pairs.  Kept graph edges
@@ -498,31 +264,7 @@ static inline uint64_t lsh_band_hash(const uint32_t *w, uint32_t r) {
   return h;
 }
 
-static Distance gen_fused_calib_graph(Graph &g, Distance coverage) {
-  static constexpr size_t NROUNDS = 10;
-  static constexpr size_t SAMP    = 2500;
-
-  // Draw NROUNDS independent 2500-element samples (permuted prefix).
-  std::vector<std::vector<size_t>> idxs(NROUNDS, std::vector<size_t>(nobs));
-  for (size_t r = 0; r < NROUNDS; ++r) {
-    std::iota(idxs[r].begin(), idxs[r].end(), 0);
-    random_unique(idxs[r].begin(), idxs[r].end(), SAMP);
-  }
-
-  // Flat sample membership: sample_round[i] = round index if contig i is in
-  // that round's sample, else -1.  Used for O(1) lookup in the inner loop.
-  // A contig may appear in multiple rounds; we record the lowest-index round.
-  std::vector<int8_t> sample_round(nobs, -1);   // -1 = not sampled
-  std::vector<size_t> sample_local(nobs, 0);    // local index within sample_round
-  for (int r = (int)NROUNDS - 1; r >= 0; --r)  // lowest round wins
-    for (size_t li = 0; li < SAMP; ++li) {
-      const size_t ci = idxs[r][li];
-      sample_round[ci] = (int8_t)r;
-      sample_local[ci] = li;
-    }
-
-  // maxsim[r][li]: max similarity seen by sample contig li in round r.
-  std::vector<std::vector<float>> maxsim(NROUNDS, std::vector<float>(SAMP, 0.f));
+static void gen_fused_graph(Graph &g) {
 
   // Per-contig neighbor heap (min-heap of size ≤ maxEdges; top = weakest kept).
   // Triangle pass: each unordered pair {i,j} is evaluated exactly once and used
@@ -613,13 +355,6 @@ static Distance gen_fused_calib_graph(Graph &g, Distance coverage) {
   const bool graphProfileOn = getenv("RB_GRAPH_PROF") != nullptr;
   std::vector<GraphPassProfile> graphProfile(numThreads);
 
-  // Per-thread maxsim accumulators — both endpoints of every pair feed these;
-  // merged into the global maxsim[][] after the pass (max is order-independent,
-  // so calibration is bit-identical regardless of pair processing order).
-  std::vector<std::vector<std::vector<float>>> thread_jmax(
-      numThreads,
-      std::vector<std::vector<float>>(NROUNDS, std::vector<float>(SAMP, 0.f)));
-
   // Tile size: keep both winner rows and (when present) both abundance rows in
   // one core's L2.  The production PMH path packs winners to 16 bits, so charging
   // sizeof(uint32_t) here made the old heuristic substantially too conservative.
@@ -670,9 +405,8 @@ static Distance gen_fused_calib_graph(Graph &g, Distance coverage) {
         tilepairs.emplace_back((uint32_t)ii, (uint32_t)jj);
   }
 
-  verbose_message("Fused graph (triangle): single-pass calib+graph nobs=%zu "
-                  "SAMP=%zu×%zu TILE=%zu tilepairs=%zu\n",
-                  nobs, NROUNDS, SAMP, TILE, tilepairs.size());
+  verbose_message("Fused graph (triangle): nobs=%zu TILE=%zu tilepairs=%zu\n",
+                  nobs, TILE, tilepairs.size());
 
   const bool rb_timing = (getenv("RB_TIMING") != nullptr);
   std::chrono::steady_clock::time_point _t_pass0;
@@ -846,9 +580,7 @@ static Distance gen_fused_calib_graph(Graph &g, Distance coverage) {
   // baseline correction — an upper bound on the similarity sv.  If that upper
   // bound is below BOTH endpoints' (monotonically rising) thresholds the pair
   // can never be kept, so the remaining (g_pmh_m − EE_P) winner comparisons are
-  // skipped.  This is exact w.r.t. heap contents.  Sample endpoints feed the
-  // calibration maxsim[] and therefore always take the full compare, so the
-  // calibration (and hence simCutoff and every edge) is unchanged.
+  // skipped. This is exact with respect to the retained top-k heaps.
   // RABBIT_NO_COMP_EE=1 disables this optimization.
   const bool win16 = (g_win_bits == 16);
   const bool comp_ee = g_pmh_mode && !g_exact_cos_cmp && g_pmh_m >= 16 &&
@@ -901,7 +633,6 @@ static Distance gen_fused_calib_graph(Graph &g, Distance coverage) {
 #pragma omp parallel num_threads(numThreads)
   {
     const int tid = omp_get_thread_num();
-    auto &my_jmax = thread_jmax[tid];
     GraphPassProfile &my_prof = graphProfile[tid];
     std::vector<uint32_t> visited;       // LSH per-i dedup stamp
     uint32_t visit_gen = 0;
@@ -975,11 +706,10 @@ static Distance gen_fused_calib_graph(Graph &g, Distance coverage) {
       rs.spin.store(0, std::memory_order_release);  // release spinlock
     };
 
-    auto process_pair = [&](size_t i, size_t j, int i_round,
-                            size_t i_local) {
+    auto process_pair = [&](size_t i, size_t j) {
       if (graphProfileOn) ++my_prof.similarityPairs;
       StoredDistance sv;
-      if (comp_ee && i_round < 0 && sample_round[j] < 0) {
+      if (comp_ee) {
         // Partial winner match → exact upper bound on sv; prune if it cannot
         // beat either endpoint's heap threshold.  Result is bit-identical to
         // graph_sim(i,j) on the non-pruned path (same total match count).
@@ -1027,15 +757,6 @@ static Distance gen_fused_calib_graph(Graph &g, Distance coverage) {
       }
       update_row(i, j, sv);
       update_row(j, i, sv);
-      if (i_round >= 0) {
-        float &m = my_jmax[i_round][i_local];
-        if ((float)sv > m) m = (float)sv;
-      }
-      const int j_round = sample_round[j];
-      if (j_round >= 0) {
-        float &m = my_jmax[j_round][sample_local[j]];
-        if ((float)sv > m) m = (float)sv;
-      }
     };
 
     if (!use_lsh) {
@@ -1053,8 +774,6 @@ static Distance gen_fused_calib_graph(Graph &g, Distance coverage) {
         my_prof.geometricPairs += diag ? ni * (ni - 1) / 2 : ni * nj;
       }
       for (size_t i = ii; i < i_stop; ++i) {
-        const int    i_round = sample_round[i];
-        const size_t i_local = sample_local[i];
         // Diagonal tile: only j>i; off-diagonal: full j range.
         const size_t j_begin = diag ? i + 1 : jj;
 #if defined(__AVX512VNNI__) && defined(__AVX512BW__)
@@ -1076,7 +795,7 @@ static Distance gen_fused_calib_graph(Graph &g, Distance coverage) {
               if (graphProfileOn) ++my_prof.q8FloatRejected;
               continue;
             }
-            process_pair(i, j, i_round, i_local);
+            process_pair(i, j);
           }
           continue;
         }
@@ -1100,7 +819,7 @@ static Distance gen_fused_calib_graph(Graph &g, Distance coverage) {
             // independent abundance tests are computed ahead within a batch.
             for (size_t q = 0; q < nb; ++q) {
               if (!nz[q] || corr[q] < abd_corr_min_eps) continue;
-              process_pair(i, jb + q, i_round, i_local);
+              process_pair(i, jb + q);
             }
           }
           continue;
@@ -1114,7 +833,7 @@ static Distance gen_fused_calib_graph(Graph &g, Distance coverage) {
             const float c = unit_dot_f(abd_u + i * ABD_S, abd_u + j * ABD_S, ABD_S);
             if (c < abd_corr_min_eps) continue;
           }
-          process_pair(i, j, i_round, i_local);
+          process_pair(i, j);
         }
       }
       if (verbose && tid == 0 && (p & 0x3FFu) == 0)
@@ -1126,8 +845,6 @@ static Distance gen_fused_calib_graph(Graph &g, Distance coverage) {
       for (size_t i = 0; i < nobs; ++i) {
         ++visit_gen;
         visited[i] = visit_gen;                 // exclude self
-        const int    i_round = sample_round[i];
-        const size_t i_local = sample_local[i];
         for (uint32_t b = 0; b < LSH_B; ++b) {
           const uint64_t key   = band_key_of[b][i];
           const auto    &skey  = band_sorted_key[b];
@@ -1144,15 +861,6 @@ static Distance gen_fused_calib_graph(Graph &g, Distance coverage) {
             StoredDistance sv = (StoredDistance)graph_sim(i, j);
             update_row(i, j, sv);
             update_row(j, i, sv);
-            if (i_round >= 0) {
-              float &m = my_jmax[i_round][i_local];
-              if ((float)sv > m) m = (float)sv;
-            }
-            const int j_round = sample_round[j];
-            if (j_round >= 0) {
-              float &m = my_jmax[j_round][sample_local[j]];
-              if ((float)sv > m) m = (float)sv;
-            }
           }
         }
         if (verbose && tid == 0 && (i & 0xFFFu) == 0)
@@ -1233,35 +941,9 @@ static Distance gen_fused_calib_graph(Graph &g, Distance coverage) {
 
   { std::vector<RowSync>().swap(rowsync); }
 
-  // Merge per-thread maxsim into the global array.
-  for (size_t r = 0; r < NROUNDS; ++r)
-    for (size_t li = 0; li < SAMP; ++li)
-      for (int tid = 0; tid < (int)numThreads; ++tid)
-        if (thread_jmax[tid][r][li] > maxsim[r][li])
-          maxsim[r][li] = thread_jmax[tid][r][li];
-  thread_jmax.clear();
-
-  // ── Calibrate: converge each round independently. ─────────────────────────
-  Distance sum_p = 0;
-  for (size_t r = 0; r < NROUNDS; ++r) {
-    std::vector<Similarity> sub(SAMP);
-    for (size_t li = 0; li < SAMP; ++li) sub[li] = (Similarity)maxsim[r][li];
-    Distance _minp = (Distance)calib_converge(sub, coverage);
-    if (_minp < (Distance)(RB_SIM_FLOOR + 1)) _minp = (Distance)RB_SIM_FLOOR;
-    sum_p += _minp;
-    if (r == 1 && sum_p / 2 < (Distance)(RB_SIM_FLOOR + 1))
-      { sum_p = (Distance)RB_SIM_FLOOR * (Distance)NROUNDS; break; }
-  }
-  Distance simCutoff = sum_p / (Distance)NROUNDS;
-
-  verbose_message("Finished Preparing Similarity Graph Building [pSim = %2.2f] "
-                  "[%.1fGb / %.1fGb]                                      \n",
-                  simCutoff / 10., getUsedPhysMem(), getTotalPhysMem() / 1024 / 1024);
-
-  // ── Emit edges: drain heaps, apply cutoff, emit only i<j. ────────────────
-  const Similarity cutoff = (Similarity)(simCutoff / 1000.);
+  // Emit positive-similarity top-k candidates; no absolute PMH cutoff.
   verbose_message("Starting Building Similarity Graph (Fusion D). "
-                  "nobs=%zu cutoff=%.4f\n", nobs, (double)cutoff);
+                  "nobs=%zu maxEdges=%zu\n", nobs, maxEdges);
 
   std::vector<GraphNodeId>    &from  = g.from;
   std::vector<GraphNodeId>    &to    = g.to;
@@ -1274,7 +956,7 @@ static Distance gen_fused_calib_graph(Graph &g, Distance coverage) {
         auto e = heaps[i].top(); heaps[i].pop();
         size_t j   = e.id;
         StoredDistance sv = e.sv;
-        if (sv <= cutoff) continue;
+        if (sv <= 0.0f) continue;
         if (i < j) {
           from.push_back(i); to.push_back(j); sComp.push_back(sv);
         }
@@ -1303,7 +985,7 @@ static Distance gen_fused_calib_graph(Graph &g, Distance coverage) {
       row.reserve(h.size());
       while (!h.empty()) {
         const Edge32 &e = h.top();
-        if (e.sv > cutoff)
+        if (e.sv > 0.0f)
           row.emplace_back((uint32_t)e.id, e.sv);
         h.pop();
       }
@@ -1353,91 +1035,4 @@ static Distance gen_fused_calib_graph(Graph &g, Distance coverage) {
                   g.getEdgeCount(), getUsedPhysMem(),
                   getTotalPhysMem() / 1024 / 1024);
   g.sComp.shrink_to_fit(); g.to.shrink_to_fit(); g.from.shrink_to_fit();
-  return simCutoff;
 }
-
-// calibrate_sim_cutoff  –  sample-based auto-calibration of similarity cutoff
-// ═══════════════════════════════════════════════════════════════════════════
-// `full=true` uses all nobs contigs as both sample and reference (medium path).
-// `full=false` uses a 2500-sample subset (high path, called 10 times).
-size_t calibrate_sim_cutoff(Distance coverage, bool full) {
-  size_t _nobs = full ? nobs : std::min(nobs, (size_t)2500);
-
-  std::vector<size_t> idx(nobs);
-  std::iota(idx.begin(), idx.end(), 0);
-  random_unique(idx.begin(), idx.end(), _nobs);
-  idx.resize(_nobs);
-
-  std::vector<Similarity> maxsim(_nobs, (Similarity)0);
-
-#pragma omp parallel for schedule(dynamic, 4)
-  for (size_t i = 0; i < _nobs; ++i) {
-    const size_t contig_i = idx[i];
-    Similarity mx = (Similarity)0;
-    for (size_t j = 0; j < nobs; ++j) {
-      if (j == i) continue;
-      Similarity s = (Similarity)graph_sim(contig_i, idx[j]);
-      if (s > mx) mx = s;
-    }
-    maxsim[i] = mx;
-  }
-  return calib_converge(maxsim, coverage);
-}
-
-// calibrate_sim_cutoff_fused ── Fusion C ───────────────────────────────
-// Replaces the 10-serial-call loop used when nobs > 25000.
-// Draws 10 independent 2500-sample subsets at once, computes all 25000
-// maxsim values in a SINGLE parallel OMP pass, then independently converges
-// each sample to find its cutoff.  Benefits vs 10 serial calls:
-//   • 1 OMP region / barrier instead of 10   (less scheduling overhead)
-//   • 10× better load balancing (25000 tasks vs 2500 tasks per region)
-//   • g_sig_flat access pattern more linear (less cache thrashing)
-// Returns the same average-p that the 10-call loop would produce.
-static Distance calibrate_sim_cutoff_fused(Distance coverage) {
-  static constexpr size_t NROUNDS = 10;
-  static constexpr size_t SAMP    = 2500;  // per round
-
-  // Draw NROUNDS independent random samples (each a permuted prefix of idx)
-  std::vector<std::vector<size_t>> idxs(NROUNDS, std::vector<size_t>(nobs));
-  for (size_t r = 0; r < NROUNDS; ++r) {
-    std::iota(idxs[r].begin(), idxs[r].end(), 0);
-    random_unique(idxs[r].begin(), idxs[r].end(), SAMP);
-  }
-
-  const size_t total = NROUNDS * SAMP;
-  std::vector<Similarity> maxsim(total, (Similarity)0);
-
-  // Single parallel pass over all NROUNDS*SAMP sampled contigs.
-  // Task i = (round r, local index li): r = i/SAMP, li = i%SAMP.
-#pragma omp parallel for schedule(dynamic, 8)
-  for (size_t i = 0; i < total; ++i) {
-    const size_t r  = i / SAMP;
-    const size_t li = i % SAMP;
-    const size_t contig_i = idxs[r][li];
-    Similarity mx = (Similarity)0;
-    for (size_t j = 0; j < nobs; ++j) {
-      if (j == li) continue;
-      Similarity s = (Similarity)graph_sim(contig_i, idxs[r][j]);
-      if (s > mx) mx = s;
-    }
-    maxsim[i] = mx;
-  }
-
-  // Converge each round independently and accumulate.
-  Distance sum_p = 0;
-  for (size_t r = 0; r < NROUNDS; ++r) {
-    const std::vector<Similarity> sub(maxsim.begin() + r * SAMP,
-                                       maxsim.begin() + (r + 1) * SAMP);
-    Distance _minp = (Distance)calib_converge(sub, coverage);
-    if (_minp < (Distance)(RB_SIM_FLOOR + 1)) _minp = (Distance)RB_SIM_FLOOR;
-    sum_p += _minp;
-    if (r == 1 && sum_p / 2 < (Distance)(RB_SIM_FLOOR + 1)) {
-      return (Distance)RB_SIM_FLOOR;
-    }
-  }
-  return sum_p / (Distance)NROUNDS;
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// Similarity calibration helpers
-// ═══════════════════════════════════════════════════════════════════════════
