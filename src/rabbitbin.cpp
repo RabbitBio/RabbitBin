@@ -3256,7 +3256,7 @@ static int rb_cmd_bin(int ac, char *av[]) {
       ("add-depth", po::value<std::string>(&g_add_depth_file), "Incremental multi-sample: with --load-cache, append this depth file's samples as NEW samples on the cached composition graph (no re-sketch)")
       ("min-contig,m", po::value<size_t>(&minContig)->default_value(2500), "Minimum contig length (>=1500)")
       ("min-small-contig", po::value<size_t>(&min_small_contig)->default_value(1000), "Min length for small-contig recruiting")
-      ("min-edge-score", po::value<Similarity>(&min_edge_weight)->default_value(70), "Minimum edge weight (2-99, percent); coverage only for >=3 samples. Default 70.")
+      ("min-edge-score", po::value<Similarity>(&min_edge_weight)->default_value(100.0 * DEFAULT_MIN_EDGE_WEIGHT, "71.53318629591614"), "Minimum edge weight (percent, >1 and <100; decimals accepted); coverage only for >=3 samples. Default: two-edge Fisher neutral point.")
       ("gfa", po::value<std::string>(&g_gfa_file), "Assembly graph (GFA) whose L-links/P-paths are injected as high-weight same-genome edges")
       ("gfa-weight", po::value<double>(&g_gfa_weight)->default_value(0.90), "Edge weight assigned to GFA links (0,1)")
       ("confidence", po::value<bool>(&g_emit_confidence)->zero_tokens(), "Emit per-contig assignment confidence (members.tsv column + <prefix>.confidence.tsv soft assignment)")
@@ -3516,7 +3516,7 @@ static int rb_cmd_bin(int ac, char *av[]) {
   }
 
   print_message("RabbitBin (%s) using minContig %d, minCV %2.1f, "
-                "minCVSum %2.1f, min_edge_weight %2.0f, maxEdges %d, "
+                "minCVSum %2.1f, min_edge_weight %.12g%%, maxEdges %d, "
                 "min_bin_bp %d, sketch-k %d, sketch-m %d, seed=%lld\n",
                 version.c_str(), minContig, minCV, minCVSum, min_edge_weight,
                 maxEdges, min_bin_bp, sketch_kmer_size, sketch_size, seed);

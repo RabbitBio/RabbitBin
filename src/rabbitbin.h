@@ -157,7 +157,11 @@ static bool no_gold = false;
 static size_t min_small_contig =
     1000;          // minimum contig size for small contig binning
 static size_t numThreads = 0;
-static Similarity min_edge_weight = 60;
+// Neutral point of two equal-weight Fisher supports: A2(tau) = A1(tau),
+// i.e. (1-tau) * (1-2*log(1-tau)) = 1, with 0 < tau < 1.
+// The CLI takes percentages; rb_cmd_bin normalizes min_edge_weight once.
+static constexpr double DEFAULT_MIN_EDGE_WEIGHT = 0.7153318629591614;
+static Similarity min_edge_weight = 100.0 * DEFAULT_MIN_EDGE_WEIGHT;
 static Distance minCV = 1.0;
 static Distance minCVSum = 1;
 static bool saveCls = false;

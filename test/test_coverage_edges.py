@@ -9,11 +9,14 @@ import subprocess
 import sys
 
 
+DEFAULT_EDGE_CUTOFF = 0.7153318629591614
+
 PROFILES = {
     "anchor": (10, 20, 30, 40),
     "identical": (10, 20, 30, 40),
     "scaled": (20, 40, 60, 80),
     "above_cut": (13, 27, 41, 55),
+    "just_below_cut": (14, 28, 42, 56),
     "below_cut": (15, 30, 45, 60),
     "swapped": (10, 20, 40, 30),
     "reverse": (40, 30, 20, 10),
@@ -41,7 +44,7 @@ def near(actual, expected, label):
         raise AssertionError(f"{label}: got {actual}, expected {expected}")
 
 
-def check_edges(rows, samples, power=1.0):
+def check_edges(rows, samples, power=1.0, cutoff=DEFAULT_EDGE_CUTOFF):
     means = [sum(p[s] for p in PROFILES.values()) / len(PROFILES)
              for s in range(samples)]
     if not rows:
@@ -58,12 +61,12 @@ def check_edges(rows, samples, power=1.0):
                 denominator) if denominator else 0.0
         raw = min(max(rho, 0.0), jcov)
         if samples >= 3:
-            weight = raw ** power if raw >= 0.70 else 0.0
+            weight = raw ** power if raw >= cutoff else 0.0
         else:
             # The original two-sample path uses composition after its signed
             # depth gate, then applies the same edge threshold and power.
             composition = float(row["sComp"]) if rho >= -0.3 else 0.0
-            weight = composition ** power if composition >= 0.70 else 0.0
+            weight = composition ** power if composition >= cutoff else 0.0
         near(float(row["rho"]), rho, f"{key} rho")
         near(float(row["Jcov"]), jcov, f"{key} Jcov")
         near(float(row["dterm"]), raw, f"{key} raw weight")
@@ -78,6 +81,7 @@ def check_edges(rows, samples, power=1.0):
     # Equal rank patterns alone cannot rescue mismatched coverage magnitudes.
     # Conversely, identical coverage must give weight 1 even if PMH differs.
     for other, positive in [("identical", True), ("above_cut", True),
+                            ("just_below_cut", 5 / 7 >= cutoff),
                             ("below_cut", False), ("scaled", False),
                             ("reverse", False), ("constant", False),
                             ("zero", False)]:
@@ -148,6 +152,16 @@ def main():
     cache = work / "coverage.cache"
     baseline, _ = run("four", extra=("--save-cache", str(cache)))
     check_edges(baseline, 4)
+    explicit, _ = run("explicit_cutoff", extra=(
+        "--min-edge-score", repr(100 * DEFAULT_EDGE_CUTOFF)))
+    if explicit != baseline:
+        raise AssertionError("default and explicit fractional cutoff differ")
+    lower, _ = run("lower_cutoff", extra=("--min-edge-score", "70"))
+    check_edges(lower, 4, cutoff=0.7)
+    # This magnitude ratio lies between 0.70 and the Fisher-derived default.
+    boundary = tuple(sorted(("anchor", "just_below_cut")))
+    if float(baseline[boundary]["weight"]) != 0 or float(lower[boundary]["weight"]) <= 0:
+        raise AssertionError("fractional default and explicit override must separate the boundary pair")
     varied_rows, _ = run("varied", assembly=varied)
     check_edges(varied_rows, 4)
     if baseline.keys() != varied_rows.keys():
