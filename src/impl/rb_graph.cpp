@@ -483,8 +483,8 @@ static void gen_fused_graph(Graph &g) {
       }
       abd_u = abd_unit.data();
     }
-    verbose_message("Abundance-first prune: skip pairs with depth corr < %.4f "
-                    "(coverage-only, min_edge=%.2f)%s\n",
+    verbose_message("Abundance-first prune: skip pairs with depth corr < %.12g "
+                    "(coverage-only, min_edge=%.12g)%s\n",
                     abd_corr_min, (double)min_edge_weight,
                     abd_reused ? " [reused g_depth_unit]" : "");
 #if defined(__AVX512VNNI__) && defined(__AVX512BW__)

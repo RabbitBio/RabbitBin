@@ -167,9 +167,18 @@ Both bounds are user-settable: `--min-contig` accepts any value ≥ 1500 and
    have zero correlation support; an all-zero Jaccard denominator gives zero
    support. PMH composition similarity does not enter `w`.
 
-   Edges with `w < 0.70` are dropped by default (`--min-edge-score 70`, expressed
-   as a percentage). This is a survival threshold on the coverage weight, not a
-   mixing coefficient. No edge-power transform is applied by default. The former
+   Edges with `w < tau` are dropped, with the default
+   `tau = 0.7153318629591614` (`--min-edge-score 71.53318629591614`, expressed
+   as a percentage). The cutoff is the neutral point at which two equal-weight
+   Fisher supports have the same score as one support. It is the unique solution
+   in `(0, 1)` of
+
+   $$(1-\tau)[1-2\ln(1-\tau)]=1.$$
+
+   This adopts the two-term Fisher soft truncation boundary on the weight scale
+   ([Zaykin et al., 2007](https://pmc.ncbi.nlm.nih.gov/articles/PMC2569904/))
+   as a local scoring consistency rule. No edge-power transform is applied by
+   default. The former
    `RABBIT_W_COMP` override is ignored, with a message when it is set.
 
    Optional coverage-metric ablations (`RABBIT_DEPTH_SIM`, `RABBIT_DEPTH_FUSE`),
@@ -310,7 +319,7 @@ reused, while edge weights are recomputed.
 | `-m, --min-contig` | 2500 | Minimum length of a clustered contig (must be ≥1500) |
 | `--min-small-contig` | 1000 | Minimum length of a recruitable short contig (must be ≥500); shorter contigs are discarded |
 | `-s, --min-bin-size` | 200000 | Minimum output bin size (bp) |
-| `--min-edge-score` | 70 | Minimum edge weight, percent (2–99); coverage weight for `S >= 3` |
+| `--min-edge-score` | 71.53318629591614 | Minimum edge weight, percent (>1 and <100, decimals accepted); coverage weight for `S >= 3` |
 | `--max-edges` | 200 | Maximum PMH neighbours per contig among production-feasible pairs, before mutual filtering |
 | `--sketch-m` | 500 | Number of ProbMinHash registers |
 | `--validate-pmh-gold` | — | Evaluate sequence-only PMH top-N neighbourhoods against CAMI gold, write TSV, and exit |
