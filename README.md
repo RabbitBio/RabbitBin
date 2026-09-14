@@ -1,7 +1,8 @@
 # RabbitBin
 
 Fast, sketch-based metagenome binning. The default RabbitBin pipeline uses
-canonical, count-weighted 4-mer ProbMinHash (PMH) sketches to construct a
+canonical 4-mer ProbMinHash (PMH) sketches weighted by enrichment relative to
+each contig's own base composition to construct a
 bounded mutual-nearest-neighbour candidate graph, uses abundance profiles as
 the edge evidence in the standard multi-sample setting, clusters the retained
 graph with Fisher label propagation, and re-splits multi-modal bins. One final
@@ -145,8 +146,16 @@ Both bounds are user-settable: `--min-contig` accepts any value ≥ 1500 and
 **Graph construction**
 
 1. **4-mer PMH sketching.** Each large contig is represented by a weighted
-   ProbMinHash sketch over canonical 4-mer counts, with `--sketch-m`
-   (default 500) registers.
+   ProbMinHash sketch over canonical 4-mers, with `--sketch-m`
+   (default 500) registers. The default weight measures enrichment relative
+   to the contig's own base composition:
+
+   $$w_c(x)=\frac{f_c(x)/\sum_y f_c(y)}{P_c(x)+P_c(\operatorname{rc}(x))},
+   \qquad P_c(x)=\prod_{\ell=1}^{4}\pi_c(x_\ell).$$
+
+   Here `f_c(x)` counts canonical 4-mer occurrences, `pi_c(b)` is the frequency
+   of base `b` among the contig's A/C/G/T bases, and `rc(x)` is the reverse
+   complement of `x`. A denominator at or below `1e-14` gives zero weight.
 2. **Bounded mutual candidate graph.** In the standard multi-sample path, an
    exact abundance-feasibility bound first removes pairs that cannot pass the
    final edge threshold. PMH similarity then retains at most `--max-edges`

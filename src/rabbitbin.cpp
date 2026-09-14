@@ -189,8 +189,8 @@ static uint32_t g_sig_np = 0;  // bit-planes per sketch (b_)
 static uint32_t g_sig_m  = 0;  // m_ (bucket count)
 
 // ── Weighted ProbMinHash4 path (RABBIT_PMH=1) ─────────────────────────────
-// When enabled, the large-contig similarity graph uses a frequency-weighted
-// ProbMinHash4 sketch (small k, k-mer counts as weights)
+// When enabled, the large-contig similarity graph uses a weighted
+// ProbMinHash4 sketch (small k, contig-specific enrichment weights by default)
 // instead of the OPH b-bit signature.  This estimates the weighted Jaccard
 // Σmin(wA,wB)/Σmax(wA,wB) over the small-k composition spectrum.
 //
@@ -388,9 +388,7 @@ static std::string g_add_depth_file;   // --add-depth PATH ("" = disabled)
 //                       expected(ABCDEF) = P(A)·P(B|A)·P(C|B)·P(D|C)·P(E|D)·P(F|E)
 //                     P(b|a) estimated from the contig's own dinucleotide counts.
 //                     Removes both GC and dinucleotide-context bias (CpG suppression etc.)
-//   Enrichment ratios are capped at RABBIT_GC_NORM_CAP (default 20).
 static int    g_gc_norm     = 1;    // RABBIT_GC_NORM: 0=off, 1=per-base, 2=dinucleotide
-static double g_gc_norm_cap = 20.0;
 
 // Environment-variable helpers.
 static const char *rb_getenv(const char *key) {
@@ -1343,10 +1341,11 @@ static inline double graph_sim(size_t i, size_t j) {
                      g_sig_nw, g_sig_np, g_sig_m);
 }
 
-// Build a frequency-weighted ProbMinHash4 sketch for one contig and copy its
-// winner-identity array into out_winners[0..m).  k-mer counts (canonical) are
-// used as element weights, so the resulting jaccard_weighted ≈ weighted Jaccard
-// over the small-k composition spectrum.  `scratch` is a caller
+// Build a weighted ProbMinHash4 sketch for one contig and copy its
+// winner-identity array into out_winners[0..m). Canonical k-mer frequencies
+// are divided by their contig-specific background probabilities by default.
+// The resulting sketch represents the weighted small-k composition spectrum.
+// `scratch` is a caller
 // owned reusable buffer (avoids per-contig reallocation in the parallel loop).
 // out_winners32: folded 32-bit winners (for SIMD pmh_match_frac kernel)
 // out_winners64: full 64-bit winners (for inverted-index key lookup), may be null
@@ -1413,7 +1412,6 @@ static void build_pmh_winners(const char *seq, size_t len, int k, uint32_t m,
           double p[4];
           for (int b = 0; b < 4; ++b) p[b] = vb > 0 ? (double)base_cnt[b]/(double)vb : 0.25;
           const double inv = 1.0 / (double)total;
-          const double cap = g_gc_norm_cap;
           if (out_k4freq && k == 4) std::fill(out_k4freq, out_k4freq + 256, 0.0f);
           for (uint64_t v = 0; v < NB; ++v) {
             if (!scratch[v]) continue;
@@ -1426,7 +1424,7 @@ static void build_pmh_winners(const char *seq, size_t len, int k, uint32_t m,
             }
             const double obs_f = (double)scratch[v] * inv;
             const double exp_f = p_fwd + p_rev;
-            const double w = (exp_f > 1e-14) ? std::min(obs_f / exp_f, cap) : 0.0;
+            const double w = (exp_f > 1e-14) ? obs_f / exp_f : 0.0;
             if (w > 0.0) {
               pmh.addHash(v, w);
               if (out_k4freq && k == 4) out_k4freq[v] = (float)w;
@@ -1450,7 +1448,6 @@ static void build_pmh_winners(const char *seq, size_t len, int k, uint32_t m,
               p_cond[a][b] = (dinuc_cnt[a][b] + 1.0) / rs;
           }
           const double inv = 1.0 / (double)total;
-          const double cap = g_gc_norm_cap;
           for (uint64_t v = 0; v < NB; ++v) {
             if (!scratch[v]) continue;
             // Decode k bases: bases[0]=lsb=first in sequence
@@ -1466,7 +1463,7 @@ static void build_pmh_winners(const char *seq, size_t len, int k, uint32_t m,
               p_rev *= p_cond[3u - bases[k-i]][3u - bases[k-1-i]];
             const double exp_f = p_fwd + p_rev;
             const double obs_f = (double)scratch[v] * inv;
-            const double w = (exp_f > 1e-16) ? std::min(obs_f / exp_f, cap) : 0.0;
+            const double w = (exp_f > 1e-16) ? obs_f / exp_f : 0.0;
             if (w > 0.0) pmh.addHash(v, w);
           }
         }
@@ -3878,8 +3875,6 @@ static int rb_cmd_bin(int ac, char *av[]) {
       // Read precision-tuning globals early so build_pmh_winners (called inline
       // in parse_fasta_mmap_parallel) already sees the correct settings.
       g_gc_norm      = rb_env_gc_norm();
-      g_gc_norm_cap  = [] { const char *e = rb_getenv("RABBIT_GC_NORM_CAP");
-                            double v = e ? std::atof(e) : 20.0; return (v < 1.0) ? 20.0 : v; }();
       g_idf_norm     = [] { const char *e = rb_getenv("RABBIT_IDF_NORM"); return e && e[0] == '1'; }();
       g_exact_cos_cmp = [] { const char *e = rb_getenv("RABBIT_EXACT_COS");
                              return e && std::atoi(e) >= 1; }();
@@ -4566,8 +4561,6 @@ static int rb_cmd_bin(int ac, char *av[]) {
   g_edge_power  = [] { const char *e = rb_getenv("RABBIT_EDGE_POWER"); double v = e ? std::atof(e) : 1.0;
                        return (v < 0.1) ? 1.0 : v; }();
   g_gc_norm     = rb_env_gc_norm();
-  g_gc_norm_cap = [] { const char *e = rb_getenv("RABBIT_GC_NORM_CAP"); double v = e ? std::atof(e) : 20.0;
-                       return (v < 1.0) ? 20.0 : v; }();
   if (g_pmh_mode && !from_cache) {
     g_pmh_m    = sketch_size;
     g_inv_pmh_m = (g_pmh_m > 0) ? (1.0 / (double)g_pmh_m) : 0.0;
@@ -4582,7 +4575,7 @@ static int rb_cmd_bin(int ac, char *av[]) {
       g_win_flat.assign((size_t)nobs * g_pmh_m, 0u);
     }
     verbose_message("RABBIT_PMH=1: weighted ProbMinHash4 graph metric "
-                    "(k=%d, m=%u, count-weighted Jaccard, baseline_corr=%d)\n",
+                    "(k=%d, m=%u, weighted Jaccard, baseline_corr=%d)\n",
                     g_pmh_k, g_pmh_m, (int)g_pmh_base_on);
   }
 
@@ -4688,7 +4681,7 @@ static int rb_cmd_bin(int ac, char *av[]) {
           g_sketches[r]->freeRegisters();                             // free reg_[]
       }
 
-      // ── Weighted ProbMinHash4 winners (RABBIT_PMH=1): frequency-weighted,
+      // ── Weighted ProbMinHash4 winners (RABBIT_PMH=1): weighted,
       //     small-k composition spectrum ───────────────────────────────────
       // Skip when g_pmh_built_streaming: winners were already written to
       // g_win_flat during the kseq streaming pass (streaming producer-consumer).
