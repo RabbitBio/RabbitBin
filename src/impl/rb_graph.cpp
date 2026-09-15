@@ -427,7 +427,7 @@ static void gen_fused_graph(Graph &g) {
       (g_depth_sim == 0 ||
        (g_depth_sim == 2 && (g_depth_fuse == 1 || g_depth_fuse == 2)));
   const bool abdfirst = (getenv("RABBIT_NO_ABDFIRST") == nullptr) &&
-                        num_depth_samples >= 3 && corr_bounds_weight &&
+                        g_coverage_samples >= 3 && corr_bounds_weight &&
                         rb_env_edge_cut_mode() == 0;
   const double abd_corr_min = abdfirst ? (double)min_edge_weight : -2.0;
   // Precompute per-contig unit rank vectors u_i so the abundance correlation

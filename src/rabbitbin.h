@@ -268,7 +268,7 @@ public:
       incs; // incidence list which has edge id instead of node id (compared to
             // adjacent list)
   std::vector<StoredDistance> sComp;
-  std::vector<StoredDistance> edgeScore; // coverage weight for S>=3; composition if S<=2
+  std::vector<StoredDistance> edgeScore; // coverage weight; composition when no depth is available
   ContigSet connected_nodes;
   bool hasEdges;
 

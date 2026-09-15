@@ -159,6 +159,12 @@ static double             g_depth_wjac_cut  = 0.0;
 static bool               g_depth_wjac_gate = false;
 static std::vector<float> g_depth_raw;             // nobs × num_depth_samples (raw, pre-rank)
 static std::vector<double> g_depth_colnorm;        // num_depth_samples (empty = no norm)
+// Independent input samples, before BAM dual-depth or auxiliary columns are
+// appended. The ordinary coverage block occupies the first of these columns.
+static size_t g_coverage_samples = 0;
+static inline bool low_sample_coverage() {
+  return g_coverage_samples > 0 && g_coverage_samples <= 2;
+}
 // Centered + L2-normalised rank vectors (nobs × num_depth_samples).  Pearson on
 // ranks == dot product of these unit rows, so the edge-weight corr term becomes a
 // single length-S FMA dot product instead of the per-pair Welford (3 divisions /
@@ -235,10 +241,11 @@ static double g_pmh_baseline = 0.0;       // estimated chance-collision baseline
 static double g_inv_pmh_m        = 0.0;   // 1.0 / g_pmh_m
 static double g_inv_one_minus_b0 = 1.0;   // 1.0 / (1.0 - g_pmh_baseline)
 
-// With S>=3 coverage samples, graph weights use coverage only:
+// With >=3 input samples, graph weights use coverage only:
 //   w = min(max(Spearman(i,j), 0), weighted_Jaccard_coverage(i,j)).
 // Composition similarity selects candidate neighbours; it is not an edge term.
-// S<=2 retains the original composition-weighted fallback.
+// With 1-2 input samples, average min/max ratios over informative coverage
+// features, including both ordinary and MAPQ-filtered depth for BAM input.
 
 // Graph precision controls:
 //   RABBIT_MUTUAL_KNN     default on (RABBIT_MUTUAL_KNN=0 disables)
@@ -337,7 +344,7 @@ static bool   g_snv_edge       = false;     // blend SNV trajectory into edges
 static double g_snv_edge_lo    = 0.10;      // |cos| below this ⇒ different strain
 static int    g_snv_traj_minrep = 2;        // min reporting samples per site
 // Dual-coverage: when >0, append a unique-read (MAPQ>=g_dual_q) depth block as
-// extra samples alongside the all-read block (opt-in RABBIT_DUAL_DEPTH).
+// extra features alongside the all-read block (default --dual-depth=5).
 static int    g_dual_q         = 0;
 // Conjunctive dual metric (opt-in RABBIT_DUAL_CONJ, needs g_dual_q): an edge's
 // depth correlation is min(corr over the all-read half, corr over the unique-
@@ -598,6 +605,19 @@ static inline double cal_depth_wjac(size_t r1, size_t r2) {
   return mn / mx;
 }
 
+#include "impl/rb_coverage.h"
+
+static inline double cal_depth_mean_ratio(size_t r1, size_t r2) {
+  if (g_depth_raw.empty()) return 0.0;
+  const float *a = g_depth_raw.data() + r1 * num_depth_samples;
+  const float *b = g_depth_raw.data() + r2 * num_depth_samples;
+  // Per-feature normalization cancels within each min/max ratio. The input
+  // sample count selects this path; all available coverage columns contribute.
+  return rb_mean_coverage_ratio(num_depth_samples,
+      [&](size_t s) { return (double)a[s]; },
+      [&](size_t s) { return (double)b[s]; });
+}
+
 // Fast Pearson-on-ranks for two LARGE contigs via the precomputed unit vectors:
 // corr(i,j) == Σ_k u_i[k]·u_j[k] (g_depth_unit holds centered+L2-normalised rank
 // rows).  Pure FMA dot product — no per-element division, no per-pair sqrt — and
@@ -827,6 +847,7 @@ static inline double snv_traj_cos(size_t i, size_t j) {
 // non-finite correlation or an edge rejected by an enabled evidence gate.
 static inline double depth_edge_term(size_t i, size_t j, bool &ok) {
   ok = true;
+  if (low_sample_coverage()) return cal_depth_mean_ratio(i, j);
   // SNV-aware strain gate (opt-in): when both contigs carry a trajectory
   // fingerprint and it strongly DISAGREES, they are different strains that
   // cross-mapping made look depth-similar — cut the edge to protect purity.
@@ -867,22 +888,21 @@ static inline double depth_edge_term(size_t i, size_t j, bool &ok) {
   return cp;
 }
 
-// Shared by production, graph reuse and stability certification. The S<=2
-// composition fallback retains its original depth gates and cutoff behaviour.
-// For S>=3 the score comes entirely from coverage, with no composition blend.
+// Shared by production, graph reuse and stability certification. Coverage
+// determines the weight whenever it is available; PMH selects candidate edges.
 static inline double depth_graph_raw_weight(size_t i, size_t j,
                                            StoredDistance composition) {
-  if (num_depth_samples <= 1) return (double)composition;
+  if (num_depth_samples == 0) return (double)composition;
   bool ok;
   const double depth = depth_edge_term(i, j, ok);
   if (!ok) return 0.0;
-  return num_depth_samples >= 3 ? depth : (double)composition;
+  return depth;
 }
 
 static inline StoredDistance depth_graph_edge_score(size_t i, size_t j,
                                                     StoredDistance composition) {
   double w = depth_graph_raw_weight(i, j, composition);
-  if (num_depth_samples > 1 &&
+  if (num_depth_samples > 0 &&
       (!std::isfinite(w) || w < (double)min_edge_weight)) return 0.0f;
   if (g_edge_power != 1.0 && w > 0.0) w = std::pow(w, g_edge_power);
   return (StoredDistance)w;
@@ -899,20 +919,20 @@ static void dump_coverage_edge_scores(const Graph &g) {
     cerr << "[Warn] RB_PAIR_DUMP: cannot open " << path << "\n";
     return;
   }
-  fprintf(f, "name_i\tname_j\tsComp\tdterm\tok\trho\tJcov\tweight\n");
+  fprintf(f, "name_i\tname_j\tsComp\tdterm\tok\trho\tJcov\tweight\tAmean\n");
   for (size_t e = 0; e < g.from.size(); ++e) {
     if (edge_is_gfa(g.sComp[e])) continue;
     const size_t i = g.from[e], j = g.to[e];
     if (i >= contig_names.size() || j >= contig_names.size()) continue;
     bool ok = true;
     const double undefined = std::numeric_limits<double>::quiet_NaN();
-    const double d = num_depth_samples > 1 ? depth_edge_term(i, j, ok) : undefined;
-    fprintf(f, "%s\t%s\t%.9g\t%.9g\t%d\t%.9g\t%.9g\t%.9g\n",
+    const double d = depth_edge_term(i, j, ok);
+    fprintf(f, "%s\t%s\t%.9g\t%.9g\t%d\t%.9g\t%.9g\t%.9g\t%.9g\n",
             contig_names[i].c_str(), contig_names[j].c_str(),
             (double)g.sComp[e], d, ok ? 1 : 0,
-            num_depth_samples > 1 ? depth_corr_fast(i, j) : undefined,
-            num_depth_samples > 1 ? cal_depth_wjac(i, j) : undefined,
-            (double)g.edgeScore[e]);
+            low_sample_coverage() ? undefined : depth_corr_fast(i, j),
+            cal_depth_wjac(i, j), (double)g.edgeScore[e],
+            low_sample_coverage() ? cal_depth_mean_ratio(i, j) : undefined);
   }
   fclose(f);
   verbose_message("RB_PAIR_DUMP: wrote %zu candidate pairs to %s\n",
@@ -2885,8 +2905,13 @@ static int apply_incremental_depth(const std::string &add_file) {
   }
 
   const size_t old_S = (size_t)num_depth_samples;
+  const size_t old_samples = g_coverage_samples;
   const size_t tot_S = old_S + (size_t)new_S;
+  const size_t total_samples = old_samples + (size_t)new_S;
   const size_t nL = (size_t)nobs, nS = (size_t)nobs1;
+  // Keep ordinary sample columns together, ahead of any cached auxiliary
+  // BAM columns, so a one-to-two-sample update still uses the correct inputs.
+  auto old_column = [&](size_t k) { return k < old_samples ? k : k + new_S; };
 
   // Expand raw large-contig depth + means, copying old columns then appending
   // the new samples (matched by contig name; absent → 0).
@@ -2898,16 +2923,16 @@ static int apply_incremental_depth(const std::string &add_file) {
       const size_t o = i * old_S + k;
       const float v  = (o < g_depth_raw.size())   ? g_depth_raw[o]   : 0.0f;
       const float mv = (o < g_large_means.size()) ? g_large_means[o] : v;
-      new_raw[i * tot_S + k]   = v;
-      new_means[i * tot_S + k] = mv;
+      new_raw[i * tot_S + old_column(k)]   = v;
+      new_means[i * tot_S + old_column(k)] = mv;
     }
     auto it = m.find(contig_names[i]);
     if (it != m.end()) {
       ++matched;
       for (int j = 0; j < new_S; ++j) {
         const float v = (j < (int)it->second.means.size()) ? it->second.means[j] : 0.0f;
-        new_raw[i * tot_S + old_S + j]   = v;
-        new_means[i * tot_S + old_S + j] = v;
+        new_raw[i * tot_S + old_samples + j]   = v;
+        new_means[i * tot_S + old_samples + j] = v;
       }
     }
   }
@@ -2923,7 +2948,8 @@ static int apply_incremental_depth(const std::string &add_file) {
 #pragma omp for schedule(static)
     for (size_t i = 0; i < nL; ++i) {
       for (size_t k = 0; k < tot_S; ++k) rin[k] = g_depth_raw[i * tot_S + k];
-      rank(rin, rout);
+      if (total_samples >= 3) rank(rin, rout);
+      else rout = rin;
       for (size_t k = 0; k < tot_S; ++k)
         depth_matrix(i, k) = (StoredDistance)rout[k];
     }
@@ -2934,11 +2960,11 @@ static int apply_incremental_depth(const std::string &add_file) {
     Matrix new_small(nS, tot_S);
     for (size_t i = 0; i < nS; ++i) {
       for (size_t k = 0; k < old_S; ++k)
-        new_small(i, k) = (k < small_depth_matrix.size2()) ? small_depth_matrix(i, k)
+        new_small(i, old_column(k)) = (k < small_depth_matrix.size2()) ? small_depth_matrix(i, k)
                                                            : (StoredDistance)0;
       auto it = m.find(small_contig_names[i]);
       for (int j = 0; j < new_S; ++j)
-        new_small(i, old_S + j) =
+        new_small(i, old_samples + j) =
             (it != m.end() && j < (int)it->second.means.size())
                 ? (StoredDistance)it->second.means[j] : (StoredDistance)0;
     }
@@ -2946,9 +2972,19 @@ static int apply_incremental_depth(const std::string &add_file) {
   }
 
   num_depth_samples = (int)tot_S;
+  g_coverage_samples = total_samples;
+  g_depth_colnorm.clear();
+  if (rb_env_depth_wjac_norm_on()) {
+    g_depth_colnorm.assign(tot_S, 1.0);
+    for (size_t k = 0; k < tot_S; ++k) {
+      double total = 0.0;
+      for (size_t i = 0; i < nL; ++i) total += g_depth_raw[i * tot_S + k];
+      if (total > 0.0) g_depth_colnorm[k] = (double)nL / total;
+    }
+  }
   verbose_message("Incremental: appended %d sample(s) from %s (%zu/%zu large "
                   "contigs matched); total samples %zu -> %zu\n",
-                  new_S, add_file.c_str(), matched, nL, old_S, tot_S);
+                  new_S, add_file.c_str(), matched, nL, old_samples, total_samples);
   return (int)tot_S;
 }
 
@@ -3253,7 +3289,7 @@ static int rb_cmd_bin(int ac, char *av[]) {
       ("add-depth", po::value<std::string>(&g_add_depth_file), "Incremental multi-sample: with --load-cache, append this depth file's samples as NEW samples on the cached composition graph (no re-sketch)")
       ("min-contig,m", po::value<size_t>(&minContig)->default_value(2500), "Minimum contig length (>=1500)")
       ("min-small-contig", po::value<size_t>(&min_small_contig)->default_value(1000), "Min length for small-contig recruiting")
-      ("min-edge-score", po::value<Similarity>(&min_edge_weight)->default_value(100.0 * DEFAULT_MIN_EDGE_WEIGHT, "71.53318629591614"), "Minimum edge weight (percent, >1 and <100; decimals accepted); coverage only for >=3 samples. Default: two-edge Fisher neutral point.")
+      ("min-edge-score", po::value<Similarity>(&min_edge_weight)->default_value(100.0 * DEFAULT_MIN_EDGE_WEIGHT, "71.53318629591614"), "Minimum coverage edge weight (percent, >1 and <100; decimals accepted). Default: two-edge Fisher neutral point.")
       ("gfa", po::value<std::string>(&g_gfa_file), "Assembly graph (GFA) whose L-links/P-paths are injected as high-weight same-genome edges")
       ("gfa-weight", po::value<double>(&g_gfa_weight)->default_value(0.90), "Edge weight assigned to GFA links (0,1)")
       ("confidence", po::value<bool>(&g_emit_confidence)->zero_tokens(), "Emit per-contig assignment confidence (members.tsv column + <prefix>.confidence.tsv soft assignment)")
@@ -3567,13 +3603,10 @@ static int rb_cmd_bin(int ac, char *av[]) {
     cvExt = false;
     has_depth = true;
     num_depth_samples = (int)fuse_bams.size();
-    // Dual-coverage feature (opt-in RABBIT_DUAL_DEPTH=q): append a second,
-    // unique-read (MAPQ>=q) depth block as extra "samples".  The unique-read
-    // coverage is the same BAM's clean signal — cross-mapped (low-MAPQ) reads
-    // are excluded — so the Spearman edge metric estimates over richer, cleaner
-    // dimensions. Doubles the depth columns.
+    g_coverage_samples = fuse_bams.size();
     // Dual coverage (default ON, q=5 via --dual-depth): append a unique-read
     // depth block as extra abundance dimensions, computed in the SAME BAM scan.
+    // These are additional features, not additional independent samples.
     // The SNV pass (--strain) forces its own depth scan and disables dual, so
     // only double the columns when dual will actually run. Env RABBIT_DUAL_DEPTH
     // overrides the CLI value; set either to 0 to disable.
@@ -3732,6 +3765,7 @@ static int rb_cmd_bin(int ac, char *av[]) {
         }
         num_depth_samples /= 2;
       }
+      g_coverage_samples = num_depth_samples;
       // Launch depth_matrix pre-parse on a background thread.  It runs while
       // libdeflate decompresses and parses the FASTA below.
       const std::string async_depth_file = depth_file;
@@ -4535,7 +4569,7 @@ static int rb_cmd_bin(int ac, char *av[]) {
   }();
 
   verbose_message("Building composition sketches%s. nobs=%zd k=%d m=%d\n",
-                  (num_depth_samples > 1 ? " + abundance ranking" : ""),
+                  (g_coverage_samples >= 3 ? " + abundance ranking" : ""),
                   nobs, sketch_kmer_size, sketch_size);
 
   // ── Weighted ProbMinHash4 path setup must come BEFORE builder creation ──
@@ -4543,14 +4577,16 @@ static int rb_cmd_bin(int ac, char *av[]) {
   g_pmh_k       = [] { const char *e = rb_getenv("RABBIT_PMHK"); return e ? std::atoi(e) : 4; }();
   g_pmh_base_on = [] { const char *e = rb_getenv("RABBIT_PMH_BASE"); return !e || e[0] != '0'; }();
   if (rb_getenv("RABBIT_W_COMP"))
-    cerr << "[Warn] RABBIT_W_COMP is ignored: S>=3 uses coverage weights; "
-            "S<=2 retains composition weights.\n";
-  if (has_depth && num_depth_samples >= 3)
-    verbose_message("Edge weighting: S=%zu; coverage only, "
-                    "PMH selects candidate neighbours\n", num_depth_samples);
+    cerr << "[Warn] RABBIT_W_COMP is ignored: coverage determines edge weights "
+            "when available.\n";
+  if (has_depth)
+    verbose_message("Edge weighting: S=%zu; %s; coverage columns=%zu; "
+                    "PMH selects candidate neighbours\n", g_coverage_samples,
+                    low_sample_coverage() ? "mean coverage-feature ratio" :
+                                            "coverage only",
+                    num_depth_samples);
   else
-    verbose_message("Edge weighting: S=%zu; composition-only fallback "
-                    "(fewer than three coverage samples)\n", num_depth_samples);
+    verbose_message("Edge weighting: S=0; composition only (no coverage)\n");
   g_depth_sim       = rb_env_depth_sim();
   g_depth_fuse      = rb_env_depth_fuse();
   g_depth_wjac_norm = rb_env_depth_wjac_norm_on();
@@ -4619,7 +4655,7 @@ static int rb_cmd_bin(int ac, char *av[]) {
   // is skipped entirely.
   if (!from_cache) {
   if ((!marker_seed_file.empty() || g_split_abundance ||
-       (g_bin_recruit && num_depth_samples <= 2)) &&
+       (g_bin_recruit && low_sample_coverage())) &&
       num_depth_samples >= 1) {
     g_large_means.assign((size_t)nobs * num_depth_samples, 0.0f);
     for (size_t r = 0; r < nobs; ++r)
@@ -4627,9 +4663,9 @@ static int rb_cmd_bin(int ac, char *av[]) {
         g_large_means[r * num_depth_samples + i] = (float)depth_matrix(r, i);
   }
 
-  // Weighted-Jaccard abundance metric needs RAW per-sample depths (magnitudes),
+  // Coverage ratios and weighted Jaccard need RAW per-sample depths (magnitudes),
   // so snapshot them here BEFORE the in-place Spearman rank transform below.
-  if (g_depth_sim >= 1 && num_depth_samples > 1) {
+  if (num_depth_samples > 0 && (g_depth_sim >= 1 || low_sample_coverage())) {
     g_depth_raw.assign((size_t)nobs * num_depth_samples, 0.0f);
     for (size_t r = 0; r < nobs; ++r)
       for (size_t i = 0; i < (size_t)num_depth_samples; ++i)
@@ -4648,6 +4684,7 @@ static int rb_cmd_bin(int ac, char *av[]) {
       g_depth_colnorm.clear();
     }
     verbose_message("Abundance edge metric: %s (per-sample norm %s)\n",
+                    low_sample_coverage() ? "mean coverage-feature ratio" :
                     g_depth_sim != 2 ? "weighted Jaccard" :
                     g_depth_fuse == 1 ? "min(max(Spearman,0),coverage Jaccard)" :
                     g_depth_fuse == 2 ? "max(Spearman,0)*coverage Jaccard" :
@@ -4694,7 +4731,7 @@ static int rb_cmd_bin(int ac, char *av[]) {
       }
 
       // ── Spearman ranking (Fusion E): rank depth_matrix[r] in-place per thread
-      if (num_depth_samples > 1) {
+      if (g_coverage_samples >= 3) {
         auto &rowMat = threadRowMat[omp_get_thread_num()];
         MatrixRowType rRow(depth_matrix, r);
         std::copy(rRow.begin(), rRow.end(), rowMat.begin());
@@ -4726,9 +4763,9 @@ static int rb_cmd_bin(int ac, char *av[]) {
   rb_phase("comp sketch loop done");
   verbose_message("Composition sketches ready%s. [%.1fGb / %.1fGb]"
                   "                          \n",
-                  (num_depth_samples > 1 ? " + Spearman" : ""),
+                  (g_coverage_samples >= 3 ? " + Spearman" : ""),
                   getUsedPhysMem(), getTotalPhysMem() / 1024 / 1024);
-  if (num_depth_samples > 1) verbose_message("Calculated spearman for large contigs\n");
+  if (g_coverage_samples >= 3) verbose_message("Calculated spearman for large contigs\n");
 
   rb_phase("parse+sketch done");
   if (!from_cache) rb_seq_integrity_check("post-parse");
@@ -4802,7 +4839,7 @@ static int rb_cmd_bin(int ac, char *av[]) {
   // dot product (depth_corr_fast) instead of the per-pair Welford (3 div/sample +
   // 2 sqrt/pair).  Cost: one O(N·S) pass.  Identical Pearson-on-ranks value the
   // abdfirst prune already relies on, so edge weights match within float noise.
-  if (num_depth_samples > 1) {
+  if (g_coverage_samples >= 3) {
     const size_t S = num_depth_samples;
     g_depth_unit.assign(nobs * S, 0.0f);
 #pragma omp parallel for schedule(static) num_threads(numThreads)
@@ -4930,7 +4967,7 @@ static int rb_cmd_bin(int ac, char *av[]) {
           return std::chrono::duration<double, std::milli>(clk::now() - t0).count();
         };
 
-        // Sweep edge powers only; S>=3 weights remain coverage-based.
+        // Sweep edge powers only; coverage remains the source of edge weights.
         // null/"1"/empty selects the default grid. Legacy alpha:power configs
         // are rejected so a former composition sweep cannot change meaning.
         std::vector<double> cfgs;
@@ -5043,8 +5080,8 @@ static int rb_cmd_bin(int ac, char *av[]) {
         std::string base = std::string(outFile);
 
         // ── Label-free selection criterion: weighted modularity Q ─────────────
-        // Q is evaluated on the FIXED baseline coverage graph (composition only
-        // for the S<=2 fallback), identical for every config, so differences in Q
+        // Q is evaluated on the FIXED baseline graph (coverage when available),
+        // identical for every config, so differences in Q
         // reflect ONLY how well each config's partition cuts the graph — not the
         // per-config reweighting. This is the no-ground-truth selector: pick the
         // config with the highest Q. Precompute weighted degree + total weight
@@ -5222,7 +5259,7 @@ static int rb_cmd_bin(int ac, char *av[]) {
                 M, tail_total / std::max<size_t>(M, 1), tail_total);
       }  // end --no_gold multi-resolution selection
 
-      // ── 3. Score candidate edges (coverage for S>=3; composition for S<=2) ──
+      // ── 3. Score candidate edges using coverage whenever available ─────────
       if (!used_no_gold) {
       if (has_depth) {
         verbose_message("Calculating depth_matrix graph [%.1fGb / %.1fGb]               "
@@ -5231,10 +5268,10 @@ static int rb_cmd_bin(int ac, char *av[]) {
         size_t ne = g.getEdgeCount();
         g.edgeScore.resize(ne);
 
-        // Retain the optional adaptive-cutoff path for S>=2; single-sample
-        // composition weights keep their original cutoff behaviour.
+        // The optional adaptive-cutoff path uses the same coverage scores
+        // as the fixed-cutoff path, including one- and two-sample inputs.
         const int edge_cut_mode =
-            (num_depth_samples > 1) ? rb_env_edge_cut_mode() : 0;
+            (num_depth_samples > 0) ? rb_env_edge_cut_mode() : 0;
 
         if (edge_cut_mode != 0) {
           // ── Phase A: compute the RAW weight for every candidate edge
