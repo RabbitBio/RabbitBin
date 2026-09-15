@@ -1,8 +1,10 @@
 #include "../src/impl/rb_recruit.h"
+#include "../src/impl/rb_coverage.h"
 
 #include <cmath>
 #include <cstdlib>
 #include <iostream>
+#include <vector>
 
 static void require(bool condition, const char *message) {
   if (!condition) {
@@ -12,6 +14,24 @@ static void require(bool condition, const char *message) {
 }
 
 int main() {
+  auto check_ratio = [](std::vector<double> a, std::vector<double> b,
+                        double expected) {
+    const double score = rb_mean_coverage_ratio(a.size(),
+        [&](size_t s) { return a[s]; }, [&](size_t s) { return b[s]; });
+    require(std::abs(score - expected) < 1e-12,
+            "unexpected per-sample coverage ratio");
+  };
+  check_ratio({2.0}, {1.8}, 0.9);
+  check_ratio({2.0}, {0.5}, 0.25);
+  check_ratio({10.0, 1.0}, {9.0, 0.5}, 0.7);
+  check_ratio({1.0, 10.0}, {0.9, 5.0}, 0.7); // library rescaling cancels
+  check_ratio({10.0, 9.0}, {9.0, 10.0}, 0.9); // opposite ranks still match
+  check_ratio({10.0, 0.0}, {9.0, 0.0}, 0.9); // joint absence is uninformative
+  check_ratio({10.0, 0.0}, {9.0, 5.0}, 0.45);
+  check_ratio({0.0, 0.0}, {0.0, 0.0}, 0.0);
+  check_ratio({0.0, 0.0}, {5.0, 0.0}, 0.0);
+  check_ratio({std::nan("")}, {5.0}, 0.0);
+
   RbRecruitEvidence evidence;
   const double no_second_wrong = -std::numeric_limits<double>::infinity();
 

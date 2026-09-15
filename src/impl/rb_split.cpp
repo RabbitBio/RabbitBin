@@ -354,8 +354,10 @@ static void abundance_guided_split_current(BinMap &cls) {
 
 // Selectively attach all unassigned large and short contigs to immutable
 // output-sized cores after abundance splitting.
-// Recruitment uses rank-cosine coverage similarity for S>=3 and magnitude-aware
-// weighted Jaccard for S<=2.  Leave-one-out winner confidence supplies the ROC
+// Recruitment uses rank-cosine coverage similarity for S>=3 and the mean of
+// per-feature min/max coverage ratios for S<=2. S counts independent input
+// samples; auxiliary BAM depth columns do not change the low-sample branch.
+// Leave-one-out winner confidence supplies the ROC
 // classes.  If all predictions have the same outcome, paired source-core and
 // strongest-wrong-core counterfactuals supply the missing class, avoiding a
 // fixed fallback cutoff.  No reference labels are used.
@@ -364,8 +366,11 @@ static void abundance_guided_split_current(BinMap &cls) {
 static void recruit_unbinned_to_cores(BinMap &cls, size_t floor) {
   if (!g_bin_recruit) return;
   if (num_depth_samples < 1) return;
-  const size_t samples = (size_t)num_depth_samples;
-  const bool use_rank_profiles = samples >= 3;
+  const size_t depth_columns = (size_t)num_depth_samples;
+  const bool use_rank_profiles = !low_sample_coverage();
+  // Actual samples choose rank vs magnitude scoring. Both paths use every
+  // coverage feature, including the auxiliary MAPQ-filtered BAM block.
+  const size_t samples = depth_columns;
   if (use_rank_profiles && g_depth_unit.size() < nobs * samples) return;
   const size_t candidate_count = nobs + nobs1;
 
@@ -474,7 +479,7 @@ static void recruit_unbinned_to_cores(BinMap &cls, size_t floor) {
   auto magnitude_at = [&](size_t c, size_t k) {
     double value = 0.0;
     if (c < nobs) {
-      const size_t offset = c * samples + k;
+      const size_t offset = c * depth_columns + k;
       if (offset < g_depth_raw.size())
         value = (double)g_depth_raw[offset];
       else if (offset < g_large_means.size())
@@ -540,18 +545,16 @@ static void recruit_unbinned_to_cores(BinMap &cls, size_t floor) {
     }
     if (count == 0) return -std::numeric_limits<double>::infinity();
     const double *sum = magnitude_cores.sums.data() + ci * samples;
-    double intersection = 0.0, union_sum = 0.0, contig_total = 0.0;
-    for (size_t k = 0; k < samples; ++k) {
+    double contig_total = 0.0;
+    for (size_t k = 0; k < samples; ++k) contig_total += magnitude_at(c, k);
+    if (!(contig_total > 1e-30))
+      return -std::numeric_limits<double>::infinity();
+    return rb_mean_coverage_ratio(samples,
+        [&](size_t k) { return magnitude_at(c, k); }, [&](size_t k) {
       const double value = magnitude_at(c, k);
       const double core_sum = sum[k] - (leave_self_out ? value : 0.0);
-      const double centroid = std::max(0.0, core_sum / (double)count);
-      intersection += std::min(value, centroid);
-      union_sum += std::max(value, centroid);
-      contig_total += value;
-    }
-    if (!(contig_total > 1e-30) || !(union_sum > 1e-30))
-      return -std::numeric_limits<double>::infinity();
-    return intersection / union_sum;
+      return std::max(0.0, core_sum / (double)count);
+    });
   };
 
   auto depth_score = [&](size_t c, size_t ci, bool leave_self_out) {
@@ -689,7 +692,7 @@ static void recruit_unbinned_to_cores(BinMap &cls, size_t floor) {
       "confidence>=%.4g [TPR=%.3g,FPR=%.3g]): %zu/%zu unbinned "
       "contigs recruited (%zu large, %zu short; %zu rejected; "
       "calibration=%zu positive/%zu negative)\n",
-      use_rank_profiles ? "rank-cosine" : "magnitude Jaccard",
+      use_rank_profiles ? "rank-cosine" : "mean coverage ratio",
       boundary, boundary_tpr, boundary_fpr, recruited, candidates,
       recruited_large, recruited_small, rejected,
       positives.size(), negatives.size());

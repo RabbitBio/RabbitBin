@@ -4,7 +4,7 @@ Fast, sketch-based metagenome binning. The default RabbitBin pipeline uses
 canonical 4-mer ProbMinHash (PMH) sketches weighted by enrichment relative to
 each contig's own base composition to construct a
 bounded mutual-nearest-neighbour candidate graph, uses abundance profiles as
-the edge evidence in the standard multi-sample setting, clusters the retained
+the edge evidence when coverage is available, clusters the retained
 graph with Fisher label propagation, and re-splits multi-modal bins. One final
 coverage-based pass recruits all remaining long and short contigs against the
 split, frozen bin cores. In other words, PMH proposes where to look; it does not
@@ -55,20 +55,25 @@ is inferred from the flags and echoed in the log line beginning `Edge weighting:
 
 | Mode | Flags | Edge weight | Abundance stages |
 |------|-------|-------------|------------------|
-| BAM/CRAM | `--fasta` + `--bam`/`--bam-list` | coverage only for `S >= 3`; composition for `S <= 2` (depth computed in-process) | enabled |
-| Precomputed depth | `--assembly` + `--depth` | coverage only for `S >= 3`; composition for `S <= 2` | enabled |
+| BAM/CRAM | `--fasta` + `--bam`/`--bam-list` | coverage only (depth computed in-process) | enabled |
+| Precomputed depth | `--assembly` + `--depth` | coverage only | enabled |
 | Sequence-only | `--assembly` alone | composition only | **disabled** |
 
-The manuscript's multi-sample method uses PMH to select candidate neighbours
-and coverage alone to weight their edges when `S >= 3`.
+PMH selects candidate neighbours and coverage determines their edge weights.
+With one or two input samples, RabbitBin averages min/max ratios over
+informative coverage features. With at least three input samples, it combines
+Spearman correlation and weighted Jaccard as described below. Coverage also
+drives splitting and recruitment.
 
-For one or two coverage samples, the original composition-weighted fallback is
-retained; coverage still drives recruitment and splitting. In the two-sample
-path, the existing negative-correlation gate and minimum-edge cutoff still
-filter candidates before composition weights are used. Spearman is undefined with one
-observation and, without ties, is restricted to +1 or -1 with two. Three
-observations are the first sample count with non-binary rank-correlation
-resolution. This fallback is separate from the manuscript's `S >= 3` method.
+Here `S` counts input samples: one per BAM, or one per mean-depth column in a
+precomputed table. BAM input additionally computes MAPQ-filtered depth features
+by default (`--dual-depth 5`): each sample contributes ordinary coverage and
+coverage from reads with MAPQ >= 5. Both features are used for graph weighting
+and recruitment, giving two coverage dimensions for one BAM and four for two
+BAMs. With `--dual-depth 0`, only ordinary coverage is used. Precomputed depth
+tables supply one mean-depth feature per sample; variance columns are not
+coverage dimensions. The additional BAM features do not increase `S`. The log
+reports both the input sample count and the total number of coverage columns.
 
 **Sequence-only mode runs, but it is not the configuration used for the reported
 benchmarks.** Without coverage there is no abundance signal, so contig
@@ -163,18 +168,33 @@ Both bounds are user-settable: `--min-contig` accepts any value ≥ 1500 and
    candidate graph keeps a pair only when the neighbour relation is mutual.
    This order prevents abundance-incompatible high-PMH pairs from consuming
    the bounded neighbourhood.
-3. **Coverage-only edge weighting.** In the default method with `S >= 3`,
-   each candidate edge receives
+3. **Coverage-only edge weighting.** With one or two input samples, each
+   candidate edge receives the mean ratio over informative coverage dimensions:
+
+   $$w_{ij}=A_{ij}=\frac{1}{|\mathcal I_{ij}|}\sum_{\ell\in\mathcal I_{ij}}
+   \frac{\min(x_{i\ell},x_{j\ell})}
+        {\max(x_{i\ell},x_{j\ell})},\qquad 1\le S\le2.$$
+
+   Here `x_i` contains the available coverage features, including ordinary and
+   MAPQ-filtered depth for default BAM inputs. `I_ij` contains dimensions with
+   nonzero coverage in at least one contig; its size is the number of valid
+   coverage dimensions, not the sample count `S`. A shared zero is omitted; a
+   zero on only one side contributes zero. An empty `I_ij` gives zero support.
+   Per-feature normalization cancels within each ratio, so every informative
+   dimension contributes equally. The same magnitude-based definition applies
+   to single- and two-sample inputs, without correlation calculation or gating.
+
+   With `S >= 3`, each candidate edge receives
 
    $$w_{ij}=\min\{\max(\rho_{ij},0),J^{\mathrm{cov}}_{ij}\}.$$
 
-   Here `rho` is the Spearman correlation of the contigs' coverage profiles
-   across samples. `Jcov = sum_s min(x_is, x_js) / sum_s max(x_is, x_js)` is
-   weighted Jaccard on per-sample mean depths. By default, `x_is` is divided
-   by the mean depth of sample `s` across the retained large contigs, so library
-   size differences do not dominate this magnitude term. Constant rank profiles
+   Here `rho` is the Spearman correlation of the contigs' coverage feature
+   vectors. `Jcov = sum_l min(x_il, x_jl) / sum_l max(x_il, x_jl)` is weighted
+   Jaccard over the same dimensions. By default, each feature is divided by its
+   mean across the retained large contigs, so library size differences do not
+   dominate this magnitude term. Constant rank profiles
    have zero correlation support; an all-zero Jaccard denominator gives zero
-   support. PMH composition similarity does not enter `w`.
+   support.
 
    Edges with `w < tau` are dropped, with the default
    `tau = 0.7153318629591614` (`--min-edge-score 71.53318629591614`, expressed
@@ -193,7 +213,7 @@ Both bounds are user-settable: `--min-contig` accepts any value ≥ 1500 and
    Optional coverage-metric ablations (`RABBIT_DEPTH_SIM`, `RABBIT_DEPTH_FUSE`),
    edge-power/SNN transforms, and auxiliary GFA/SNV evidence are separate from
    this default formula. Parameter search and certification also use coverage
-   weights for `S >= 3`; they never reintroduce composition mixing.
+   weights whenever coverage is available.
 
 ### PMH representation validation
 
@@ -263,9 +283,12 @@ splitting → one selective coverage recruitment → output-size filtering.
    of its member profiles, and uses cosine similarity to score contig-core
    matches (equivalent to correlation on ranks for individual profiles). With
    one or two samples, for which rank correlation is undefined or nearly binary,
-   it instead uses weighted Jaccard between the contig's normalized raw coverage
-   and the core's mean coverage, preserving abundance magnitude. If the best and
-   second-best core scores are `s_best` and `s_second`, the recruitment
+   it uses the same mean coverage-feature min/max ratio as graph weighting,
+   comparing the contig's coverage with the arithmetic mean of the core's
+   nonzero long-contig profiles. Default BAM profiles include ordinary and
+   MAPQ-filtered coverage. Jointly zero dimensions are omitted as above. The
+   core mean excludes the current member during leave-one-out calibration.
+   If the best and second-best core scores are `s_best` and `s_second`, the recruitment
    confidence is
 
    $$C=\log\frac{1-s_{\mathrm{second}}}{1-s_{\mathrm{best}}}.$$
@@ -303,9 +326,10 @@ The optional graph-reuse search sweeps edge powers (`--no_gold`,
 silhouettes. Its default powers are 1, 1.25, 1.5, 2 and 3. A custom
 `RABBIT_REUSE_SWEEP="1.0;1.5;2.0"` lists powers only; the former `alpha:power`
 syntax is rejected. Label-free modularity is measured on the fixed baseline
-coverage graph for `S >= 3` (the composition fallback for `S <= 2`). Rebuild
-candidate caches when changing graph-construction settings: cached topology is
-reused, while edge weights are recomputed.
+coverage graph. Rebuild candidate caches when changing graph-construction
+settings: cached topology is reused, while edge weights are recomputed.
+Cache format v4 stores the input sample count separately from coverage columns;
+older caches must be rebuilt to preserve the low-sample graph semantics.
 
 ## Outputs (`bin`)
 
@@ -328,7 +352,7 @@ reused, while edge weights are recomputed.
 | `-m, --min-contig` | 2500 | Minimum length of a clustered contig (must be ≥1500) |
 | `--min-small-contig` | 1000 | Minimum length of a recruitable short contig (must be ≥500); shorter contigs are discarded |
 | `-s, --min-bin-size` | 200000 | Minimum output bin size (bp) |
-| `--min-edge-score` | 71.53318629591614 | Minimum edge weight, percent (>1 and <100, decimals accepted); coverage weight for `S >= 3` |
+| `--min-edge-score` | 71.53318629591614 | Minimum coverage edge weight, percent (>1 and <100, decimals accepted) |
 | `--max-edges` | 200 | Maximum PMH neighbours per contig among production-feasible pairs, before mutual filtering |
 | `--sketch-m` | 500 | Number of ProbMinHash registers |
 | `--validate-pmh-gold` | — | Evaluate sequence-only PMH top-N neighbourhoods against CAMI gold, write TSV, and exit |

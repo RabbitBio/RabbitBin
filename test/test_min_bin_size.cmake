@@ -74,8 +74,8 @@ if(NOT RC EQUAL 0)
 endif()
 assert_strict_floor("${PREFIX}" 20000)
 
-# With two coverage samples, recruitment must use magnitude-aware weighted
-# Jaccard. These three clean split cores also exercise the all-correct
+# With two coverage samples, recruitment must use mean per-sample min/max
+# ratios. These three clean split cores also exercise the all-correct
 # leave-one-out case: the internally constructed counterfactuals must provide a
 # non-empty negative ROC class instead of disabling recruitment calibration.
 set(TWO_SAMPLE_DEPTH "${WORK_DIR}/two_sample.depth.tsv")
@@ -114,9 +114,9 @@ if(NOT TWO_SAMPLE_RC EQUAL 0)
 endif()
 set(TWO_SAMPLE_LOG "${TWO_SAMPLE_STDOUT}${TWO_SAMPLE_STDERR}")
 if(NOT TWO_SAMPLE_LOG MATCHES
-   "Post-split coverage recruit .*magnitude Jaccard, leave-one-out ROC/Youden")
+   "Post-split coverage recruit .*mean coverage ratio, leave-one-out ROC/Youden")
   message(FATAL_ERROR
-    "Two-sample fixture did not use magnitude-Jaccard recruitment\n${TWO_SAMPLE_LOG}")
+    "Two-sample fixture did not use mean-ratio recruitment\n${TWO_SAMPLE_LOG}")
 endif()
 if(NOT TWO_SAMPLE_LOG MATCHES "calibration=[1-9][0-9]* positive/[1-9][0-9]* negative")
   message(FATAL_ERROR
@@ -124,7 +124,7 @@ if(NOT TWO_SAMPLE_LOG MATCHES "calibration=[1-9][0-9]* positive/[1-9][0-9]* nega
 endif()
 assert_strict_floor("${TWO_SAMPLE_PREFIX}" 6000)
 
-# With one sample the graph is composition-only, so the identical contigs form
+# With one sample, nearby coverage levels retain all candidate edges and form
 # one 41.6-kb parent. The marker multiplicity then forces a two-way abundance
 # split into 19.2-kb and 22.4-kb children, both below the requested 30-kb floor.
 set(MARKER_DEPTH "${WORK_DIR}/marker_min_bin_size.depth.tsv")
@@ -136,7 +136,7 @@ foreach(I RANGE 1 13)
   if(I LESS_EQUAL 6)
     string(APPEND MARKER_DEPTH_TEXT "contig_${I}\t3200\t1\t1\t0\n")
   else()
-    string(APPEND MARKER_DEPTH_TEXT "contig_${I}\t3200\t10\t10\t0\n")
+    string(APPEND MARKER_DEPTH_TEXT "contig_${I}\t3200\t1.2\t1.2\t0\n")
   endif()
 endforeach()
 file(WRITE "${MARKER_DEPTH}" "${MARKER_DEPTH_TEXT}")

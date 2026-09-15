@@ -93,9 +93,11 @@ static inline bool rbc_rd_mat(FILE *f, Matrix &m) {
 static const char RBC_MAGIC[8] = {'R', 'B', 'C', 'A', 'C', 'H', 'E', '1'};
 // v1: original (no SNV).  v2: appends an optional per-large-contig SNV block
 // (feature #5) so --strain results are reusable from cache.  v3 stores graph
-// endpoints as uint32_t instead of size_t; v1/v2 remain readable and are
-// range-checked while converting their endpoint arrays.
-static const uint32_t RBC_VERSION = 3;
+// endpoints as uint32_t instead of size_t. v4 records the independent sample
+// count separately from coverage dimensions. Earlier caches must be rebuilt:
+// they cannot identify low-sample BAM inputs, and their correlation-pruned
+// topology can omit pairs supported by the new low-sample coverage weights.
+static const uint32_t RBC_VERSION = 4;
 
 } // namespace
 
@@ -118,6 +120,8 @@ bool rb_write_cache(const std::string &path, const Graph &g, bool has_depth) {
   rbc_wr_pod(f, v_nobs);
   rbc_wr_pod(f, v_nobs1);
   rbc_wr_pod(f, v_nds);
+  uint64_t v_ncov = g_coverage_samples;
+  rbc_wr_pod(f, v_ncov);
   unsigned long long v_seed = seed, v_ts = totalSize, v_ts1 = totalSize1;
   rbc_wr_pod(f, v_seed);
   rbc_wr_pod(f, v_ts);
@@ -139,9 +143,8 @@ bool rb_write_cache(const std::string &path, const Graph &g, bool has_depth) {
   rbc_wr_vec(f, small_seq_lens);
 
   // ── Depth state ──────────────────────────────────────────────────────────
-  // depth_matrix is RANKED (as left by the sketch loop); small_depth_matrix is
-  // RAW (the recruit stage ranks it in place on both the normal and cache path,
-  // preserving the original accumulation order).
+  // depth_matrix is ranked for >=3 input samples and raw for <=2 samples;
+  // small_depth_matrix is raw. Recruitment creates its own short-contig ranks.
   rbc_wr_mat(f, depth_matrix);
   rbc_wr_mat(f, small_depth_matrix);
   rbc_wr_vec(f, g_large_means);   // raw large means (split)
@@ -187,9 +190,10 @@ bool rb_load_cache(const std::string &path) {
     return false;
   }
   uint32_t ver = 0;
-  if (!rbc_rd_pod(f, ver) || ver < 1 || ver > RBC_VERSION) {
-    cerr << "[Error!] unsupported cache version (" << ver << ", expected 1.."
-         << RBC_VERSION << ")\n";
+  if (!rbc_rd_pod(f, ver) || ver != RBC_VERSION) {
+    cerr << "[Error!] unsupported cache version (" << ver << ", expected "
+         << RBC_VERSION << "). Rebuild the cache from the original inputs; "
+            "the coverage sample count and low-sample graph have changed.\n";
     fclose(f);
     return false;
   }
@@ -203,10 +207,11 @@ bool rb_load_cache(const std::string &path) {
   }
 
   bool ok = true;
-  uint64_t v_nobs = 0, v_nobs1 = 0, v_nds = 0;
+  uint64_t v_nobs = 0, v_nobs1 = 0, v_nds = 0, v_ncov = 0;
   ok &= rbc_rd_pod(f, v_nobs);
   ok &= rbc_rd_pod(f, v_nobs1);
   ok &= rbc_rd_pod(f, v_nds);
+  ok &= rbc_rd_pod(f, v_ncov);
   unsigned long long v_seed = 0, v_ts = 0, v_ts1 = 0;
   ok &= rbc_rd_pod(f, v_seed);
   ok &= rbc_rd_pod(f, v_ts);
@@ -219,7 +224,7 @@ bool rb_load_cache(const std::string &path) {
   ok &= rbc_rd_pod(f, v_msc);
   uint8_t v_hd = 0;
   ok &= rbc_rd_pod(f, v_hd);
-  if (!ok) {
+  if (!ok || v_ncov > v_nds || (v_hd != 0) != (v_ncov > 0)) {
     cerr << "[Error!] truncated cache header: " << path << "\n";
     fclose(f);
     return false;
@@ -228,6 +233,7 @@ bool rb_load_cache(const std::string &path) {
   nobs = (size_t)v_nobs;
   nobs1 = (size_t)v_nobs1;
   num_depth_samples = (size_t)v_nds;
+  g_coverage_samples = (size_t)v_ncov;
   if (v_nobs > (uint64_t)std::numeric_limits<GraphNodeId>::max()) {
     cerr << "[Error!] cached graph exceeds the 32-bit node-ID capacity\n";
     fclose(f);
@@ -251,34 +257,8 @@ bool rb_load_cache(const std::string &path) {
   ok &= rbc_rd_vec(f, g_large_means);
   ok &= rbc_rd_vec(f, g_depth_raw);
   ok &= rbc_rd_vec(f, g_depth_colnorm);
-  if (ver >= 3) {
-    ok &= rbc_rd_vec(f, g_cache_from);
-    ok &= rbc_rd_vec(f, g_cache_to);
-  } else {
-    std::vector<size_t> legacy_from, legacy_to;
-    ok &= rbc_rd_vec(f, legacy_from);
-    ok &= rbc_rd_vec(f, legacy_to);
-    if (ok) {
-      g_cache_from.resize(legacy_from.size());
-      g_cache_to.resize(legacy_to.size());
-      for (size_t i = 0; i < legacy_from.size(); ++i) {
-        if (legacy_from[i] >
-            (size_t)std::numeric_limits<GraphNodeId>::max()) {
-          ok = false;
-          break;
-        }
-        g_cache_from[i] = (GraphNodeId)legacy_from[i];
-      }
-      for (size_t i = 0; ok && i < legacy_to.size(); ++i) {
-        if (legacy_to[i] >
-            (size_t)std::numeric_limits<GraphNodeId>::max()) {
-          ok = false;
-          break;
-        }
-        g_cache_to[i] = (GraphNodeId)legacy_to[i];
-      }
-    }
-  }
+  ok &= rbc_rd_vec(f, g_cache_from);
+  ok &= rbc_rd_vec(f, g_cache_to);
   ok &= rbc_rd_vec(f, g_cache_scomp);
 
   if (ok && (g_cache_from.size() != g_cache_to.size() ||
@@ -296,7 +276,7 @@ bool rb_load_cache(const std::string &path) {
 
   // ── SNV / strain block (v2; feature #5) ──────────────────────────────────
   g_cache_has_snv = false;
-  if (ok && ver >= 2) {
+  if (ok) {
     uint8_t v_hs = 0;
     ok &= rbc_rd_pod(f, v_hs);
     if (ok && v_hs) {
