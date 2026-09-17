@@ -633,6 +633,22 @@ static void recruit_unbinned_to_cores(BinMap &cls, size_t floor) {
     }
     i = next;
   }
+  // Youden can pick a very low score on large, noisy co-assemblies.  Keep the
+  // self-calibrated point when it is already conservative, but never recruit
+  // below a fixed confidence floor.  An infinite boundary (no discrimination)
+  // is left unchanged so recruitment stays off.
+  constexpr double recruit_conf_floor = 0.5;
+  if (std::isfinite(boundary) && boundary < recruit_conf_floor) {
+    boundary = recruit_conf_floor;
+    true_positive = 0;
+    false_positive = 0;
+    for (const auto &point : points) {
+      if (point.value < boundary) continue;
+      if (point.positive) ++true_positive; else ++false_positive;
+    }
+    boundary_tpr = (double)true_positive / positives.size();
+    boundary_fpr = (double)false_positive / negatives.size();
+  }
 
   struct Choice {
     int core = -1;
@@ -689,7 +705,7 @@ static void recruit_unbinned_to_cores(BinMap &cls, size_t floor) {
   }
   verbose_message(
       "Post-split coverage recruit (%s, leave-one-out ROC/Youden "
-      "confidence>=%.4g [TPR=%.3g,FPR=%.3g]): %zu/%zu unbinned "
+      "confidence>=%.4g [TPR=%.3g,FPR=%.3g], floor=0.5): %zu/%zu unbinned "
       "contigs recruited (%zu large, %zu short; %zu rejected; "
       "calibration=%zu positive/%zu negative)\n",
       use_rank_profiles ? "rank-cosine" : "mean coverage ratio",
