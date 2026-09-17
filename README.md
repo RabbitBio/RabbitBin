@@ -155,12 +155,17 @@ Both bounds are user-settable: `--min-contig` accepts any value ≥ 1500 and
    (default 500) registers. The default weight measures enrichment relative
    to the contig's own base composition:
 
-   $$w_c(x)=\frac{f_c(x)/\sum_y f_c(y)}{P_c(x)+P_c(\operatorname{rc}(x))},
-   \qquad P_c(x)=\prod_{\ell=1}^{4}\pi_c(x_\ell).$$
+   $$w_c(x)=\frac{f_c(x)/\sum_y f_c(y)}{e_c(x)},
+   \qquad
+   e_c(x)=P_c(x)+\mathbf{1}_{x\neq\operatorname{rc}(x)}P_c(\operatorname{rc}(x)),
+   \qquad
+   P_c(x)=\prod_{\ell=1}^{4}\pi_c(x_\ell).$$
 
    Here `f_c(x)` counts canonical 4-mer occurrences, `pi_c(b)` is the frequency
    of base `b` among the contig's A/C/G/T bases, and `rc(x)` is the reverse
-   complement of `x`. A denominator at or below `1e-14` gives zero weight.
+   complement of `x`. Palindromic 4-mers (`x = rc(x)`) are counted once and
+   therefore use `e_c(x)=P_c(x)` rather than `2P_c(x)`. A denominator at or
+   below `1e-14` gives zero weight.
 2. **Bounded mutual candidate graph.** In the standard multi-sample path, an
    exact abundance-feasibility bound first removes pairs that cannot pass the
    final edge threshold. PMH similarity then retains at most `--max-edges`

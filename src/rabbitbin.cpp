@@ -1427,7 +1427,7 @@ static void build_pmh_winners(const char *seq, size_t len, int k, uint32_t m,
             if (scratch[v]) pmh.addHash(v, (double)scratch[v] * inv);
         } else if (g_gc_norm == 1) {
           // Mode 1: per-base independence model.
-          // E(v) = P(fwd) + P(rev_comp)   where P = product of per-base frequencies.
+          // E(v) = P(v) + 1_{v != rc(v)} P(rc(v)), matching canonical counts.
           const size_t vb = base_cnt[0]+base_cnt[1]+base_cnt[2]+base_cnt[3];
           double p[4];
           for (int b = 0; b < 4; ++b) p[b] = vb > 0 ? (double)base_cnt[b]/(double)vb : 0.25;
@@ -1437,13 +1437,18 @@ static void build_pmh_winners(const char *seq, size_t len, int k, uint32_t m,
             if (!scratch[v]) continue;
             double p_fwd = 1.0, p_rev = 1.0;
             uint64_t code = v;
+            uint64_t rc = 0;
             for (int pos = 0; pos < k; ++pos) {
               const uint8_t b = (uint8_t)(code & 3u);
-              p_fwd *= p[b]; p_rev *= p[3u - b];
+              p_fwd *= p[b];
+              p_rev *= p[3u - b];
+              rc = (rc << 2) | (uint64_t)(3u - b);
               code >>= 2;
             }
             const double obs_f = (double)scratch[v] * inv;
-            const double exp_f = p_fwd + p_rev;
+            // Canonical counts already collapse x and rc(x) into one bucket.
+            // Palindromes (x == rc(x)) must not be charged twice.
+            const double exp_f = p_fwd + ((rc == v) ? 0.0 : p_rev);
             const double w = (exp_f > 1e-14) ? obs_f / exp_f : 0.0;
             if (w > 0.0) {
               pmh.addHash(v, w);
@@ -1481,7 +1486,10 @@ static void build_pmh_winners(const char *seq, size_t len, int k, uint32_t m,
             double p_rev = p_mono[3u - bases[k-1]];
             for (int i = 1; i < k; ++i)
               p_rev *= p_cond[3u - bases[k-i]][3u - bases[k-1-i]];
-            const double exp_f = p_fwd + p_rev;
+            uint64_t rc = 0;
+            for (int i = 0; i < k; ++i)
+              rc = (rc << 2) | (uint64_t)(3u - bases[i]);
+            const double exp_f = p_fwd + ((rc == v) ? 0.0 : p_rev);
             const double obs_f = (double)scratch[v] * inv;
             const double w = (exp_f > 1e-16) ? obs_f / exp_f : 0.0;
             if (w > 0.0) pmh.addHash(v, w);
