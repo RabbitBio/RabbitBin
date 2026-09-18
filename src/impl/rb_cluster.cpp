@@ -438,17 +438,30 @@ int cluster_by_propagation(Graph &g, std::vector<size_t> &membership,
   }
 
   /* Do some initial checks */
-  if (*std::min_element(g.edgeScore.begin(), g.edgeScore.end()) < 0) {
-    cerr << "edgeScore must be non-negative" << endl;
-    exit(1);
+  {
+    // Parallel min over the (tens of millions of) edge scores; min is
+    // associative so the result is identical to std::min_element's.
+    StoredDistance min_score = g.edgeScore.empty()
+                                   ? (StoredDistance)0
+                                   : g.edgeScore[0];
+#pragma omp parallel for schedule(static) reduction(min : min_score)
+    for (size_t e = 0; e < no_of_edges; ++e)
+      if (g.edgeScore[e] < min_score) min_score = g.edgeScore[e];
+    if (min_score < 0) {
+      cerr << "edgeScore must be non-negative" << endl;
+      exit(1);
+    }
   }
 
   // Precompute the per-edge quantity the propagation accumulates: LOG(1 - score)
   // for the fisher/logsum rules, the raw score for sum/mean/max.  It is invariant
   // across the (many) label-propagation rounds and across every incidence visit
   // of the edge, so hoisting it out of the hot loop removes ~10²·|E| redundant
-  // log() calls.
+  // log() calls.  Each entry is independent, so filling it in parallel yields
+  // exactly the same values while keeping 63 cores from idling in front of the
+  // (necessarily sequential) propagation sweep.
   std::vector<StoredDistance> logsscr(no_of_edges);
+#pragma omp parallel for schedule(static)
   for (size_t e = 0; e < no_of_edges; ++e)
     logsscr[e] = g_lpa_raw_w ? g.edgeScore[e]
                              : (StoredDistance)LOG(1. - g.edgeScore[e]);

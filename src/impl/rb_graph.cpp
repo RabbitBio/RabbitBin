@@ -264,6 +264,104 @@ static inline uint64_t lsh_band_hash(const uint32_t *w, uint32_t r) {
   return h;
 }
 
+#if defined(__AVX512VNNI__) && defined(__AVX512BW__)
+// ── rank8 row filter ────────────────────────────────────────────────────────
+// Exact Spearman screen of contig i against j ∈ [j_begin, j_stop) using the
+// block-transposed int8 centred-rank layout (see gen_fused_graph).  G = number
+// of 4-sample groups is a template parameter so the dpbusd chain is fully
+// unrolled with the broadcast operands held in registers, and the function is
+// kept out of the giant OpenMP body so the compiler does not spill its state.
+// Writes j's whose exact correlation is clearly ≥ the threshold to `pass`, and
+// j's inside the ±band sliver (decided by the caller with unit_dot_f) to
+// `band`.  Returns the number of pruned lanes (profiling only).
+struct Rank8Row {
+  const int8_t *blk_base;     // r8_blk.data()
+  const uint32_t *rowu;       // (r8+128) packed groups of contig i
+  const float *invn;          // r8_invn.data()
+  const uint16_t *nzmask;     // r8_nzmask.data(), consulted only if !nz_i
+  float invn_i, lo, hi;
+  bool nz_i;
+};
+
+template <int G>
+static uint64_t rank8_row_filter(const Rank8Row &R, size_t j_begin,
+                                 size_t j_stop, uint32_t *__restrict__ pass,
+                                 size_t &npass, uint32_t *__restrict__ band,
+                                 size_t &nband) {
+  __m512i bc[G];
+  for (int g = 0; g < G; ++g) bc[g] = _mm512_set1_epi32((int)R.rowu[g]);
+  const __m512 v_lo = _mm512_set1_ps(R.lo);
+  const __m512 v_hi = _mm512_set1_ps(R.hi);
+  const __m512 v_ii = _mm512_set1_ps(R.invn_i);
+  uint64_t pruned = 0;
+  npass = 0;
+  nband = 0;
+  const size_t b_begin = j_begin >> 4, b_end = (j_stop + 15u) >> 4;
+  for (size_t b = b_begin; b < b_end; ++b) {
+    const size_t j0 = b << 4;
+    __mmask16 valid = 0xFFFFu;
+    if (j0 < j_begin) valid &= (__mmask16)(0xFFFFu << (j_begin - j0));
+    if (j0 + 16 > j_stop) valid &= (__mmask16)((1u << (j_stop - j0)) - 1u);
+    if (!R.nz_i) valid &= (__mmask16)R.nzmask[b];
+    if (!valid) continue;
+    const int8_t *blk = R.blk_base + b * (size_t)G * 64u;
+    __m512i a0 = _mm512_setzero_si512(), a1 = a0, a2 = a0, a3 = a0;
+    int g = 0;
+    for (; g + 4 <= G; g += 4) {
+      a0 = _mm512_dpbusd_epi32(a0, bc[g],     _mm512_loadu_si512((const void *)(blk + (size_t)g * 64u)));
+      a1 = _mm512_dpbusd_epi32(a1, bc[g + 1], _mm512_loadu_si512((const void *)(blk + (size_t)(g + 1) * 64u)));
+      a2 = _mm512_dpbusd_epi32(a2, bc[g + 2], _mm512_loadu_si512((const void *)(blk + (size_t)(g + 2) * 64u)));
+      a3 = _mm512_dpbusd_epi32(a3, bc[g + 3], _mm512_loadu_si512((const void *)(blk + (size_t)(g + 3) * 64u)));
+    }
+    if (g < G)     a0 = _mm512_dpbusd_epi32(a0, bc[g],     _mm512_loadu_si512((const void *)(blk + (size_t)g * 64u)));
+    if (g + 1 < G) a1 = _mm512_dpbusd_epi32(a1, bc[g + 1], _mm512_loadu_si512((const void *)(blk + (size_t)(g + 1) * 64u)));
+    if (g + 2 < G) a2 = _mm512_dpbusd_epi32(a2, bc[g + 2], _mm512_loadu_si512((const void *)(blk + (size_t)(g + 2) * 64u)));
+    const __m512i acc = _mm512_add_epi32(_mm512_add_epi32(a0, a1),
+                                         _mm512_add_epi32(a2, a3));
+    const __m512 rho = _mm512_mul_ps(
+        _mm512_mul_ps(_mm512_cvtepi32_ps(acc), _mm512_loadu_ps(R.invn + j0)),
+        v_ii);
+    const __mmask16 ge_lo = _mm512_mask_cmp_ps_mask(valid, rho, v_lo, _CMP_GE_OQ);
+    if (__builtin_expect(ge_lo == 0, 1)) {
+      pruned += (uint64_t)__builtin_popcount((unsigned)valid);
+      continue;
+    }
+    const __mmask16 ge_hi = _mm512_mask_cmp_ps_mask(ge_lo, rho, v_hi, _CMP_GE_OQ);
+    pruned += (uint64_t)__builtin_popcount((unsigned)(valid & ~ge_lo));
+    __mmask16 p = ge_hi, q = (__mmask16)(ge_lo & ~ge_hi);
+    while (p) {
+      const unsigned l = (unsigned)__builtin_ctz((unsigned)p);
+      p = (__mmask16)(p & (p - 1u));
+      pass[npass++] = (uint32_t)(j0 + l);
+    }
+    while (q) {
+      const unsigned l = (unsigned)__builtin_ctz((unsigned)q);
+      q = (__mmask16)(q & (q - 1u));
+      band[nband++] = (uint32_t)(j0 + l);
+    }
+  }
+  return pruned;
+}
+
+typedef uint64_t (*Rank8RowFn)(const Rank8Row &, size_t, size_t, uint32_t *,
+                               size_t &, uint32_t *, size_t &);
+static Rank8RowFn rank8_row_filter_for(size_t G) {
+  switch (G) {
+#define RB_R8_CASE(n) case n: return &rank8_row_filter<n>;
+    RB_R8_CASE(1)  RB_R8_CASE(2)  RB_R8_CASE(3)  RB_R8_CASE(4)
+    RB_R8_CASE(5)  RB_R8_CASE(6)  RB_R8_CASE(7)  RB_R8_CASE(8)
+    RB_R8_CASE(9)  RB_R8_CASE(10) RB_R8_CASE(11) RB_R8_CASE(12)
+    RB_R8_CASE(13) RB_R8_CASE(14) RB_R8_CASE(15) RB_R8_CASE(16)
+    RB_R8_CASE(17) RB_R8_CASE(18) RB_R8_CASE(19) RB_R8_CASE(20)
+    RB_R8_CASE(21) RB_R8_CASE(22) RB_R8_CASE(23) RB_R8_CASE(24)
+    RB_R8_CASE(25) RB_R8_CASE(26) RB_R8_CASE(27) RB_R8_CASE(28)
+    RB_R8_CASE(29) RB_R8_CASE(30) RB_R8_CASE(31) RB_R8_CASE(32)
+#undef RB_R8_CASE
+    default: return nullptr;
+  }
+}
+#endif
+
 static void gen_fused_graph(Graph &g) {
 
   // Per-contig neighbor heap (min-heap of size ≤ maxEdges; top = weakest kept).
@@ -288,7 +386,43 @@ static void gen_fused_graph(Graph &g) {
       return a.id < b.id;
     }
   };
-  using Heap = std::priority_queue<Edge32, std::vector<Edge32>, CompareEdge32>;
+  // Minimal binary min-heap (CompareEdge32 order) with a single-pass
+  // replace_top: a kept candidate on a FULL heap used to cost pop()+push()
+  // (sift-down then sift-up); overwriting the root and sifting down once does
+  // the same job.  Element set and pop order are unchanged (strict total order).
+  struct Heap {
+    std::vector<Edge32> v;
+    size_t size() const noexcept { return v.size(); }
+    bool empty() const noexcept { return v.empty(); }
+    const Edge32 &top() const noexcept { return v.front(); }
+    void reserve(size_t n) { v.reserve(n); }
+    void push(const Edge32 &e) {
+      v.push_back(e);
+      std::push_heap(v.begin(), v.end(), CompareEdge32{});
+    }
+    void pop() {
+      std::pop_heap(v.begin(), v.end(), CompareEdge32{});
+      v.pop_back();
+    }
+    void replace_top(const Edge32 &e) {
+      static const CompareEdge32 c{};
+      const size_t n = v.size();
+      size_t k = 0;
+      for (;;) {
+        size_t l = 2 * k + 1;
+        if (l >= n) break;
+        size_t r = l + 1;
+        // child that must move up = the one "kept-preferred" by CompareEdge32
+        // (std::push_heap puts the comparator-maximal element at the root).
+        size_t m = (r < n && c(v[l], v[r])) ? r : l;
+        if (!c(e, v[m])) break;
+        v[k] = v[m];
+        k = m;
+      }
+      v[k] = e;
+    }
+    void swap(Heap &o) noexcept { v.swap(o.v); }
+  };
   std::vector<Heap> heaps(nobs);
 
   // Per-row sync state (threshold + spinlock) co-located on its OWN cache line.
@@ -351,17 +485,25 @@ static void gen_fused_graph(Graph &g) {
     uint64_t lockContentions = 0;
     uint64_t heapPushes = 0;
     uint64_t heapReplacements = 0;
+    uint64_t eeStop[8] = {0, 0, 0, 0, 0, 0, 0, 0};  // early exits per checkpoint
   };
   const bool graphProfileOn = getenv("RB_GRAPH_PROF") != nullptr;
   std::vector<GraphPassProfile> graphProfile(numThreads);
 
-  // Tile size: keep both winner rows and (when present) both abundance rows in
-  // one core's L2.  The production PMH path packs winners to 16 bits, so charging
-  // sizeof(uint32_t) here made the old heuristic substantially too conservative.
-  // Row heaps are sparse writes shared across the whole graph rather than data
-  // reused inside a tile-pair, so including maxEdges in the per-row working set
-  // likewise under-sized the block.  Leave 15% of L2 for loop state / cache-set
-  // conflicts and round down to a SIMD-friendly multiple of 16 rows.
+  // Tile size: keep one tile-pair's *j-block* resident in a core's L2.  The loop
+  // structure is `for i in i-tile: screen j-tile; process survivors`, so the data
+  // reused across the whole i-loop is the j-tile's winner rows (and, on the
+  // abundance-per-pair paths, its depth rows).  The i-side is streamed one row at
+  // a time, so only a single block — not two — needs to stay resident.  (The old
+  // heuristic charged 2×, which halved the block and left it undersized.)  The
+  // production PMH path packs winners to 16 bits, so charging sizeof(uint32_t)
+  // here was also too conservative; row heaps are sparse cross-graph writes, not
+  // tile-local reuse, so maxEdges is excluded.  We fill ~2/3 of L2 with the
+  // j-block and leave the rest for the streamed i-row, the abundance/rank8
+  // filter's own j-block, rowsync lines, and set-associativity headroom (winner
+  // rows are ~1 KB-strided, which stresses a set-associative L2).  Everything is
+  // derived from CacheSize(); no absolute sizes are baked in.  Rounded down to a
+  // SIMD-friendly multiple of 16 rows.
   size_t TILE = 10;
   try {
     const size_t winner_bytes = (g_win_bits == 16)
@@ -371,10 +513,14 @@ static void gen_fused_graph(Graph &g) {
     const size_t depth_row = num_depth_samples > 1
                                  ? (size_t)num_depth_samples * sizeof(float)
                                  : 0;
-    const size_t pair_row_bytes = 2 * (winner_row + depth_row);
-    if (pair_row_bytes > 0) {
-      const size_t usable_l2 = (size_t)(CacheSize() * 1024. * 0.85);
-      TILE = usable_l2 / pair_row_bytes;
+    const size_t block_row_bytes = winner_row + depth_row;
+    if (block_row_bytes > 0) {
+      // The j winner block is *pinned* in L2 for the whole (tall) i-sweep while
+      // thousands of transient i-rows and rank8 rows stream past it, so it must
+      // fit with generous headroom or capacity/conflict misses evict it.  Fill
+      // ~45% of L2 with the pinned block; the rest absorbs the streaming churn.
+      const size_t usable_l2 = (size_t)(CacheSize() * 1024. * 0.45);
+      TILE = usable_l2 / block_row_bytes;
       TILE = std::max((size_t)10, std::min((size_t)1024, TILE));
       // With hundreds of abundance dimensions the dot-product stream, dynamic
       // work balance, and early heap-threshold formation benefit from more tile
@@ -386,27 +532,76 @@ static void gen_fused_graph(Graph &g) {
     }
   } catch (...) {}
   // TILE only affects blocking (never the result), so it is a safe speed knob.
-  // The default sizes a tile-pair's two winner blocks for L2; larger tiles cut
-  // the number of tile-pairs (fewer g_win_flat DRAM re-reads) at the cost of
-  // spilling block reuse to L3. RABBIT_TILE provides an explicit override.
+  // The default sizes a tile-pair's j winner block for L2; larger tiles let more
+  // i-rows reuse that resident block, but once it no longer fits L2 the reuse
+  // spills to DRAM and the pass slows again.  RABBIT_TILE forces an override.
   if (const char *e = getenv("RABBIT_TILE")) {
     long v = atol(e);
     if (v >= 10) TILE = (size_t)v;
   }
 
-  // Flatten the upper-triangle tile-pairs (jj ≥ ii) into a list so dynamic
-  // scheduling balances load evenly (each tile-pair is ~equal work).
-  std::vector<std::pair<uint32_t, uint32_t>> tilepairs;
-  {
-    const size_t ntiles = (nobs + TILE - 1) / TILE;
-    tilepairs.reserve(ntiles * (ntiles + 1) / 2);
-    for (size_t ii = 0; ii < nobs; ii += TILE)
-      for (size_t jj = ii; jj < nobs; jj += TILE)
-        tilepairs.emplace_back((uint32_t)ii, (uint32_t)jj);
+  // Asymmetric blocking.  The j-block (winner rows) is what must stay L2-resident
+  // across a tile-pair, and it is *reused once per i-row* in the tile.  Survivors
+  // of the abundance screen are sparse, so with a square tile a given j winner
+  // row is only revisited by a couple of i-rows before eviction — the PMH stage
+  // then re-streams winner rows from DRAM and becomes bandwidth-bound.  Keeping
+  // the j-block narrow (L2-resident) but making the i-block *tall* multiplies how
+  // many i-rows reuse each resident winner row, cutting winner-row DRAM traffic
+  // several-fold.  The i-block costs no extra L2 (its rows are streamed one at a
+  // time), so its height is bounded only by load-balance granularity, not cache.
+  size_t J_TILE = TILE;                 // L2-resident winner-block width
+  size_t iMul = 32;                     // i-block is iMul × taller than j-block
+  if (const char *e = getenv("RABBIT_ITILE_MUL")) {
+    long v = atol(e);
+    if (v >= 1) iMul = (size_t)v;
+  }
+  size_t I_TILE = J_TILE * iMul;
+  if (const char *e = getenv("RABBIT_JTILE")) {
+    long v = atol(e);
+    if (v >= 10) J_TILE = (size_t)v;
+  }
+  bool i_tile_forced = false;
+  if (const char *e = getenv("RABBIT_ITILE")) {
+    long v = atol(e);
+    if (v >= 10) { I_TILE = (size_t)v; i_tile_forced = true; }
+  }
+  if (I_TILE < J_TILE) I_TILE = J_TILE;
+  // Load-balance floor: the auto height is capped only if it would leave too few
+  // tile-pairs to keep the thread pool busy.  Because the j-dimension is finely
+  // tiled (many j-tiles), this rarely binds — a tall i-block is fine.  An explicit
+  // RABBIT_ITILE bypasses the cap for experimentation.
+  if (!i_tile_forced) {
+    const size_t nj_tiles = (nobs + J_TILE - 1) / J_TILE;
+    const size_t want_tiles = (size_t)numThreads * 8;
+    if (nj_tiles > 0) {
+      size_t min_i_tiles = (want_tiles + nj_tiles - 1) / nj_tiles;
+      if (min_i_tiles < 1) min_i_tiles = 1;
+      size_t cap = (nobs + min_i_tiles - 1) / min_i_tiles;
+      if (cap < J_TILE) cap = J_TILE;
+      if (I_TILE > cap) I_TILE = cap;
+    }
   }
 
-  verbose_message("Fused graph (triangle): nobs=%zu TILE=%zu tilepairs=%zu\n",
-                  nobs, TILE, tilepairs.size());
+  // Flatten the upper-triangle tile-pairs into a list so dynamic scheduling
+  // balances load evenly.  Tiles are I_TILE (rows) × J_TILE (cols); a tile is
+  // kept only if it can contain a pair with j>i, i.e. its top-right corner lies
+  // above the diagonal.  Straddling tiles clamp j_begin per row to max(jj,i+1).
+  std::vector<std::pair<uint32_t, uint32_t>> tilepairs;
+  {
+    const size_t ni_tiles = (nobs + I_TILE - 1) / I_TILE;
+    const size_t nj_tiles = (nobs + J_TILE - 1) / J_TILE;
+    tilepairs.reserve(ni_tiles * nj_tiles);
+    for (size_t ii = 0; ii < nobs; ii += I_TILE)
+      for (size_t jj = 0; jj < nobs; jj += J_TILE) {
+        const size_t j_stop = std::min(jj + J_TILE, nobs);
+        if (j_stop <= ii + 1) continue;  // entirely below diagonal (no j>i)
+        tilepairs.emplace_back((uint32_t)ii, (uint32_t)jj);
+      }
+  }
+
+  verbose_message(
+      "Fused graph (triangle): nobs=%zu I_TILE=%zu J_TILE=%zu tilepairs=%zu\n",
+      nobs, I_TILE, J_TILE, tilepairs.size());
 
   const bool rb_timing = (getenv("RB_TIMING") != nullptr);
   std::chrono::steady_clock::time_point _t_pass0;
@@ -459,6 +654,28 @@ static void gen_fused_graph(Graph &g) {
   int32_t abd_q8_prune_max = std::numeric_limits<int32_t>::min();
   std::vector<int8_t> abd_q8;
   std::vector<int32_t> abd_q8_sum;
+  // ── Exact integer Spearman filter (rank8, 1×16 transposed VNNI kernel) ──
+  // depth_matrix rows are average-tie Spearman ranks over S columns, so
+  // 2·(rank − mean) is an exact integer in [−(S−1), S−1] and fits int8 for
+  // S ≤ 128.  corr(i,j) = dot(r8_i, r8_j) · invn_i · invn_j EXACTLY (no
+  // quantisation); the only rounding is the final float scale, covered by a
+  // tiny fallback band around the prune threshold in which the original
+  // unit_dot_f decides.  Layout: contigs in blocks of 16; block b, sample group
+  // g (4 samples) is one 64-byte vector whose lane l holds the 4 int8 ranks of
+  // contig 16b+l — so one vpdpbusd advances 16 pairs by 4 samples and the whole
+  // 16-pair dot needs G = ceil(S/4) instructions and NO horizontal reduction.
+  // Σ r8 = 0 per row, so biasing the broadcast left operand by +128 (u8) needs
+  // no correction term.
+  bool use_rank8 = false;
+  // Fallback band: |float unit_dot_f − exact corr| is bounded by ~8·2⁻²⁴·S⁰
+  // (≤ 6e-7 for S ≤ 128) and the rank8 float scale adds ≤ 3e-7; 4e-6 leaves
+  // a wide margin, and the band is decided by unit_dot_f itself.
+  constexpr float R8_BAND = 4e-6f;
+  size_t r8_G = 0;                    // sample groups of 4
+  std::vector<int8_t>  r8_blk;        // nblocks × G × 64 bytes (transposed)
+  std::vector<uint32_t> r8_row_u8;    // nobs × G packed (r8+128) bytes, broadcast source
+  std::vector<float>   r8_invn;       // nobs: 1/sqrt(Σ r8²), 0 for constant rows
+  std::vector<uint16_t> r8_nzmask;    // nblocks: lane l set iff g_anynz[16b+l]
   if (abdfirst) {
     if (!g_depth_unit.empty() && g_depth_unit.size() == (size_t)nobs * ABD_S) {
       abd_u = g_depth_unit.data();
@@ -488,6 +705,68 @@ static void gen_fused_graph(Graph &g) {
                     abd_corr_min, (double)min_edge_weight,
                     abd_reused ? " [reused g_depth_unit]" : "");
 #if defined(__AVX512VNNI__) && defined(__AVX512BW__)
+    {
+      const char *r8Env = getenv("RABBIT_ABD_RANK8");
+      const bool r8Requested = r8Env ? atoi(r8Env) != 0 : true;
+      const bool anynz_ok = depth_file.empty() || g_anynz.size() == nobs;
+      if (r8Requested && ABD_S >= 3 && ABD_S <= 128 && anynz_ok) {
+        r8_G = ((size_t)ABD_S + 3u) / 4u;
+        const size_t nblk = (nobs + 15u) / 16u;
+        r8_blk.assign(nblk * r8_G * 64u, (int8_t)0);
+        r8_row_u8.assign((size_t)nobs * r8_G, 0u);
+        r8_invn.assign(nobs, 0.0f);
+        r8_nzmask.assign(nblk, 0u);
+        int bad = 0;
+#pragma omp parallel for num_threads(numThreads) schedule(static) \
+    reduction(+ : bad)
+        for (size_t b = 0; b < nblk; ++b) {
+          int8_t *blk = r8_blk.data() + b * r8_G * 64u;
+          uint16_t nzm = 0;
+          for (size_t l = 0; l < 16; ++l) {
+            const size_t r = b * 16u + l;
+            if (r >= nobs) break;
+            if (depth_file.empty() || g_anynz[r]) nzm |= (uint16_t)(1u << l);
+            double mean = 0.0;
+            for (uint32_t k = 0; k < ABD_S; ++k) mean += depth_matrix(r, k);
+            mean /= (double)ABD_S;
+            long long ss = 0, sum = 0;
+            uint32_t *rowu = r8_row_u8.data() + r * r8_G;
+            for (uint32_t k = 0; k < ABD_S; ++k) {
+              const double v = 2.0 * ((double)depth_matrix(r, k) - mean);
+              const long q = std::lround(v);
+              if (std::fabs(v - (double)q) > 1e-6 || q < -127 || q > 127) ++bad;
+              ss += (long long)q * q;
+              sum += q;
+              blk[(size_t)(k >> 2) * 64u + l * 4u + (k & 3u)] = (int8_t)q;
+              rowu[k >> 2] |= (uint32_t)((uint8_t)(q + 128)) << (8u * (k & 3u));
+            }
+            if (sum != 0) ++bad;
+            // Padded samples (k ≥ S) stay 0 in the block; the broadcast side
+            // holds +128 there so the pad contributes 128·0 = 0.
+            for (uint32_t k = ABD_S; k < r8_G * 4u; ++k)
+              rowu[k >> 2] |= 128u << (8u * (k & 3u));
+            r8_invn[r] = (ss > 0) ? (float)(1.0 / std::sqrt((double)ss)) : 0.0f;
+          }
+          r8_nzmask[b] = nzm;
+        }
+        if (bad == 0) {
+          use_rank8 = true;
+          verbose_message(
+              "Abundance prefilter: exact int8 Spearman rank dot (1x16 VNNI, "
+              "S=%u groups=%zu, %.1f MB)\n",
+              ABD_S, r8_G,
+              (double)(r8_blk.size() + r8_row_u8.size() * 4 +
+                       r8_invn.size() * 4) / 1048576.0);
+        } else {
+          verbose_message("Abundance prefilter: rank8 disabled (%d rows not "
+                          "integer-centered ranks); using q8\n", bad);
+          std::vector<int8_t>().swap(r8_blk);
+          std::vector<uint32_t>().swap(r8_row_u8);
+          std::vector<float>().swap(r8_invn);
+          std::vector<uint16_t>().swap(r8_nzmask);
+        }
+      }
+    }
     // ISA-gated exact-safe int8 prefilter. Quantisation is never used as the
     // similarity value: an analytically conservative error radius only rejects
     // pairs that cannot reach the original float-dot threshold. All remaining
@@ -505,7 +784,7 @@ static void gen_fused_graph(Graph &g) {
     // explicitly forced; RABBIT_ABD_Q8=0 disables the prefilter everywhere.
     const bool q8Requested = abdQ8Env ? atoi(abdQ8Env) != 0
                                       : (size_t)ABD_S >= q8MinDefaultDim;
-    if (q8Requested && ABD_S > 0 && (size_t)ABD_S <= q8SafeDim) {
+    if (!use_rank8 && q8Requested && ABD_S > 0 && (size_t)ABD_S <= q8SafeDim) {
       abd_q8_stride = ((size_t)ABD_S + 63u) & ~(size_t)63u;
       if (abd_q8_stride != 0 &&
           nobs <= std::numeric_limits<size_t>::max() / abd_q8_stride) {
@@ -587,6 +866,13 @@ static void gen_fused_graph(Graph &g) {
                        (win16 ? !g_win16.empty() : !g_win_flat.empty()) &&
                        (getenv("RABBIT_NO_COMP_EE") == nullptr);
   const uint32_t EE_P = (g_pmh_m >= 64) ? 64u : g_pmh_m;
+  // Progressive re-check granularity (registers) after the EE_P prefix.
+  // RABBIT_COMP_EE_STEP overrides; 0 or >= m restores the single check.
+  uint32_t EE_STEP = 128u;
+  if (const char *e = getenv("RABBIT_COMP_EE_STEP")) {
+    long v = atol(e);
+    EE_STEP = (v <= 0 || v >= (long)g_pmh_m) ? g_pmh_m : (uint32_t)v;
+  }
 
   // Spread the large read-mostly winner array over both memory controllers so
   // the all-pairs scan is not bottlenecked on the first-touch socket's DRAM.
@@ -634,6 +920,13 @@ static void gen_fused_graph(Graph &g) {
   {
     const int tid = omp_get_thread_num();
     GraphPassProfile &my_prof = graphProfile[tid];
+#if defined(__AVX512VNNI__) && defined(__AVX512BW__)
+    // rank8 per-row survivor scratch (bounded by the tile width).
+    std::vector<uint32_t> r8_pass(use_rank8 ? J_TILE + 16 : 0);
+    std::vector<uint32_t> r8_band(use_rank8 ? J_TILE + 16 : 0);
+    std::vector<uint32_t> r8_merge;
+    const Rank8RowFn r8_fn = use_rank8 ? rank8_row_filter_for(r8_G) : nullptr;
+#endif
     std::vector<uint32_t> visited;       // LSH per-i dedup stamp
     uint32_t visit_gen = 0;
     if (use_lsh) visited.assign(nobs, 0u);
@@ -660,12 +953,17 @@ static void gen_fused_graph(Graph &g) {
       rs.thresh_key.store(edge_key(top.sv, top.id),
                           std::memory_order_relaxed);
     };
-    auto update_row = [&](size_t r, size_t other, StoredDistance sv) {
+    // t_seen: a threshold value for row r read earlier by the caller.  Row
+    // thresholds only ever rise, so rejecting on a stale (lower) snapshot is
+    // exact and saves re-touching the contended rowsync line in the common
+    // case; the snapshot is refreshed only when the fast test does not reject.
+    auto update_row = [&](size_t r, size_t other, StoredDistance sv,
+                          float t_seen) {
       if (graphProfileOn) ++my_prof.rowUpdateCalls;
       RowSync &rs = rowsync[r];
       // Common case: similarity strictly below the kept threshold — rejected with
       // one float compare, identical cost to the original sv-only fast path.
-      if (sv < rs.thresh_sv.load(std::memory_order_relaxed)) {
+      if (sv < t_seen || sv < rs.thresh_sv.load(std::memory_order_relaxed)) {
         if (graphProfileOn) ++my_prof.similarityRejects;
         return;
       }
@@ -698,8 +996,7 @@ static void gen_fused_graph(Graph &g) {
         if (graphProfileOn) ++my_prof.heapPushes;
         if (h.size() == (size_t)maxEdges) store_thresh(rs, h.top());
       } else if (cmp_edge(cand, h.top())) {  // cand kept-preferred over weakest
-        h.pop();
-        h.push(cand);
+        h.replace_top(cand);
         if (graphProfileOn) ++my_prof.heapReplacements;
         store_thresh(rs, h.top());
       }
@@ -709,28 +1006,58 @@ static void gen_fused_graph(Graph &g) {
     auto process_pair = [&](size_t i, size_t j) {
       if (graphProfileOn) ++my_prof.similarityPairs;
       StoredDistance sv;
+      float t_i = std::numeric_limits<float>::lowest();
+      float t_j = std::numeric_limits<float>::lowest();
       if (comp_ee) {
         // Partial winner match → exact upper bound on sv; prune if it cannot
         // beat either endpoint's heap threshold.  Result is bit-identical to
         // graph_sim(i,j) on the non-pruned path (same total match count).
         uint32_t cP, cFull;
         if (win16) {
+          // Progressive exact early exit: after p registers with c matches the
+          // full count is ≤ c + (m − p), so the baseline-corrected similarity
+          // is bounded above; once that bound is below BOTH endpoints' current
+          // heap thresholds (monotonically rising, read once) the pair can
+          // never be kept and the remaining registers are skipped.  Checked
+          // after EE_P, then every EE_STEP registers.
           const uint16_t *aw = g_win16.data() + i * (size_t)g_pmh_m;
           const uint16_t *bw = g_win16.data() + j * (size_t)g_pmh_m;
-          cP = pmh_match_count16(aw, bw, EE_P);
-          double up = (double)(cP + (g_pmh_m - EE_P)) * g_inv_pmh_m;
-          if (g_pmh_base_on && g_pmh_baseline > 0.0 && g_pmh_baseline < 1.0) {
-            up = (up - g_pmh_baseline) * g_inv_one_minus_b0;
-            if (up < 0.0) up = 0.0;
-          }
-          if (up > 1.0 - 1e-6) up = 1.0 - 1e-6;
           const float ti = rowsync[i].thresh_sv.load(std::memory_order_relaxed);
           const float tj = rowsync[j].thresh_sv.load(std::memory_order_relaxed);
-          if ((float)up < (ti < tj ? ti : tj)) {
-            if (graphProfileOn) ++my_prof.upperBoundPruned;
+          t_i = ti; t_j = tj;
+          const float tmin = ti < tj ? ti : tj;
+          auto bound_below = [&](uint32_t c, uint32_t p) -> bool {
+            double up = (double)(c + (g_pmh_m - p)) * g_inv_pmh_m;
+            if (g_pmh_base_on && g_pmh_baseline > 0.0 && g_pmh_baseline < 1.0) {
+              up = (up - g_pmh_baseline) * g_inv_one_minus_b0;
+              if (up < 0.0) up = 0.0;
+            }
+            if (up > 1.0 - 1e-6) up = 1.0 - 1e-6;
+            return (float)up < tmin;
+          };
+          uint32_t c = pmh_match_count16(aw, bw, EE_P);
+          uint32_t p = EE_P;
+          if (bound_below(c, p)) {
+            if (graphProfileOn) { ++my_prof.upperBoundPruned; ++my_prof.eeStop[0]; }
             return;  // exact: unkeepable
           }
-          cFull = cP + pmh_match_count16(aw + EE_P, bw + EE_P, g_pmh_m - EE_P);
+          uint32_t stage = 1;
+          while (p < g_pmh_m) {
+            const uint32_t step = std::min<uint32_t>(EE_STEP, g_pmh_m - p);
+            c += pmh_match_count16(aw + p, bw + p, step);
+            p += step;
+            if (p < g_pmh_m && bound_below(c, p)) {
+              if (graphProfileOn) {
+                ++my_prof.upperBoundPruned;
+                ++my_prof.eeStop[stage < 7 ? stage : 7];
+              }
+              return;  // exact: unkeepable
+            }
+            ++stage;
+          }
+          cP = c;
+          cFull = c;
+          (void)cP;
         } else {
           const uint32_t *aw = g_win_flat.data() + i * (size_t)g_pmh_m;
           const uint32_t *bw = g_win_flat.data() + j * (size_t)g_pmh_m;
@@ -743,6 +1070,7 @@ static void gen_fused_graph(Graph &g) {
           if (up > 1.0 - 1e-6) up = 1.0 - 1e-6;
           const float ti = rowsync[i].thresh_sv.load(std::memory_order_relaxed);
           const float tj = rowsync[j].thresh_sv.load(std::memory_order_relaxed);
+          t_i = ti; t_j = tj;
           if ((float)up < (ti < tj ? ti : tj)) {
             if (graphProfileOn) ++my_prof.upperBoundPruned;
             return;  // exact: unkeepable
@@ -755,8 +1083,8 @@ static void gen_fused_graph(Graph &g) {
         if (graphProfileOn) ++my_prof.graphSimCalls;
         sv = (StoredDistance)graph_sim(i, j);
       }
-      update_row(i, j, sv);
-      update_row(j, i, sv);
+      update_row(i, j, sv, t_i);
+      update_row(j, i, sv, t_j);
     };
 
     if (!use_lsh) {
@@ -764,19 +1092,75 @@ static void gen_fused_graph(Graph &g) {
     for (size_t p = 0; p < tilepairs.size(); ++p) {
       const size_t ii = tilepairs[p].first;
       const size_t jj = tilepairs[p].second;
-      const size_t i_stop = std::min(ii + TILE, nobs);
-      const size_t j_stop = std::min(jj + TILE, nobs);
-      const bool diag = (ii == jj);
-      if (graphProfileOn) {
-        const uint64_t ni = (uint64_t)(i_stop - ii);
-        const uint64_t nj = (uint64_t)(j_stop - jj);
-        ++my_prof.tiles;
-        my_prof.geometricPairs += diag ? ni * (ni - 1) / 2 : ni * nj;
-      }
+      const size_t i_stop = std::min(ii + I_TILE, nobs);
+      const size_t j_stop = std::min(jj + J_TILE, nobs);
+      if (graphProfileOn) ++my_prof.tiles;
       for (size_t i = ii; i < i_stop; ++i) {
-        // Diagonal tile: only j>i; off-diagonal: full j range.
-        const size_t j_begin = diag ? i + 1 : jj;
+        // Only j>i: clamp the column start to max(jj, i+1).  For tiles wholly
+        // above the diagonal this is just jj; for straddling tiles the early
+        // rows may have no work.
+        const size_t j_begin = jj > i + 1 ? jj : i + 1;
+        if (j_begin >= j_stop) continue;
+        if (graphProfileOn)
+          my_prof.geometricPairs += (uint64_t)(j_stop - j_begin);
 #if defined(__AVX512VNNI__) && defined(__AVX512BW__)
+        if (use_rank8) {
+          // Exact int8 Spearman screen for row i over [j_begin, j_stop):
+          // survivors (clearly >= threshold) go to PMH in ascending j order;
+          // the +-R8_BAND sliver is decided by unit_dot_f (bit-identical).
+          Rank8Row R;
+          R.blk_base = r8_blk.data();
+          R.rowu = r8_row_u8.data() + i * r8_G;
+          R.invn = r8_invn.data();
+          R.nzmask = r8_nzmask.data();
+          R.invn_i = r8_invn[i];
+          R.lo = abd_corr_min_eps - R8_BAND;
+          R.hi = abd_corr_min_eps + R8_BAND;
+          R.nz_i = depth_file.empty() || g_anynz[i];
+          size_t npass = 0, nband = 0;
+          const uint64_t pruned = r8_fn(R, j_begin, j_stop, r8_pass.data(), npass,
+                                        r8_band.data(), nband);
+          if (graphProfileOn) {
+            my_prof.q8Pruned += pruned;
+            my_prof.q8FloatChecked += nband;
+          }
+          if (nband) {
+            // Merge band survivors (rare) into the pass list, keeping j order.
+            size_t kept = 0;
+            for (size_t q = 0; q < nband; ++q) {
+              const size_t j = r8_band[q];
+              const float c = unit_dot_f(abd_u + i * ABD_S, abd_u + j * ABD_S, ABD_S);
+              if (c < abd_corr_min_eps) {
+                if (graphProfileOn) ++my_prof.q8FloatRejected;
+              } else {
+                r8_band[kept++] = (uint32_t)j;
+              }
+            }
+            if (kept) {
+              std::vector<uint32_t> &m = r8_merge;
+              m.resize(npass + kept);
+              std::merge(r8_pass.begin(), r8_pass.begin() + npass,
+                         r8_band.begin(), r8_band.begin() + kept, m.begin());
+              std::copy(m.begin(), m.end(), r8_pass.begin());
+              npass += kept;
+            }
+          }
+          if (npass) {
+            // Warm the lines the PMH stage will miss on: each survivor's
+            // contended rowsync line and the head of its winner row.
+            for (size_t q = 0; q < npass; ++q) {
+              const size_t j = r8_pass[q];
+              _mm_prefetch((const char *)&rowsync[j], _MM_HINT_T0);
+              if (win16) {
+                const char *wr = (const char *)(g_win16.data() + j * (size_t)g_pmh_m);
+                _mm_prefetch(wr, _MM_HINT_T0);
+                _mm_prefetch(wr + 64, _MM_HINT_T0);
+              }
+            }
+            for (size_t q = 0; q < npass; ++q) process_pair(i, r8_pass[q]);
+          }
+          continue;
+        }
         if (use_abd_q8) {
           const int8_t *qi = abd_q8.data() + i * abd_q8_stride;
           for (size_t j = j_begin; j < j_stop; ++j) {
@@ -859,8 +1243,8 @@ static void gen_fused_graph(Graph &g) {
             if ((size_t)j <= i) continue;           // each unordered pair once (i<j)
             if (!is_nz(i, j)) continue;
             StoredDistance sv = (StoredDistance)graph_sim(i, j);
-            update_row(i, j, sv);
-            update_row(j, i, sv);
+            update_row(i, j, sv, std::numeric_limits<float>::lowest());
+            update_row(j, i, sv, std::numeric_limits<float>::lowest());
           }
         }
         if (verbose && tid == 0 && (i & 0xFFFu) == 0)
@@ -890,6 +1274,7 @@ static void gen_fused_graph(Graph &g) {
       total.lockContentions += p.lockContentions;
       total.heapPushes += p.heapPushes;
       total.heapReplacements += p.heapReplacements;
+      for (int s = 0; s < 8; ++s) total.eeStop[s] += p.eeStop[s];
       if (p.geometricPairs != 0) {
         minPairs = std::min(minPairs, p.geometricPairs);
         maxPairs = std::max(maxPairs, p.geometricPairs);
@@ -931,6 +1316,15 @@ static void gen_fused_graph(Graph &g) {
             (unsigned long long)total.lockContentions,
             (unsigned long long)total.heapPushes,
             (unsigned long long)total.heapReplacements);
+    fprintf(stderr,
+            "[RB_GRAPH_PROF] pmh_early_exit@checkpoint: p=%u:%llu",
+            EE_P, (unsigned long long)total.eeStop[0]);
+    for (int s = 1; s < 8; ++s)
+      if (total.eeStop[s])
+        fprintf(stderr, " p=%u:%llu",
+                (unsigned)std::min<uint64_t>(EE_P + (uint64_t)s * EE_STEP, g_pmh_m),
+                (unsigned long long)total.eeStop[s]);
+    fprintf(stderr, " full=%llu\n", (unsigned long long)total.partialThenFull);
   }
 
   if (rb_timing) {
