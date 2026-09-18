@@ -1378,26 +1378,37 @@ std::string compute_depth_tsv_inmem(const StringVector &bamFilePaths,
     for (size_t s = 0; s < b2shards.size(); ++s)
       if (!shardOk[s]) bamFailed[b2shards[s].bamIdx] = 1;
     // Merge successful BAMs' partial sums (compact-aware: skip filtered contigs).
-    for (int s = 0; s < (int)b2shards.size(); s++) {
-      if (bamFailed[b2shards[s].bamIdx])
+    // Parallel over BAMs: each BAM owns its own depth array, so there is no
+    // sharing between iterations, and CountType is an unsigned integer, so the
+    // regrouped additions are exactly the same values as the serial merge.
+    // With millions of contigs this loop touches ~100M+ entries and was the
+    // single-threaded tail of the whole depth stage.
+#pragma omp parallel for schedule(dynamic, 1) \
+    num_threads(std::min(g_full_threads, num_bams))
+    for (int bi = 0; bi < num_bams; bi++) {
+      if (bamFailed[bi])
         continue;
-      CountType *cd = bamContigDepths[b2shards[s].bamIdx].get();
-      for (const auto &kv : b2local[s]) {
-        if (t2c) {
-          int32_t ci = t2c[kv.first];
-          if (ci >= 0) cd[ci] += kv.second;
-        } else {
-          cd[kv.first] += kv.second;
-        }
-      }
-      if (dualOn) {
-        CountType *cdU = bamContigDepthsU[b2shards[s].bamIdx].get();
-        for (const auto &kv : b2localU[s]) {
+      CountType *cd = bamContigDepths[bi].get();
+      CountType *cdU = dualOn ? bamContigDepthsU[bi].get() : nullptr;
+      for (int s = 0; s < (int)b2shards.size(); s++) {
+        if (b2shards[s].bamIdx != bi)
+          continue;
+        for (const auto &kv : b2local[s]) {
           if (t2c) {
             int32_t ci = t2c[kv.first];
-            if (ci >= 0) cdU[ci] += kv.second;
+            if (ci >= 0) cd[ci] += kv.second;
           } else {
-            cdU[kv.first] += kv.second;
+            cd[kv.first] += kv.second;
+          }
+        }
+        if (cdU) {
+          for (const auto &kv : b2localU[s]) {
+            if (t2c) {
+              int32_t ci = t2c[kv.first];
+              if (ci >= 0) cdU[ci] += kv.second;
+            } else {
+              cdU[kv.first] += kv.second;
+            }
           }
         }
       }
@@ -1450,27 +1461,35 @@ std::string compute_depth_tsv_inmem(const StringVector &bamFilePaths,
   // the TSV rows.  Returns "" (no formatting).
   if (outCols) {
     const int32_t nt2 = header->n_targets;
-    size_t keep = 0;
-    for (int32_t t = 0; t < nt2; ++t) if (contigLengthPass[t]) ++keep;
-    outCols->names.clear();
-    outCols->lens.clear();
-    outCols->means.clear();
-    outCols->names.reserve(keep);
-    outCols->lens.reserve(keep);
+    // Collect the kept tids first so names/lens/means can be filled in
+    // parallel.  Each output row is computed independently from the same
+    // inputs and formula as the serial version, so the values are unchanged.
+    std::vector<int32_t> keptTids;
+    keptTids.reserve((size_t)nt2);
+    for (int32_t t = 0; t < nt2; ++t)
+      if (contigLengthPass[t]) keptTids.push_back(t);
+    const size_t keep = keptTids.size();
+    outCols->names.assign(keep, std::string());
+    outCols->lens.assign(keep, 0);
     outCols->num_samples = (size_t)num_bams * (dualOn ? 2 : 1);
     outCols->means.resize(keep * outCols->num_samples);
-    size_t outRow = 0;
-    for (int32_t t = 0; t < nt2; ++t) {
-      if (!contigLengthPass[t]) continue;
+    // The per-BAM edge trim is contig-independent; hoist it out of the 6M-row
+    // loop instead of recomputing it for every contig/BAM pair.
+    std::vector<int> bamEdge(num_bams);
+    for (int bi = 0; bi < num_bams; ++bi)
+      bamEdge[bi] =
+          includeEdgeBases ? 0 : std::min(maxEdgeBases, averageReadSize[bi] / 3);
+#pragma omp parallel for schedule(static) num_threads(g_full_threads)
+    for (size_t r = 0; r < keep; ++r) {
+      const int32_t t = keptTids[r];
       const int32_t di = compactMode ? tid2compact[t] : t; // depth-array index
-      outCols->names.emplace_back(header->target_name[t]);
-      outCols->lens.push_back((int32_t)header->target_len[t]);
+      outCols->names[r] = header->target_name[t];
+      outCols->lens[r] = (int32_t)header->target_len[t];
       // Dual mode: 2*num_bams columns = [all-read block | unique-read block].
-      float *mv = outCols->row(outRow++);
+      float *mv = outCols->row(r);
+      const int32_t cl = (int32_t)header->target_len[t];
       for (int bi = 0; bi < num_bams; ++bi) {
-        const int edge =
-            includeEdgeBases ? 0 : std::min(maxEdgeBases, averageReadSize[bi] / 3);
-        int32_t cl = header->target_len[t];
+        const int edge = bamEdge[bi];
         int32_t adj = (cl > 2 * edge + 1) ? (cl - 2 * edge) : cl;
         float m;
         if (intraDepthVariance) {

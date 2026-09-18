@@ -32,7 +32,8 @@ static void certify_stability(Graph &g, const std::vector<size_t> &baseline,
   auto compute_es = [&]() {
     g.edgeScore.assign(E, 0.0f);
     if (has_depth) {
-#pragma omp parallel for schedule(dynamic, 1)
+      prepare_coverage_edge_scoring();
+#pragma omp parallel for schedule(runtime)
       for (size_t e = 0; e < E; ++e) {
         size_t i = g.from[e], j = g.to[e];
         if (edge_is_gfa(g.sComp[e])) { g.edgeScore[e] = (StoredDistance)g_gfa_weight; continue; }

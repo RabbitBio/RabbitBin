@@ -476,6 +476,75 @@ static void recruit_unbinned_to_cores(BinMap &cls, size_t floor) {
     small_norms = row_norms(small_unit, nobs1, samples);
   }
 
+  // ── Fast per-contig scoring against every core ────────────────────────────
+  // With leave_self_out=false, feature_cosine(c, ci) is just
+  //   dot(q_c, core_sums[ci]) / sqrt(core_norms[ci]^2),  q_c[k] = row[k]/norm[c]
+  // and q_c depends only on the contig, not on the core.  The original
+  // recomputed that division inside the per-core loop, so each contig paid
+  // core_count x dimension divisions (the profile's `vdivsd` hot spot).  We
+  // hoist q_c out of the loop, and transpose the core sums to [k][ci] so one
+  // vector evaluates eight cores at once.  Each lane still accumulates over k
+  // in ascending order with the same FMA the scalar loop contracted to, so
+  // every core's dot product keeps its original summation order and value.
+  std::vector<double> coreSumsT;  // samples x core_count
+  std::vector<double> coreDenom;  // sqrt(norm^2), 0 marks "unusable core"
+  if (use_rank_profiles) {
+    coreSumsT.assign(samples * core_count, 0.0);
+    coreDenom.assign(core_count, 0.0);
+    for (size_t ci = 0; ci < core_count; ++ci) {
+      const double *sum = depth_cores.sums.data() + ci * samples;
+      for (size_t k = 0; k < samples; ++k)
+        coreSumsT[k * core_count + ci] = sum[k];
+      // Match the original exactly: it squared the norm, tested the square,
+      // then took its square root (sqrt(x*x) is not always x to the last bit).
+      const double ss = depth_cores.norms[ci] * depth_cores.norms[ci];
+      coreDenom[ci] = (ss > 1e-30) ? std::sqrt(ss) : 0.0;
+    }
+  }
+
+  // q[k] = row[k] / norm[c], the unit-scaled rank profile of contig c.
+  auto make_q = [&](size_t c, double *q) -> bool {
+    const float *row;
+    double nc;
+    if (c < nobs) {
+      if (!(depth_norms[c] > 0.0f)) return false;
+      row = g_depth_unit.data() + c * samples;
+      nc = (double)depth_norms[c];
+    } else {
+      if (!(small_norms[c - nobs] > 0.0f)) return false;
+      row = small_unit.data() + (c - nobs) * samples;
+      nc = (double)small_norms[c - nobs];
+    }
+    for (size_t k = 0; k < samples; ++k) q[k] = (double)row[k] / nc;
+    return true;
+  };
+
+  // out[ci] = depth_score(c, ci, /*leave_self_out=*/false) for every core.
+  auto score_all_cores = [&](const double *q, double *out) {
+    const double ninf = -std::numeric_limits<double>::infinity();
+    const double *T = coreSumsT.data();
+    size_t ci = 0;
+#if defined(__AVX512F__)
+    for (; ci + 8 <= core_count; ci += 8) {
+      __m512d acc = _mm512_setzero_pd();
+      for (size_t k = 0; k < samples; ++k)
+        acc = _mm512_fmadd_pd(_mm512_set1_pd(q[k]),
+                              _mm512_loadu_pd(T + k * core_count + ci), acc);
+      _mm512_storeu_pd(out + ci, acc);
+    }
+#endif
+    for (; ci < core_count; ++ci) {
+      double dot = 0.0;
+      const double *col = T + ci;
+      for (size_t k = 0; k < samples; ++k) dot += q[k] * col[k * core_count];
+      out[ci] = dot;
+    }
+    for (size_t x = 0; x < core_count; ++x) {
+      const double d = coreDenom[x];
+      out[x] = (d > 0.0) ? std::max(-1.0, std::min(1.0, out[x] / d)) : ninf;
+    }
+  };
+
   auto magnitude_at = [&](size_t c, size_t k) {
     double value = 0.0;
     if (c < nobs) {
@@ -567,26 +636,38 @@ static void recruit_unbinned_to_cores(BinMap &cls, size_t floor) {
   };
 
   std::vector<std::vector<RbRecruitEvidence>> evidence(core_count);
-#pragma omp parallel for schedule(dynamic, 4) num_threads(numThreads)
-  for (size_t ci = 0; ci < core_count; ++ci) {
-    for (size_t c : *bins[core_bins[ci]]) {
-      if (c >= nobs) continue;
-      const double own = depth_score(c, ci, true);
-      double best_other = -std::numeric_limits<double>::infinity();
-      double second_other = -std::numeric_limits<double>::infinity();
-      for (size_t cj = 0; cj < core_count; ++cj) {
-        if (cj == ci) continue;
-        const double score = depth_score(c, cj, false);
-        if (score > best_other) {
-          second_other = best_other;
-          best_other = score;
-        } else if (score > second_other) {
-          second_other = score;
+#pragma omp parallel num_threads(numThreads)
+  {
+    const double ninf = -std::numeric_limits<double>::infinity();
+    std::vector<double> q(samples), scores(use_rank_profiles ? core_count : 0);
+#pragma omp for schedule(dynamic, 4)
+    for (size_t ci = 0; ci < core_count; ++ci) {
+      for (size_t c : *bins[core_bins[ci]]) {
+        if (c >= nobs) continue;
+        const double own = depth_score(c, ci, true);
+        double best_other = ninf;
+        double second_other = ninf;
+        if (use_rank_profiles) {
+          if (make_q(c, q.data()))
+            score_all_cores(q.data(), scores.data());
+          else
+            std::fill(scores.begin(), scores.end(), ninf);
         }
+        for (size_t cj = 0; cj < core_count; ++cj) {
+          if (cj == ci) continue;
+          const double score =
+              use_rank_profiles ? scores[cj] : depth_score(c, cj, false);
+          if (score > best_other) {
+            second_other = best_other;
+            best_other = score;
+          } else if (score > second_other) {
+            second_other = score;
+          }
+        }
+        RbRecruitEvidence item;
+        if (rb_make_recruit_evidence(own, best_other, second_other, item))
+          evidence[ci].push_back(item);
       }
-      RbRecruitEvidence item;
-      if (rb_make_recruit_evidence(own, best_other, second_other, item))
-        evidence[ci].push_back(item);
     }
   }
 
@@ -672,28 +753,48 @@ static void recruit_unbinned_to_cores(BinMap &cls, size_t floor) {
 
   std::vector<int> assignments(candidate_count, -1);
   size_t candidates = 0, rejected = 0;
-#pragma omp parallel for schedule(dynamic, 256) num_threads(numThreads) \
-    reduction(+:candidates,rejected)
-  for (size_t c = 0; c < candidate_count; ++c) {
-    bool has_profile = false;
-    if (use_rank_profiles) {
-      has_profile = c < nobs ? depth_norms[c] > 0.0f
-                             : small_norms[c - nobs] > 0.0f;
-    } else {
-      for (size_t k = 0; k < samples; ++k)
-        has_profile = has_profile || magnitude_at(c, k) > 0.0;
+#pragma omp parallel num_threads(numThreads) reduction(+ : candidates, rejected)
+  {
+    std::vector<double> q(samples), scores(use_rank_profiles ? core_count : 0);
+#pragma omp for schedule(dynamic, 256)
+    for (size_t c = 0; c < candidate_count; ++c) {
+      bool has_profile = false;
+      if (use_rank_profiles) {
+        has_profile = c < nobs ? depth_norms[c] > 0.0f
+                               : small_norms[c - nobs] > 0.0f;
+      } else {
+        for (size_t k = 0; k < samples; ++k)
+          has_profile = has_profile || magnitude_at(c, k) > 0.0;
+      }
+      if (binned[c] || !has_profile)
+        continue;
+      ++candidates;
+      Choice choice;
+      if (use_rank_profiles) {
+        // has_profile guarantees norm>0, so make_q always succeeds here.
+        make_q(c, q.data());
+        score_all_cores(q.data(), scores.data());
+        for (size_t ci = 0; ci < core_count; ++ci) {
+          const double score = scores[ci];
+          if (score > choice.best) {
+            choice.second = choice.best;
+            choice.best = score;
+            choice.core = (int)ci;
+          } else if (score > choice.second) {
+            choice.second = score;
+          }
+        }
+      } else {
+        choice = choose_core(c);
+      }
+      const double confidence =
+          rb_recruit_confidence(choice.best, choice.second);
+      if (choice.core < 0 || !(confidence >= boundary)) {
+        ++rejected;
+        continue;
+      }
+      assignments[c] = (int)core_bins[(size_t)choice.core];
     }
-    if (binned[c] || !has_profile)
-      continue;
-    ++candidates;
-    const Choice choice = choose_core(c);
-    const double confidence =
-        rb_recruit_confidence(choice.best, choice.second);
-    if (choice.core < 0 || !(confidence >= boundary)) {
-      ++rejected;
-      continue;
-    }
-    assignments[c] = (int)core_bins[(size_t)choice.core];
   }
 
   size_t recruited = 0, recruited_large = 0, recruited_small = 0;

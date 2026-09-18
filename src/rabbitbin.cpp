@@ -159,6 +159,13 @@ static double             g_depth_wjac_cut  = 0.0;
 static bool               g_depth_wjac_gate = false;
 static std::vector<float> g_depth_raw;             // nobs × num_depth_samples (raw, pre-rank)
 static std::vector<double> g_depth_colnorm;        // num_depth_samples (empty = no norm)
+// Per-contig non-negative coverage totals T_i = Σ_s max(0, d̃_is) on the same
+// column-normalised scale as cal_depth_wjac. Used only after mutual top-N, to
+// drop candidate edges whose Jaccard upper bound min(T_i,T_j)/max(T_i,T_j)
+// is already below τ_F. Must not be applied during PMH neighbourhood selection.
+static std::vector<double> g_depth_wjac_tot;
+static bool g_wjac_bound_on = true;
+static double g_wjac_bound_cut_adj = 0.0;  // τ with a conservative float margin
 // Independent input samples, before BAM dual-depth or auxiliary columns are
 // appended. The ordinary coverage block occupies the first of these columns.
 static size_t g_coverage_samples = 0;
@@ -456,6 +463,39 @@ static int rb_env_edge_cut_mode() {
   return 0;   // "fixed" or unrecognised → hand-set cutoff
 }
 
+// Per-edge coverage scoring has essentially uniform work (fixed sample count).
+// Default to dynamic chunks of 256: schedule(dynamic, 1) spent more time in
+// the OpenMP runtime than in Jaccard/corr, while static and larger dynamic
+// chunks reuse a contig's coverage row. RABBIT_EDGE_SCHED={static,dynamic1,
+// dynamic256,dynamic1024} selects omp schedule(runtime). This is NOT the
+// Fusion-D tile-pair loop, which remains schedule(dynamic, 1).
+static void rb_apply_edge_weight_schedule() {
+  const char *e = rb_getenv("RABBIT_EDGE_SCHED");
+  omp_sched_t kind = omp_sched_dynamic;
+  int chunk = 256;
+  if (e) {
+    if (!std::strcmp(e, "static")) {
+      kind = omp_sched_static;
+      chunk = 0;
+    } else if (!std::strcmp(e, "dynamic") || !std::strcmp(e, "dynamic1")) {
+      kind = omp_sched_dynamic;
+      chunk = 1;
+    } else if (!std::strcmp(e, "dynamic256")) {
+      kind = omp_sched_dynamic;
+      chunk = 256;
+    } else if (!std::strcmp(e, "dynamic1024")) {
+      kind = omp_sched_dynamic;
+      chunk = 1024;
+    }
+  }
+  omp_set_schedule(kind, chunk);
+}
+
+static bool rb_env_wjac_bound_on() {
+  const char *e = rb_getenv("RABBIT_WJAC_BOUND");
+  return !e || e[0] != '0';
+}
+
 // Otsu threshold over the positive edge weights in (0, 1]. 256 bins is a
 // conventional 8-bit discretisation. Returns the upper edge
 // of the between-class-variance-maximising bin.
@@ -603,6 +643,63 @@ static inline double cal_depth_wjac(size_t r1, size_t r2) {
   }
   if (mx <= 0.0) return 0.0;
   return mn / mx;
+}
+
+// T_i on the same non-negative normalised coverage as cal_depth_wjac.
+static void rebuild_depth_wjac_totals() {
+  g_depth_wjac_tot.clear();
+  if (g_depth_raw.empty() || num_depth_samples <= 0) return;
+  const size_t S = (size_t)num_depth_samples;
+  if (S == 0 || (g_depth_raw.size() % S) != 0) return;
+  const size_t n = g_depth_raw.size() / S;
+  g_depth_wjac_tot.assign(n, 0.0);
+  const bool norm = !g_depth_colnorm.empty();
+#pragma omp parallel for schedule(static)
+  for (size_t r = 0; r < n; ++r) {
+    const float *a = g_depth_raw.data() + r * S;
+    double t = 0.0;
+    for (size_t s = 0; s < S; ++s) {
+      double x = (double)a[s];
+      if (norm) x *= g_depth_colnorm[s];
+      if (x > 0.0) t += x;
+    }
+    g_depth_wjac_tot[r] = t;
+  }
+}
+
+// Jaccard of non-negative vectors satisfies
+//   J_ij <= min(T_i, T_j) / max(T_i, T_j).
+// For the default fuse w = min(max(ρ,0), J) the same bound is an upper bound
+// on the fused weight; product fuse is likewise ≤ J; geometric mean is ≤ √J.
+static inline double coverage_jaccard_pass_cut() {
+  double cut = (double)min_edge_weight;
+  if (g_depth_sim == 1 && g_depth_wjac_cut > cut) cut = g_depth_wjac_cut;
+  if (g_depth_sim == 2 && g_depth_fuse != 1 && g_depth_fuse != 2)
+    cut *= cut;  // w = sqrt(cp * J) <= sqrt(J)
+  return cut;
+}
+
+static inline bool wjac_total_bound_rejects(size_t i, size_t j) {
+  if (!g_wjac_bound_on) return false;
+  const double ti = g_depth_wjac_tot[i];
+  const double tj = g_depth_wjac_tot[j];
+  if (!(ti > 0.0) || !(tj > 0.0)) return true;  // all-zero → J = 0
+  const double lo = ti < tj ? ti : tj;
+  const double hi = ti < tj ? tj : ti;
+  // lo/hi < τ_adj  ⇔  lo < hi * τ_adj  (both positive; no per-edge division)
+  return lo < hi * g_wjac_bound_cut_adj;
+}
+
+static void prepare_coverage_edge_scoring() {
+  g_wjac_bound_on = rb_env_wjac_bound_on() && !low_sample_coverage() &&
+                    (g_depth_sim == 1 ||
+                     (g_depth_sim == 2 && num_depth_samples > 1));
+  rebuild_depth_wjac_totals();
+  if (g_wjac_bound_on && g_depth_wjac_tot.empty()) g_wjac_bound_on = false;
+  const double cut = g_wjac_bound_on ? coverage_jaccard_pass_cut() : 0.0;
+  g_wjac_bound_cut_adj = (cut > 0.0) ? (cut * (1.0 - 1e-6) - 1e-12) : 0.0;
+  if (!(g_wjac_bound_cut_adj > 0.0)) g_wjac_bound_on = false;
+  rb_apply_edge_weight_schedule();
 }
 
 #include "impl/rb_coverage.h"
@@ -901,6 +998,8 @@ static inline double depth_graph_raw_weight(size_t i, size_t j,
 
 static inline StoredDistance depth_graph_edge_score(size_t i, size_t j,
                                                     StoredDistance composition) {
+  // Bound is applied here (post mutual top-N), never during PMH heap selection.
+  if (num_depth_samples > 0 && wjac_total_bound_rejects(i, j)) return 0.0f;
   double w = depth_graph_raw_weight(i, j, composition);
   if (num_depth_samples > 0 &&
       (!std::isfinite(w) || w < (double)min_edge_weight)) return 0.0f;
@@ -1206,6 +1305,17 @@ static inline uint32_t pmh_match_count16(const uint16_t *__restrict__ a,
     __mmask32 eq = _mm512_cmpeq_epi16_mask(va, vb);
     __mmask32 nz = _mm512_cmpneq_epi16_mask(va, vz);
     cnt += (uint32_t)__builtin_popcount((unsigned)(eq & nz));
+  }
+  // Masked tail (m = 500 leaves 20 lanes): one masked compare instead of a
+  // 20-iteration scalar loop.  Masked loads never touch bytes beyond m.
+  if (k < m) {
+    const __mmask32 tail = (__mmask32)((1u << (m - k)) - 1u);
+    __m512i va = _mm512_maskz_loadu_epi16(tail, (const void *)(a + k));
+    __m512i vb = _mm512_maskz_loadu_epi16(tail, (const void *)(b + k));
+    __mmask32 eq = _mm512_mask_cmpeq_epi16_mask(tail, va, vb);
+    __mmask32 nz = _mm512_mask_cmpneq_epi16_mask(tail, va, vz);
+    cnt += (uint32_t)__builtin_popcount((unsigned)(eq & nz));
+    k = m;
   }
 #elif defined(__AVX2__)
   const __m256i vz = _mm256_setzero_si256();
@@ -5011,7 +5121,8 @@ static int rb_cmd_bin(int ac, char *av[]) {
         auto compute_edgescore = [&]() {
           g.edgeScore.assign(E, 0.0f);
           if (has_depth) {
-#pragma omp parallel for schedule(dynamic, 1)
+            prepare_coverage_edge_scoring();
+#pragma omp parallel for schedule(runtime)
             for (size_t e = 0; e < E; ++e) {
               size_t i = g.from[e], j = g.to[e];
               if (edge_is_gfa(g.sComp[e])) {
@@ -5275,6 +5386,8 @@ static int rb_cmd_bin(int ac, char *av[]) {
                         getUsedPhysMem(), getTotalPhysMem() / 1024 / 1024);
         size_t ne = g.getEdgeCount();
         g.edgeScore.resize(ne);
+        prepare_coverage_edge_scoring();
+        rb_phase("edgescore start");
 
         // The optional adaptive-cutoff path uses the same coverage scores
         // as the fixed-cutoff path, including one- and two-sample inputs.
@@ -5286,7 +5399,7 @@ static int rb_cmd_bin(int ac, char *av[]) {
           // (no survival cutoff yet), so its unlabelled distribution can set the
           // cutoff.  GFA edges carry a sentinel (-1) and bypass the cutoff.
           std::vector<float> raw_w(ne, 0.0f);
-#pragma omp parallel for schedule(dynamic, 1)
+#pragma omp parallel for schedule(runtime)
           for (size_t e = 0; e < ne; ++e) {
             if (edge_is_gfa(g.sComp[e])) { raw_w[e] = -1.0f; continue; }
             size_t i = g.from[e], j = g.to[e];
@@ -5310,7 +5423,7 @@ static int rb_cmd_bin(int ac, char *av[]) {
               edge_cut_mode == 1 ? "otsu" : "gmm", adaptive_cut,
               (double)min_edge_weight, pos.size(), ne);
           // ── Phase B: apply the derived cutoff (+ optional edge power).
-#pragma omp parallel for schedule(dynamic, 1)
+#pragma omp parallel for schedule(runtime)
           for (size_t e = 0; e < ne; ++e) {
             if (raw_w[e] < 0.0f) {
               g.edgeScore[e] = (StoredDistance)g_gfa_weight;
@@ -5322,7 +5435,8 @@ static int rb_cmd_bin(int ac, char *av[]) {
             g.edgeScore[e] = (StoredDistance)w;
           }
         } else {
-#pragma omp parallel for schedule(dynamic, 1)
+        uint64_t wjac_skipped = 0;
+#pragma omp parallel for schedule(runtime) reduction(+:wjac_skipped)
         for (size_t e = 0; e < ne; ++e) {
           size_t i = g.from[e], j = g.to[e];
           if (edge_is_gfa(g.sComp[e])) {
@@ -5330,8 +5444,18 @@ static int rb_cmd_bin(int ac, char *av[]) {
             g.edgeScore[e] = (StoredDistance)g_gfa_weight;
             continue;
           }
+          if (wjac_total_bound_rejects(i, j)) {
+            g.edgeScore[e] = 0.0f;
+            ++wjac_skipped;
+            continue;
+          }
           g.edgeScore[e] = depth_graph_edge_score(i, j, g.sComp[e]);
         }
+        if (wjac_skipped)
+          verbose_message(
+              "Coverage Jaccard total-sum bound skipped %llu / %zu "
+              "candidate edges (bound < τ_F)\n",
+              (unsigned long long)wjac_skipped, ne);
         }
         dump_coverage_edge_scores(g);
       } else {
