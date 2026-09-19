@@ -192,13 +192,15 @@ public:
         valid(false) {}
   ReadStatistics(bam1_t *b, uint32_t _exactmatches, uint32_t _substitutions,
                  uint32_t _insertions, uint32_t _deletions, uint32_t _softclips,
-                 uint32_t _hardclips, uint32_t _skipRef, uint32_t _nm)
+                 uint32_t _hardclips, uint32_t _skipRef, uint32_t _nm,
+                 const uint32_t *knownAlignEnd = nullptr)
       : exactmatches(_exactmatches), substitutions(_substitutions),
         insertions(_insertions), deletions(_deletions), softclips(_softclips),
         hardclips(_hardclips), skipRef(_skipRef), seqstart(0),
         seqend(b->core.l_qseq), seqlen(b->core.l_qseq), alignstart(0),
         alignend(0), alignlen(0), nm(_nm), bam(b), valid(true) {
-    alignlen = calculateAlignment(b, alignstart, alignend, seqstart, seqend);
+    alignlen = calculateAlignment(b, alignstart, alignend, seqstart, seqend,
+                                   knownAlignEnd);
     // seqlen remains the length of the sequence...
     const char *failMsg = NULL;
     if (nm != substitutions + insertions + deletions) {
@@ -245,7 +247,8 @@ public:
 
   static uint32_t calculateAlignment(bam1_t *b, uint32_t &alignstart,
                                      uint32_t &alignend, uint32_t &seqstart,
-                                     uint32_t &seqend) {
+                                     uint32_t &seqend,
+                                     const uint32_t *knownAlignEnd = nullptr) {
     uint32_t len = 0;
     alignstart = alignend = seqstart = seqend = 0;
     if (b == NULL)
@@ -265,7 +268,10 @@ public:
 
     alignstart = b->core.pos;
     uint32_t *cigar = bam1_cigar(b);
-    alignend = bam_endpos(b);
+    // A caller that already checked the reference end can reuse that exact
+    // bam_endpos result, avoiding another complete CIGAR scan. The cached end
+    // must come from the current record, after any clipping/repair.
+    alignend = knownAlignEnd ? *knownAlignEnd : bam_endpos(b);
 
     seqend = b->core.l_qseq;
     int32_t op = bam_cigar_op(cigar[0]);
@@ -617,7 +623,8 @@ CountType calcMismatches(bam1_t *b, uint32_t seqpos, const char *ref,
 static int64_t WARNING_FLAG = 0;
 CountType caldepth(bam1_t *b, DepthCounts depthCounts = DepthCounts(),
                    int32_t refLen = -1, const char *ref = NULL,
-                   int ignoreEdges = 0, ReadStatistics *readstats = NULL) {
+                   int ignoreEdges = 0, ReadStatistics *readstats = NULL,
+                   const uint32_t *knownAlignEnd = nullptr) {
   // calculate the covered bases
   // optionally increment the coveredBases in the baseCounts vector
   int len = 0;
@@ -861,7 +868,8 @@ CountType caldepth(bam1_t *b, DepthCounts depthCounts = DepthCounts(),
     }
     if (readstats != NULL) {
       *readstats = ReadStatistics(b, exactmatches, mismatches, insertions,
-                                  deletions, softclips, hardclips, skipRef, nm);
+                                  deletions, softclips, hardclips, skipRef, nm,
+                                  knownAlignEnd);
     }
   } else {
     // TODO if NM == NULL -- then calculate it (with a reference, of course)!
@@ -871,7 +879,8 @@ CountType caldepth(bam1_t *b, DepthCounts depthCounts = DepthCounts(),
     if (readstats != NULL) {
       *readstats = ReadStatistics(b, exactmatches, mismatches, insertions,
                                   deletions, softclips, hardclips, skipRef,
-                                  mismatches + insertions + deletions);
+                                  mismatches + insertions + deletions,
+                                  knownAlignEnd);
     }
   }
   if (b->core.l_qseq > 0 && seqpos != (uint32_t)b->core.l_qseq) {

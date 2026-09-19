@@ -422,6 +422,33 @@ Everything else in the *Default pipeline* section above is deterministic given
 the input files and thread count. No other flags were used for the published
 benchmarks.
 
+### Performance diagnostics
+
+Set `RB_TIMING=1` to report wall-clock phase timestamps and
+`RB_GRAPH_PROF=1` to count candidate pairs, exact early exits and heap updates.
+`RB_DEPTH_PROF=1` reports depth preparation, scanning and matrix merge phases.
+FASTA/sketch construction overlaps in-process BAM depth calculation; these
+times must not be added when computing the total runtime.
+
+The fused graph's portable abundance filter batches dot products over a
+transposed copy of the rank vectors. It rejects a pair only outside a
+conservative floating-point error bound; every survivor still uses the
+original dot calculation before PMH and top-k selection. Set
+`RABBIT_NO_ABD_BATCH=1` for a differential run with the original dot path.
+Existing integer/VNNI filters retain precedence when enabled. PMH score
+conversion is cached for each possible integer winner-match count using the
+same correction and clamp as the direct calculation. These optimizations do
+not change thresholds, sample handling, random seeds or neighbour tie-breaking.
+
+For coordinate-sorted BAM input, byte-range workers write complete interior
+contigs directly to their depth column and retain only boundary contigs for
+merging. Integer depth sums and per-sample floating-point normalization are
+unchanged. Matrix merging verifies names before reusing reference order and
+copies independent rows in parallel; duplicate names retain the original
+name-based handling. The graph heap reuses its packed threshold key for
+comparisons, caps allocation at the configured top-k, and sorts its existing
+storage for mutual-neighbour lookup without popping and copying every edge.
+
 ## Pipeline wrapper
 
 `run_rabbitbin.sh` runs BAM depth summarization then RabbitBin in one call:

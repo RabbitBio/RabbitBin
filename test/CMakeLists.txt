@@ -7,6 +7,9 @@ add_test(NAME test_silhouette COMMAND test_silhouette)
 add_executable(test_recruitment test_recruitment.cpp)
 add_test(NAME test_recruitment COMMAND test_recruitment)
 
+add_executable(test_abundance_filter test_abundance_filter.cpp)
+add_test(NAME test_abundance_filter COMMAND test_abundance_filter)
+
 find_package(PythonInterp 3 QUIET)
 if(PYTHONINTERP_FOUND)
   add_test(NAME test_coverage_edges
@@ -14,6 +17,11 @@ if(PYTHONINTERP_FOUND)
                    ${CMAKE_CURRENT_SOURCE_DIR}/test_coverage_edges.py
                    ${CMAKE_BINARY_DIR}/src/rabbitbin
                    ${CMAKE_BINARY_DIR}/test-coverage-edges)
+  add_test(NAME test_abundance_filter_graph
+           COMMAND ${PYTHON_EXECUTABLE}
+                   ${CMAKE_CURRENT_SOURCE_DIR}/test_abundance_filter_graph.py
+                   ${CMAKE_BINARY_DIR}/src/rabbitbin
+                   ${CMAKE_BINARY_DIR}/test-abundance-filter-graph)
 else()
   message(STATUS "Python 3 unavailable; coverage edge integration test not registered")
 endif()
