@@ -449,6 +449,14 @@ name-based handling. The graph heap reuses its packed threshold key for
 comparisons, caps allocation at the configured top-k, and sorts its existing
 storage for mutual-neighbour lookup without popping and copying every edge.
 
+BAM scan streams use a bounded 1 MiB compressed-input buffer to batch reads
+across BGZF blocks. HTSlib still performs seeks, decompression, CRC checks and
+record decoding. NM lookup traverses ordinary scalar/string tags in one loop;
+arrays, unknown types, missing tags and malformed data use HTSlib's lookup.
+Neither optimization assumes a particular tag order, dataset or storage device.
+Measured results, cache conditions and equivalence checks are documented in
+[the optimization validation note](docs/performance-20260919.md).
+
 ## Pipeline wrapper
 
 `run_rabbitbin.sh` runs BAM depth summarization then RabbitBin in one call:

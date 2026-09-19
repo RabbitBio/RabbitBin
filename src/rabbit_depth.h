@@ -34,6 +34,9 @@
 #include "CheckRead.hpp"
 #include "OpenMP.h"
 #include "RunningStats.h"
+#ifndef LEGACY_SAMTOOLS
+#include "impl/rb_bam_aux.h"
+#endif
 
 using namespace std;
 
@@ -745,7 +748,11 @@ CountType caldepth(bam1_t *b, DepthCounts depthCounts = DepthCounts(),
       refpos += oplen;
   }
   // use NM - (insertion + deletion) errors to calculate mismatches
+#ifdef LEGACY_SAMTOOLS
   uint8_t *NM = (uint8_t *)bam_aux_get(b, "NM");
+#else
+  uint8_t *NM = rabbit_bam::aux_nm(b);
+#endif
   if (NM != NULL) {
     int32_t nm = bam_aux2i(NM);
     if (nm < (int32_t)(insertions + deletions)) {

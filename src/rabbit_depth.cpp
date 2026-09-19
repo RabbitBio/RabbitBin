@@ -594,6 +594,19 @@ static inline void snv_finalize_contig(const uint32_t *cnt, int32_t reflen,
   }
 }
 
+// Coalesce compressed input across BGZF blocks. The default hFILE buffer may
+// be smaller than a compressed block, causing a header read and a payload read
+// to become separate system calls for every block. A bounded batch of 16
+// maximum-sized BGZF blocks amortises that cost without any device-specific
+// settings. HTSlib retains ownership of buffering, seeks, decoding and CRCs;
+// if resizing fails it keeps the existing buffer and reports a warning.
+static htsFile *open_depth_bam(const std::string &path) {
+  htsFile *fp = hts_open(path.c_str(), "rb");
+  if (fp)
+    hts_set_opt(fp, HTS_OPT_BLOCK_SIZE, 16 * BGZF_MAX_BLOCK_SIZE);
+  return fp;
+}
+
 static void process_depth_shard(const DepthShard &sh,
                                 const std::string &bamPath,
                                 const BamHeaderT &header,
@@ -613,7 +626,7 @@ static void process_depth_shard(const DepthShard &sh,
                                  : ProfileClock::time_point{};
   if (!sh.hasData)
     return;
-  htsFile *fp = hts_open(bamPath.c_str(), "rb");
+  htsFile *fp = open_depth_bam(bamPath);
   if (!fp) {
     if (profile)
       profile->openSeekMs = std::chrono::duration<double, std::milli>(
@@ -773,7 +786,7 @@ static bool bgzf_read_le_i32(BGZF *fp, int32_t &value) {
 static bool bam_header_end_and_avgread(const std::string &path,
                                        int32_t expectedTargets,
                                        uint64_t &firstRecVoff, int &avgRead) {
-  htsFile *fp = hts_open(path.c_str(), "rb");
+  htsFile *fp = open_depth_bam(path);
   if (!fp)
     return false;
   BGZF *bgzf = fp->fp.bgzf;
@@ -948,7 +961,7 @@ static bool process_depth_byterange(
     std::vector<std::pair<int32_t, CountType>> *outU = nullptr, int dualQ = 0,
     const int32_t *tid2compact = nullptr,
     CountType *interiorDepth = nullptr, CountType *interiorDepthU = nullptr) {
-  htsFile *fp = hts_open(bamPath.c_str(), "rb");
+  htsFile *fp = open_depth_bam(bamPath);
   if (!fp)
     return false;
   BGZF *bgzf = fp->fp.bgzf;

@@ -10,6 +10,19 @@ add_test(NAME test_recruitment COMMAND test_recruitment)
 add_executable(test_abundance_filter test_abundance_filter.cpp)
 add_test(NAME test_abundance_filter COMMAND test_abundance_filter)
 
+add_executable(test_bam_aux test_bam_aux.cpp)
+find_package(Threads REQUIRED)
+target_include_directories(test_bam_aux PRIVATE ${HTSlib_INCLUDE_DIRS})
+target_link_libraries(test_bam_aux ${HTSlib_LIBRARIES} ${ZLIB_LIBRARIES}
+                     Threads::Threads ${CMAKE_DL_LIBS})
+if(DEFLATE_LIB)
+  target_link_libraries(test_bam_aux ${DEFLATE_LIB})
+endif()
+if(NOT "${EXTRA_DEPENDENCIES}" STREQUAL "")
+  add_dependencies(test_bam_aux ${EXTRA_DEPENDENCIES})
+endif()
+add_test(NAME test_bam_aux COMMAND test_bam_aux)
+
 find_package(PythonInterp 3 QUIET)
 if(PYTHONINTERP_FOUND)
   add_test(NAME test_coverage_edges
@@ -22,6 +35,15 @@ if(PYTHONINTERP_FOUND)
                    ${CMAKE_CURRENT_SOURCE_DIR}/test_abundance_filter_graph.py
                    ${CMAKE_BINARY_DIR}/src/rabbitbin
                    ${CMAKE_BINARY_DIR}/test-abundance-filter-graph)
+  find_program(SAMTOOLS_EXECUTABLE samtools)
+  if(SAMTOOLS_EXECUTABLE AND DEFLATE_LIB)
+    add_test(NAME test_bam_depth_equivalence
+             COMMAND ${PYTHON_EXECUTABLE}
+                     ${CMAKE_CURRENT_SOURCE_DIR}/test_bam_depth_equivalence.py
+                     ${CMAKE_BINARY_DIR}/src/rabbitbin
+                     ${CMAKE_BINARY_DIR}/test-bam-depth-equivalence
+                     ${SAMTOOLS_EXECUTABLE})
+  endif()
 else()
   message(STATUS "Python 3 unavailable; coverage edge integration test not registered")
 endif()
