@@ -79,10 +79,12 @@ public:
     }
   }
 
-  static bool checkEnd(const bam1_t *b, uint32_t refLen) {
-    if (refLen > 0) {
+  static bool checkEnd(const bam1_t *b, uint32_t refLen,
+                       uint32_t *alignEndOut = nullptr) {
+    if (refLen > 0 || alignEndOut) {
       uint32_t alignend = bam_endpos(b);
-      if (alignend > refLen) {
+      if (alignEndOut) *alignEndOut = alignend;
+      if (refLen > 0 && alignend > refLen) {
         std::cerr << "Warning checkEnd found alignend=" << alignend
                   << " but refLen=" << refLen << " for " << bam1_qname(b)
                   << std::endl;
@@ -91,11 +93,13 @@ public:
     }
     return true;
   }
-  static bool checkEnd(const bam1_t *b, const bam_header_t *header) {
+  static bool checkEnd(const bam1_t *b, const bam_header_t *header,
+                       uint32_t *alignEndOut = nullptr) {
     if ((b->core.flag & BAM_FUNMAP) == BAM_FUNMAP) {
+      if (alignEndOut) *alignEndOut = bam_endpos(b);
       return true;
     } else {
-      return checkEnd(b, header->target_len[b->core.tid]);
+      return checkEnd(b, header->target_len[b->core.tid], alignEndOut);
     }
   }
   static bam1_t *fixEndClip(bam1_t *b, const bam_header_t *header) {

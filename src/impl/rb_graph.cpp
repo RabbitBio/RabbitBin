@@ -1,5 +1,7 @@
 // RabbitBin module: rb_graph.cpp
 
+#include "rb_abundance_filter.h"
+
 // ═══════════════════════════════════════════════════════════════════════════
 // build_similarity_graph  –  build edge list using KmerSketch Jaccard
 // ═══════════════════════════════════════════════════════════════════════════
@@ -372,18 +374,33 @@ static void gen_fused_graph(Graph &g) {
   // row_thresh[r] mirrors heaps[r].top() once the heap is full, so the common
   // low-similarity candidate is rejected with a single relaxed atomic read and
   // never contends for the lock.  Correctness is re-verified inside the lock.
-  // Compact 8-byte heap edge (uint32 neighbour id + float similarity) instead of
-  // the global 16-byte Edge (size_t id).  Contig ids are < nobs < 2^32, so this
-  // halves the per-row neighbour-heap footprint without preallocating sparse
-  // rows.
-  // CompareEdge32 reproduces CompareEdge's total order exactly (min-heap on sv;
-  // equal-sv → larger id evicted first, so the smaller id is retained), keeping
-  // the kept edge set and drain order bit-identical.
-  struct Edge32 { uint32_t id; StoredDistance sv; };
+  // Reuse the threshold's packed order in the heap itself. For graph_sim's
+  // nonnegative similarities, IEEE float bits have the same order as values;
+  // the complemented id retains the original smaller-id-wins tie-break.
+  // Sifting therefore needs one integer comparison per level, with no float
+  // comparison or second branch for equal scores. Both the kept set and the
+  // pop order are unchanged. Each edge still occupies eight bytes.
+  static_assert(sizeof(StoredDistance) == 4 &&
+                    std::numeric_limits<StoredDistance>::is_iec559,
+                "packed edge key requires an IEEE-754 32-bit similarity");
+  struct Edge32 {
+    uint64_t key;
+    static uint64_t pack(StoredDistance sv, uint32_t id) noexcept {
+      uint32_t bits;
+      std::memcpy(&bits, &sv, sizeof(bits));
+      return ((uint64_t)bits << 32) | (uint32_t)~id;
+    }
+    uint32_t id() const noexcept { return ~(uint32_t)key; }
+    StoredDistance sv() const noexcept {
+      const uint32_t bits = (uint32_t)(key >> 32);
+      StoredDistance value;
+      std::memcpy(&value, &bits, sizeof(value));
+      return value;
+    }
+  };
   struct CompareEdge32 {
     constexpr bool operator()(Edge32 const &a, Edge32 const &b) const noexcept {
-      if (a.sv != b.sv) return a.sv > b.sv;
-      return a.id < b.id;
+      return a.key > b.key;
     }
   };
   // Minimal binary min-heap (CompareEdge32 order) with a single-pass
@@ -395,8 +412,14 @@ static void gen_fused_graph(Graph &g) {
     size_t size() const noexcept { return v.size(); }
     bool empty() const noexcept { return v.empty(); }
     const Edge32 &top() const noexcept { return v.front(); }
-    void reserve(size_t n) { v.reserve(n); }
-    void push(const Edge32 &e) {
+    void push(const Edge32 &e, size_t limit) {
+      if (v.size() == v.capacity()) {
+        // Grow only as far as the configured top-k. Default vector growth can
+        // otherwise keep almost twice as many slots as the heap can ever use.
+        const size_t next = v.empty() ? 1 :
+            v.size() + std::min(v.size(), limit - v.size());
+        v.reserve(next);
+      }
       v.push_back(e);
       std::push_heap(v.begin(), v.end(), CompareEdge32{});
     }
@@ -421,7 +444,6 @@ static void gen_fused_graph(Graph &g) {
       }
       v[k] = e;
     }
-    void swap(Heap &o) noexcept { v.swap(o.v); }
   };
   std::vector<Heap> heaps(nobs);
 
@@ -851,6 +873,15 @@ static void gen_fused_graph(Graph &g) {
                       ABD_S);
   }
 
+  rabbit_abundance::DotFilter abd_batch;
+  const bool use_abd_batch = abdfirst && !use_rank8 && !use_abd_q8 &&
+      getenv("RABBIT_NO_ABD_BATCH") == nullptr &&
+      abd_batch.build(abd_u, nobs, ABD_S, abd_corr_min_eps, (int)numThreads);
+  if (use_abd_batch)
+    verbose_message("Abundance prefilter: conservative batched dot (S=%u, "
+                    "%.1f MB); survivors use original dot\n", ABD_S,
+                    (double)abd_batch.bytes() / 1048576.0);
+
   // ── Composition early-exit (exact) ───────────────────────────────────────
   // For the default PMH winners metric a pair can only become an edge if its
   // similarity beats at least one endpoint's current heap threshold.  After
@@ -865,6 +896,15 @@ static void gen_fused_graph(Graph &g) {
   const bool comp_ee = g_pmh_mode && !g_exact_cos_cmp && g_pmh_m >= 16 &&
                        (win16 ? !g_win16.empty() : !g_win_flat.empty()) &&
                        (getenv("RABBIT_NO_COMP_EE") == nullptr);
+  // A PMH score depends only on an integer match count in [0,m]. Compute the
+  // SAME correction/clamp once per count, rather than for every checkpoint
+  // of every pair. This table also preserves float ties in the heap bound.
+  std::vector<StoredDistance> pmh_count_scores;
+  if (comp_ee) {
+    pmh_count_scores.resize((size_t)g_pmh_m + 1);
+    for (size_t c = 0; c < pmh_count_scores.size(); ++c)
+      pmh_count_scores[c] = (StoredDistance)pmh_sv_from_count((uint32_t)c);
+  }
   const uint32_t EE_P = (g_pmh_m >= 64) ? 64u : g_pmh_m;
   // Progressive re-check granularity (registers) after the EE_P prefix.
   // RABBIT_COMP_EE_STEP overrides; 0 or >= m restores the single check.
@@ -931,27 +971,12 @@ static void gen_fused_graph(Graph &g) {
     uint32_t visit_gen = 0;
     if (use_lsh) visited.assign(nobs, 0u);
 
-    // Pack (similarity, neighbour id) into one 64-bit key with the SAME total
-    // order as CompareEdge so the lock-free threshold test is exact: a candidate
-    // is rejected iff it cannot beat the current weakest kept edge, including the
-    // equal-similarity smaller-id-wins tie-break. Higher key == kept-preferred.
-    // Similarities are >= 0 (graph_sim clamps), so the IEEE-754 float bit pattern
-    // is monotonic with value; smaller id maps to a larger (~id) low word so it
-    // ranks above a larger id at equal similarity. The heap top (weakest kept)
-    // therefore has the MINIMUM key, and that key only ever increases, making the
-    // relaxed fast-path load safe (never rejects a true winner).
-    static_assert(sizeof(StoredDistance) == 4,
-                  "packed edge key assumes a 32-bit StoredDistance");
-    auto edge_key = [](StoredDistance sv, size_t id) -> uint64_t {
-      uint32_t sb;
-      std::memcpy(&sb, &sv, sizeof(sb));
-      return ((uint64_t)sb << 32) | (uint32_t)(~(uint32_t)id);
-    };
+    // Heap keys and atomic thresholds use the same total order. The weakest
+    // kept key only increases, so a stale relaxed load cannot reject a winner.
     static const CompareEdge32 cmp_edge{};
     auto store_thresh = [&](RowSync &rs, const Edge32 &top) {
-      rs.thresh_sv.store(top.sv, std::memory_order_relaxed);
-      rs.thresh_key.store(edge_key(top.sv, top.id),
-                          std::memory_order_relaxed);
+      rs.thresh_sv.store(top.sv(), std::memory_order_relaxed);
+      rs.thresh_key.store(top.key, std::memory_order_relaxed);
     };
     // t_seen: a threshold value for row r read earlier by the caller.  Row
     // thresholds only ever rise, so rejecting on a stale (lower) snapshot is
@@ -969,9 +994,7 @@ static void gen_fused_graph(Graph &g) {
       }
       // Near/at threshold (rare): resolve the deterministic equal-similarity
       // smaller-id-wins tie-break lock-free via the packed key.
-      uint32_t svb;
-      std::memcpy(&svb, &sv, sizeof(svb));
-      const uint64_t ck = ((uint64_t)svb << 32) | (uint32_t)(~(uint32_t)other);
+      const uint64_t ck = Edge32::pack(sv, (uint32_t)other);
       if (ck <= rs.thresh_key.load(std::memory_order_relaxed)) {
         if (graphProfileOn) ++my_prof.keyRejects;
         return;
@@ -990,9 +1013,9 @@ static void gen_fused_graph(Graph &g) {
       }
       if (graphProfileOn) ++my_prof.lockAcquires;
       Heap &h = heaps[r];
-      const Edge32 cand{(uint32_t)other, sv};
+      const Edge32 cand{ck};
       if (h.size() < (size_t)maxEdges) {
-        h.push(cand);
+        h.push(cand, (size_t)maxEdges);
         if (graphProfileOn) ++my_prof.heapPushes;
         if (h.size() == (size_t)maxEdges) store_thresh(rs, h.top());
       } else if (cmp_edge(cand, h.top())) {  // cand kept-preferred over weakest
@@ -1027,13 +1050,7 @@ static void gen_fused_graph(Graph &g) {
           t_i = ti; t_j = tj;
           const float tmin = ti < tj ? ti : tj;
           auto bound_below = [&](uint32_t c, uint32_t p) -> bool {
-            double up = (double)(c + (g_pmh_m - p)) * g_inv_pmh_m;
-            if (g_pmh_base_on && g_pmh_baseline > 0.0 && g_pmh_baseline < 1.0) {
-              up = (up - g_pmh_baseline) * g_inv_one_minus_b0;
-              if (up < 0.0) up = 0.0;
-            }
-            if (up > 1.0 - 1e-6) up = 1.0 - 1e-6;
-            return (float)up < tmin;
+            return pmh_count_scores[c + (g_pmh_m - p)] < tmin;
           };
           uint32_t c = pmh_match_count16(aw, bw, EE_P);
           uint32_t p = EE_P;
@@ -1062,23 +1079,18 @@ static void gen_fused_graph(Graph &g) {
           const uint32_t *aw = g_win_flat.data() + i * (size_t)g_pmh_m;
           const uint32_t *bw = g_win_flat.data() + j * (size_t)g_pmh_m;
           cP = pmh_match_count(aw, bw, EE_P);
-          double up = (double)(cP + (g_pmh_m - EE_P)) * g_inv_pmh_m;
-          if (g_pmh_base_on && g_pmh_baseline > 0.0 && g_pmh_baseline < 1.0) {
-            up = (up - g_pmh_baseline) * g_inv_one_minus_b0;
-            if (up < 0.0) up = 0.0;
-          }
-          if (up > 1.0 - 1e-6) up = 1.0 - 1e-6;
+          const StoredDistance up = pmh_count_scores[cP + (g_pmh_m - EE_P)];
           const float ti = rowsync[i].thresh_sv.load(std::memory_order_relaxed);
           const float tj = rowsync[j].thresh_sv.load(std::memory_order_relaxed);
           t_i = ti; t_j = tj;
-          if ((float)up < (ti < tj ? ti : tj)) {
+          if (up < (ti < tj ? ti : tj)) {
             if (graphProfileOn) ++my_prof.upperBoundPruned;
             return;  // exact: unkeepable
           }
           cFull = cP + pmh_match_count(aw + EE_P, bw + EE_P, g_pmh_m - EE_P);
         }
         if (graphProfileOn) ++my_prof.partialThenFull;
-        sv = (StoredDistance)pmh_sv_from_count(cFull);
+        sv = pmh_count_scores[cFull];
       } else {
         if (graphProfileOn) ++my_prof.graphSimCalls;
         sv = (StoredDistance)graph_sim(i, j);
@@ -1184,6 +1196,29 @@ static void gen_fused_graph(Graph &g) {
           continue;
         }
 #endif
+        if (use_abd_batch) {
+          constexpr size_t width = rabbit_abundance::DotFilter::width;
+          const float *left = abd_u + i * ABD_S;
+          const size_t block_end = j_stop / width + (j_stop % width != 0);
+          for (size_t b = j_begin / width; b < block_end; ++b) {
+            const size_t j0 = b * width;
+            uint32_t valid = ~uint32_t(0);
+            if (j0 < j_begin) valid &= ~uint32_t(0) << (j_begin - j0);
+            if (j_stop - j0 < width) valid &= (uint32_t(1) << (j_stop - j0)) - 1;
+            uint32_t pass = abd_batch.candidates(left, b) & valid;
+            while (pass) {
+              const size_t j = j0 + (unsigned)__builtin_ctz(pass);
+              pass &= pass - 1;
+              if (!is_nz(i, j)) continue;
+              // Preserve the exact previous prune decision, including the
+              // floating-point boundary and the order of surviving j values.
+              if (unit_dot_f(left, abd_u + j * ABD_S, ABD_S) < abd_corr_min_eps)
+                continue;
+              process_pair(i, j);
+            }
+          }
+          continue;
+        }
 #if defined(__AVX512F__)
         if (preload_short_abd) {
           UnitDotLeft64 left;
@@ -1348,8 +1383,8 @@ static void gen_fused_graph(Graph &g) {
     for (size_t i = 0; i < nobs; ++i) {
       while (!heaps[i].empty()) {
         auto e = heaps[i].top(); heaps[i].pop();
-        size_t j   = e.id;
-        StoredDistance sv = e.sv;
+        size_t j   = e.id();
+        StoredDistance sv = e.sv();
         if (sv <= 0.0f) continue;
         if (i < j) {
           from.push_back(i); to.push_back(j); sComp.push_back(sv);
@@ -1361,34 +1396,22 @@ static void gen_fused_graph(Graph &g) {
     // Mutual k-NN (RABBIT_MUTUAL_KNN=1): keep edge (i,j) only if both
     // j ∈ top-k(i) AND i ∈ top-k(j).
     //
-    // Parallel + compact: instead of one ~16M-entry hash map (serial build +
-    // serial probe, plus a fat 24 B/entry footprint and cross-NUMA reads on the
-    // thread-scattered heaps), we drain each row's heap into a per-row sorted
-    // vector of (neighborId, sim). Membership "is i a neighbor of j?" becomes a
-    // branch-light binary search in contiguous 8 B pairs (≈128 MB vs 200-400 MB
-    // for the map). Both the drain and the mutual-emit passes parallelise over
-    // rows, and the edge order is now deterministic (sorted by i then j).
-    typedef std::pair<uint32_t, StoredDistance> Nbr;   // (neighborId, sim)
-    std::vector<std::vector<Nbr>> nbr(nobs);
-
-    // (1) Parallel drain: heaps[i] → sorted nbr[i] (ascending neighbor id).
+    // Each heap already owns a contiguous array of all its neighbours. Filter
+    // and sort that array in place: popping every edge before sorting it again
+    // performed an unnecessary O(k log k) heap traversal plus a second buffer
+    // allocation and copy for every row. No heap operation is needed after the
+    // pair pass. Membership remains a binary search over ascending ids.
 #pragma omp parallel for num_threads(numThreads) schedule(dynamic, 64)
     for (size_t i = 0; i < nobs; ++i) {
-      Heap &h = heaps[i];
-      std::vector<Nbr> &row = nbr[i];
-      row.reserve(h.size());
-      while (!h.empty()) {
-        const Edge32 &e = h.top();
-        if (e.sv > 0.0f)
-          row.emplace_back((uint32_t)e.id, e.sv);
-        h.pop();
-      }
-      Heap().swap(h);   // release this row's heap buffer early
+      std::vector<Edge32> &row = heaps[i].v;
+      row.erase(std::remove_if(row.begin(), row.end(),
+                               [](const Edge32 &e) { return !(e.sv() > 0.0f); }),
+                row.end());
       std::sort(row.begin(), row.end(),
-                [](const Nbr &a, const Nbr &b) { return a.first < b.first; });
+                [](const Edge32 &a, const Edge32 &b) { return a.id() < b.id(); });
     }
 
-    // (2) Parallel emit: for each i, keep (i,j) with i<j iff i ∈ nbr[j] too.
+    // Parallel emit: keep (i,j) with i<j iff row j also contains i.
     std::vector<std::vector<GraphNodeId>>    tl_from(numThreads);
     std::vector<std::vector<GraphNodeId>>    tl_to(numThreads);
     std::vector<std::vector<StoredDistance>> tl_sv(numThreads);
@@ -1398,16 +1421,16 @@ static void gen_fused_graph(Graph &g) {
       auto &lf = tl_from[tid]; auto &lt = tl_to[tid]; auto &ls = tl_sv[tid];
 #pragma omp for schedule(dynamic, 64)
       for (size_t i = 0; i < nobs; ++i) {
-        const std::vector<Nbr> &row = nbr[i];
-        for (const Nbr &nj : row) {
-          const uint32_t j = nj.first;
+        const std::vector<Edge32> &row = heaps[i].v;
+        for (const Edge32 &nj : row) {
+          const uint32_t j = nj.id();
           if ((size_t)j <= i) continue;          // emit each undirected pair once
-          const std::vector<Nbr> &rj = nbr[j];   // is i a neighbor of j?
+          const std::vector<Edge32> &rj = heaps[j].v; // is i a neighbor of j?
           auto it = std::lower_bound(
               rj.begin(), rj.end(), (uint32_t)i,
-              [](const Nbr &p, uint32_t v) { return p.first < v; });
-          if (it != rj.end() && it->first == (uint32_t)i) {
-            lf.push_back(i); lt.push_back((size_t)j); ls.push_back(nj.second);
+              [](const Edge32 &p, uint32_t v) { return p.id() < v; });
+          if (it != rj.end() && it->id() == (uint32_t)i) {
+            lf.push_back(i); lt.push_back((size_t)j); ls.push_back(nj.sv());
           }
         }
       }

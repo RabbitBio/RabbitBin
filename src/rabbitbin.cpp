@@ -4467,11 +4467,13 @@ static int rb_cmd_bin(int ac, char *av[]) {
                                       : DepthMergeClock::time_point{};
       DepthAsyncResult depth_result =
           depth_future.get();  // blocks only if not yet done
-      DepthMap &depth_map = depth_result.by_name;
+      const DepthMap &depth_map = depth_result.by_name;
 #ifdef RABBITBIN_FUSE
       DepthMatrixOut *depth_cols = depth_result.matrix.get();
       using DepthRowMap = phmap::flat_hash_map<std::string_view, size_t>;
       DepthRowMap depth_rows;
+      std::vector<size_t> ordered_large_rows, ordered_small_rows;
+      bool depth_rows_ordered = false;
       if (depth_cols) {
         const bool shape_ok =
             depth_cols->num_samples == (size_t)num_depth_samples &&
@@ -4488,12 +4490,60 @@ static int rb_cmd_bin(int ac, char *av[]) {
                   "dimensions.\n";
           return 1;
         }
-        depth_rows.reserve(depth_cols->names.size());
-        for (size_t i = 0; i < depth_cols->names.size(); ++i) {
-          // Rows shorter than the configured smallest retained contig cannot
-          // be consumed by either target matrix.
-          if ((size_t)depth_cols->lens[i] < min_small_contig) continue;
-          depth_rows.emplace(std::string_view(depth_cols->names[i]), i);
+        // FASTA and BAM references often have the same order. Verify every
+        // name against the two retained FASTA subsequences before using that
+        // order; neither header order nor matching lengths are assumed. This
+        // replaces a string hash table and its random probes with compact row
+        // indices. Any mismatch (including an extra/duplicate BAM name) keeps
+        // the original name-based join below.
+        // The parser deduplicates large and small contigs separately. Also
+        // rule out a name shared across the two classes: the original hash
+        // join gives both rows the first BAM occurrence of that name.
+        bool unique_names = !had_dup_names &&
+            contigs.size() == contig_names.size() &&
+            small_contigs.size() == small_contig_names.size();
+        if (unique_names && !contig_names.empty() && !small_contig_names.empty()) {
+          const bool large_is_smaller = contig_names.size() < small_contig_names.size();
+          const auto &names = large_is_smaller ? contig_names : small_contig_names;
+          const auto &other = large_is_smaller ? small_contigs : contigs;
+          for (const auto &name : names) {
+            if (other.find(name) != other.end()) {
+              unique_names = false;
+              break;
+            }
+          }
+        }
+        if (unique_names) {
+          ordered_large_rows.resize(contig_names.size());
+          ordered_small_rows.resize(small_contig_names.size());
+          size_t large_pos = 0, small_pos = 0;
+          bool matched = true;
+          for (size_t i = 0; i < depth_cols->names.size(); ++i) {
+            if ((size_t)depth_cols->lens[i] < min_small_contig) continue;
+            const std::string &name = depth_cols->names[i];
+            if (large_pos < contig_names.size() &&
+                name == contig_names[large_pos]) {
+              ordered_large_rows[large_pos++] = i;
+            } else if (small_pos < small_contig_names.size() &&
+                       name == small_contig_names[small_pos]) {
+              ordered_small_rows[small_pos++] = i;
+            } else {
+              matched = false;
+              break;
+            }
+          }
+          depth_rows_ordered = matched && large_pos == contig_names.size() &&
+                               small_pos == small_contig_names.size();
+        }
+        if (!depth_rows_ordered) {
+          std::vector<size_t>().swap(ordered_large_rows);
+          std::vector<size_t>().swap(ordered_small_rows);
+          depth_rows.reserve(depth_cols->names.size());
+          for (size_t i = 0; i < depth_cols->names.size(); ++i) {
+            // Apply the same length filter to both join paths.
+            if ((size_t)depth_cols->lens[i] < min_small_contig) continue;
+            depth_rows.emplace(std::string_view(depth_cols->names[i]), i);
+          }
         }
       }
 #endif
@@ -4533,11 +4583,16 @@ static int rb_cmd_bin(int ac, char *av[]) {
       small_depth_matrix.resize(nobs1, num_depth_samples, false);
       depthMergeMark("depth_matrix_alloc", nobs + nobs1);
 
-      auto find_depth_means = [&](const std::string &name) -> const float * {
+      auto find_depth_means = [&](const std::string &name, size_t ordinal,
+                                   bool small) -> const float * {
 #ifdef RABBITBIN_FUSE
         if (depth_cols) {
-          auto it = depth_rows.find(std::string_view(name));
-          return it == depth_rows.end() ? nullptr : depth_cols->row(it->second);
+          if (depth_rows_ordered)
+            return depth_cols->row(small ? ordered_small_rows[ordinal]
+                                        : ordered_large_rows[ordinal]);
+          const DepthRowMap &rows = depth_rows;
+          auto it = rows.find(std::string_view(name));
+          return it == rows.end() ? nullptr : depth_cols->row(it->second);
         }
 #endif
         auto it = depth_map.find(name);
@@ -4548,6 +4603,12 @@ static int rb_cmd_bin(int ac, char *av[]) {
       // Fast path: when the FASTA had no duplicate headers, contigs[name] == ci
       // by construction (kept order == insertion order, nskip stayed 0), so the
       // per-contig contigs.find() is redundant and is skipped entirely.
+      // These rows have independent destinations. Copy complete row-major
+      // float rows in parallel, without touching their values. The duplicate
+      // path must stay serial because its row index depends on prior skips.
+      const size_t mean_bytes = (size_t)num_depth_samples * sizeof(StoredDistance);
+#pragma omp parallel for if(!had_dup_names) num_threads(numThreads) schedule(static) \
+    reduction(+ : r, num, totalSize, ignored_too_small)
       for (size_t ci = 0; ci < contig_names.size(); ++ci) {
         const std::string& name = contig_names[ci];
         size_t idx, row;
@@ -4561,11 +4622,11 @@ static int rb_cmd_bin(int ac, char *av[]) {
           idx = ci; row = ci;
         }
 
-        const float *means = find_depth_means(name);
+        const float *means = find_depth_means(name, ci, false);
         if (!means) { ignored_too_small++; continue; }
 
-        for (int i = 0; i < num_depth_samples; ++i)
-          depth_matrix(row, i) = means[i];
+        if (mean_bytes)
+          std::memcpy(&depth_matrix(row, 0), means, mean_bytes);
         // NOTE: depth_var_matrix is intentionally NOT filled — its only reader,
         // cal_depth_dist(), has no live call sites, so the per-element variance
         // store here was dead work.  Re-add this if cal_depth_dist is revived.
@@ -4574,6 +4635,8 @@ static int rb_cmd_bin(int ac, char *av[]) {
       depthMergeMark("depth_large_copy", r);
 
       // Iterate small contigs (same fast path as the large-contig loop above)
+#pragma omp parallel for if(!had_dup_names) num_threads(numThreads) schedule(static) \
+    reduction(+ : r1, num1, totalSize1, ignored_too_small)
       for (size_t ci = 0; ci < small_contig_names.size(); ++ci) {
         const std::string& name = small_contig_names[ci];
         size_t idx, row;
@@ -4587,12 +4650,11 @@ static int rb_cmd_bin(int ac, char *av[]) {
           idx = ci; row = ci;
         }
 
-        const float *means = find_depth_means(name);
+        const float *means = find_depth_means(name, ci, true);
         if (!means) { ignored_too_small++; continue; }
 
-        for (int i = 0; i < num_depth_samples; ++i) {
-          small_depth_matrix(row, i) = means[i];
-        }
+        if (mean_bytes)
+          std::memcpy(&small_depth_matrix(row, 0), means, mean_bytes);
         r1++;  num1++;  totalSize1 += small_seq_lens[idx];
       }
       depthMergeMark("depth_small_copy", r1);

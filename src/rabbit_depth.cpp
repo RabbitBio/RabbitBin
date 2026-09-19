@@ -686,9 +686,10 @@ static void process_depth_shard(const DepthShard &sh,
       continue;
     if ((b->core.flag & BAM_FUNMAP) == BAM_FUNMAP || b->core.qual < minMapQual)
       continue;
-    if (!CheckRead::checkEnd(b, header.get())) {
+    uint32_t alignEnd;
+    if (!CheckRead::checkEnd(b, header.get(), &alignEnd)) {
       b = CheckRead::fixEndClip(b, header.get());
-      if (!CheckRead::checkEnd(b, header.get()))
+      if (!CheckRead::checkEnd(b, header.get(), &alignEnd))
         continue;
     }
     // Advance the SNV pileup buffer when we cross into a new contig.
@@ -702,7 +703,7 @@ static void process_depth_shard(const DepthShard &sh,
     // One pass: caldepth's return (edge-trimmed overlap) is identical with or
     // without a per-base buffer, so this matches the serial depth exactly.
     CountType ov =
-        caldepth(b, none, header->target_len[tid], NULL, edge, &rs);
+        caldepth(b, none, header->target_len[tid], NULL, edge, &rs, &alignEnd);
     if (rs.isValid() && rs.getPctId() >= percentIdentity) {
       if (profile) ++profile->accepted;
       // Compact mode (tid2compact != null): write to the dense index of kept
@@ -945,7 +946,8 @@ static bool process_depth_byterange(
     bool includeEdgeBases, int avgRead, int minMapQual,
     std::vector<std::pair<int32_t, CountType>> &out,
     std::vector<std::pair<int32_t, CountType>> *outU = nullptr, int dualQ = 0,
-    const int32_t *tid2compact = nullptr) {
+    const int32_t *tid2compact = nullptr,
+    CountType *interiorDepth = nullptr, CountType *interiorDepthU = nullptr) {
   htsFile *fp = hts_open(bamPath.c_str(), "rb");
   if (!fp)
     return false;
@@ -995,6 +997,25 @@ static bool process_depth_byterange(
   int32_t curTid = -1;
   CountType curSum = 0;
   CountType curSumU = 0;   // unique-read (MAPQ>=dualQ) accumulator (dual mode)
+  bool firstFlushed = false;
+  auto flushContig = [&](bool last) {
+    if (curTid < 0) return;
+    // In a coordinate-sorted BAM, a contig strictly between the first and
+    // last accepted contig of a byte range cannot occur in another range.
+    // Write that exclusively owned sum directly. Only the two boundary
+    // contigs need deferred merging after all workers have finished.
+    if (interiorDepth && firstFlushed && !last) {
+      const int32_t ci = tid2compact ? tid2compact[curTid] : curTid;
+      if (ci >= 0) {
+        interiorDepth[ci] = curSum;
+        if (interiorDepthU) interiorDepthU[ci] = curSumU;
+      }
+    } else {
+      out.emplace_back(curTid, curSum);
+      if (outU) outU->emplace_back(curTid, curSumU);
+    }
+    firstFlushed = true;
+  };
   while (true) {
     uint64_t voffBefore = (uint64_t)bgzf_tell(bgzf);
     if ((voffBefore >> 16) >= endCoff)
@@ -1023,19 +1044,18 @@ static bool process_depth_byterange(
       continue;
     if ((b->core.flag & BAM_FUNMAP) == BAM_FUNMAP || b->core.qual < minMapQual)
       continue;
-    if (!CheckRead::checkEnd(b, header.get())) {
+    uint32_t alignEnd;
+    if (!CheckRead::checkEnd(b, header.get(), &alignEnd)) {
       b = CheckRead::fixEndClip(b, header.get());
-      if (!CheckRead::checkEnd(b, header.get()))
+      if (!CheckRead::checkEnd(b, header.get(), &alignEnd))
         continue;
     }
     ReadStatistics rs;
-    CountType ov = caldepth(b, none, header->target_len[tid], NULL, edge, &rs);
+    CountType ov = caldepth(b, none, header->target_len[tid], NULL, edge, &rs,
+                            &alignEnd);
     if (rs.isValid() && rs.getPctId() >= percentIdentity) {
       if (tid != curTid) {
-        if (curTid >= 0) {
-          out.emplace_back(curTid, curSum);
-          if (outU) outU->emplace_back(curTid, curSumU);
-        }
+        flushContig(false);
         curTid = tid;
         curSum = 0;
         curSumU = 0;
@@ -1046,10 +1066,7 @@ static bool process_depth_byterange(
       if (outU && b->core.qual >= dualQ) curSumU += ov;
     }
   }
-  if (curTid >= 0) {
-    out.emplace_back(curTid, curSum);
-    if (outU) outU->emplace_back(curTid, curSumU);
-  }
+  flushContig(true);
   bam_destroy1(b);
   hts_close(fp);
   return true;
@@ -1257,6 +1274,8 @@ std::string compute_depth_tsv_inmem(const StringVector &bamFilePaths,
 
   CountTypeMatrix bamContigDepthsU(dualOn ? num_bams : 0);
   int minAvgRead = INT_MAX;
+#pragma omp parallel for schedule(static) \
+    num_threads(std::min(g_full_threads, num_bams)) reduction(min : minAvgRead)
   for (int bi = 0; bi < num_bams; bi++) {
     bamContigDepths[bi].reset(new CountType[depthN]());
     if (dualOn) bamContigDepthsU[bi].reset(new CountType[depthN]());
@@ -1351,10 +1370,10 @@ std::string compute_depth_tsv_inmem(const StringVector &bamFilePaths,
   }
   depthProfileMark("bam_whole_file_scan");
 
-  // Route B2: process byte-range shards in parallel into ordered per-shard
-  // partial sums, then merge serially. A shard that fails to re-sync marks its
-  // BAM for a whole-file fallback scan (no double counting: failed BAMs are not
-  // merged from b2 partials).
+  // Route B2: write exclusively owned interior contigs directly into each
+  // BAM's dense depth column; keep only shard-boundary sums for the merge.
+  // No atomics are needed: interior contigs have one owner, and boundary
+  // contributions are merged only after the parallel scan barrier.
   if (!b2shards.empty()) {
     std::vector<std::vector<std::pair<int32_t, CountType>>> b2local(
         b2shards.size());
@@ -1371,18 +1390,16 @@ std::string compute_depth_tsv_inmem(const StringVector &bamFilePaths,
           bamFilePaths[sh.bamIdx], header, sh.startVoff, sh.endCoff,
           sh.needResync, percentIdentity, maxEdgeBases, includeEdgeBases,
           averageReadSize[sh.bamIdx], minMapQual, b2local[s],
-          dualOn ? &b2localU[s] : nullptr, dualMapQual, t2c);
+          dualOn ? &b2localU[s] : nullptr, dualMapQual, t2c,
+          bamContigDepths[sh.bamIdx].get(),
+          dualOn ? bamContigDepthsU[sh.bamIdx].get() : nullptr);
       shardOk[s] = ok ? 1 : 0;
     }
     std::vector<char> bamFailed(num_bams, 0);
     for (size_t s = 0; s < b2shards.size(); ++s)
       if (!shardOk[s]) bamFailed[b2shards[s].bamIdx] = 1;
-    // Merge successful BAMs' partial sums (compact-aware: skip filtered contigs).
-    // Parallel over BAMs: each BAM owns its own depth array, so there is no
-    // sharing between iterations, and CountType is an unsigned integer, so the
-    // regrouped additions are exactly the same values as the serial merge.
-    // With millions of contigs this loop touches ~100M+ entries and was the
-    // single-threaded tail of the whole depth stage.
+    // Merge successful BAMs' boundary sums (at most two entries per shard).
+    // CountType is an unsigned integer, so regrouped additions are identical.
 #pragma omp parallel for schedule(dynamic, 1) \
     num_threads(std::min(g_full_threads, num_bams))
     for (int bi = 0; bi < num_bams; bi++) {
@@ -1427,6 +1444,12 @@ std::string compute_depth_tsv_inmem(const StringVector &bamFilePaths,
 #pragma omp parallel for schedule(dynamic, 1)
       for (int fi = 0; fi < (int)failedBams.size(); fi++) {
         int bi = failedBams[fi];
+        // Other shards of this BAM may already have written interior sums.
+        // Discard them before the complete fallback scan to avoid counting
+        // any read twice. Failed shards' deferred boundaries were not merged.
+        std::fill_n(bamContigDepths[bi].get(), depthN, CountType(0));
+        if (dualOn)
+          std::fill_n(bamContigDepthsU[bi].get(), depthN, CountType(0));
         process_depth_shard(
             DepthShard{bi, 0, header->n_targets, bamHdrVoff[bi], true, budget},
             bamFilePaths[bi], header, bamContigDepths[bi].get(), percentIdentity,
