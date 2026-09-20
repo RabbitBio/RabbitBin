@@ -112,7 +112,6 @@ static std::string g_audit_graph_out;
 // (k = min(marker multiplicity, splitMaxK)). Empty file => disabled.
 static std::string marker_seed_file;
 static int         splitMaxK        = 6;  // cap on sub-clusters per split bin
-static int         splitMinContigs  = 6;  // min contigs in a bin to consider
 static int         splitKmeansRestarts = 10;
 // ── Marker-FREE Phase-2 split (--split-bins) ──────────────────────────────
 // Splits internally multi-modal bins using only the multi-sample abundance

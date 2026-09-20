@@ -82,7 +82,7 @@ static void marker_guided_split(BinMap &cls) {
       if (it == contig_markers.end()) continue;
       for (int m : it->second) { int v = ++mc[m]; if (v > mult) mult = v; }
     }
-    if (mult <= 1 || (int)contigs.size() < splitMinContigs) {
+    if (mult <= 1) {
       out[next++] = contigs; ++n_kept; continue;
     }
     int k = std::min((int)contigs.size(), std::min(mult, splitMaxK));
@@ -170,7 +170,6 @@ static void abundance_guided_split_current(BinMap &cls) {
                        std::vector<ContigVector> &sub,
                        SplitAudit *audit) -> bool {
     const size_t n = items.size();
-    if ((int)n < splitMinContigs) return false;
     if (audit) audit->attempted = true;
 
     const size_t sd = (size_t)num_depth_samples;
