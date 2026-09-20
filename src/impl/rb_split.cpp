@@ -684,52 +684,11 @@ static void recruit_unbinned_to_cores(BinMap &cls, size_t floor) {
   if (negatives.empty()) negatives.swap(fallback_negatives);
   if (positives.empty() || negatives.empty()) return;
 
-  struct RocPoint { double value; bool positive; };
-  std::vector<RocPoint> points;
-  points.reserve(positives.size() + negatives.size());
-  for (double value : positives) points.push_back({value, true});
-  for (double value : negatives) points.push_back({value, false});
-  std::sort(points.begin(), points.end(), [](const RocPoint &a, const RocPoint &b) {
-    return a.value > b.value;
-  });
-  size_t true_positive = 0, false_positive = 0;
-  double boundary = std::numeric_limits<double>::infinity();
-  double boundary_tpr = 0.0, boundary_fpr = 0.0;
-  // Include the ROC origin (reject everything, J=0). If the internally
-  // calibrated score has no positive discrimination, recruitment stays off.
-  double best_youden = 0.0;
-  for (size_t i = 0; i < points.size();) {
-    size_t next = i;
-    while (next < points.size() && points[next].value == points[i].value) {
-      if (points[next].positive) ++true_positive; else ++false_positive;
-      ++next;
-    }
-    const double tpr = (double)true_positive / positives.size();
-    const double fpr = (double)false_positive / negatives.size();
-    if (tpr - fpr > best_youden) {
-      best_youden = tpr - fpr;
-      boundary = points[i].value;
-      boundary_tpr = tpr;
-      boundary_fpr = fpr;
-    }
-    i = next;
-  }
-  // Youden can pick a very low score on large, noisy co-assemblies.  Keep the
-  // self-calibrated point when it is already conservative, but never recruit
-  // below a fixed confidence floor.  An infinite boundary (no discrimination)
-  // is left unchanged so recruitment stays off.
-  constexpr double recruit_conf_floor = 0.5;
-  if (std::isfinite(boundary) && boundary < recruit_conf_floor) {
-    boundary = recruit_conf_floor;
-    true_positive = 0;
-    false_positive = 0;
-    for (const auto &point : points) {
-      if (point.value < boundary) continue;
-      if (point.positive) ++true_positive; else ++false_positive;
-    }
-    boundary_tpr = (double)true_positive / positives.size();
-    boundary_fpr = (double)false_positive / negatives.size();
-  }
+  const RbRecruitThreshold selected = rb_select_recruit_threshold(
+      positives, negatives, g_recruit_max_fpr);
+  const double boundary = selected.value;
+  const double boundary_tpr = selected.tpr;
+  const double boundary_fpr = selected.fpr;
 
   struct Choice {
     int core = -1;
@@ -805,12 +764,14 @@ static void recruit_unbinned_to_cores(BinMap &cls, size_t floor) {
     if (c < nobs) ++recruited_large; else ++recruited_small;
   }
   verbose_message(
-      "Post-split coverage recruit (%s, leave-one-out ROC/Youden "
-      "confidence>=%.4g [TPR=%.3g,FPR=%.3g], floor=0.5): %zu/%zu unbinned "
+      "Post-split coverage recruit (%s, leave-one-out FPR-constrained "
+      "ROC/Youden alpha=%.4g, confidence>=%.4g [TPR=%.3g,FPR=%.3g]): "
+      "%zu/%zu unbinned "
       "contigs recruited (%zu large, %zu short; %zu rejected; "
       "calibration=%zu positive/%zu negative)\n",
       use_rank_profiles ? "rank-cosine" : "mean coverage ratio",
-      boundary, boundary_tpr, boundary_fpr, recruited, candidates,
+      g_recruit_max_fpr, boundary, boundary_tpr, boundary_fpr,
+      recruited, candidates,
       recruited_large, recruited_small, rejected,
       positives.size(), negatives.size());
 }

@@ -307,8 +307,9 @@ splitting → one selective coverage recruitment → output-size filtering.
    the paired source-core and strongest-wrong-core counterfactual scores from
    the same leave-one-out members to supply that class instead of applying a
    fixed cutoff. The resulting values form an internal ROC curve, and RabbitBin
-   selects the boundary that maximizes Youden's
-   `J = TPR - FPR`. An unassigned contig is recruited into its best-scoring core
+   selects the boundary that maximizes Youden's `J = TPR - FPR` among operating
+   points with `FPR <= 0.05`. Tied optima use the largest (most conservative)
+   threshold. An unassigned contig is recruited into its best-scoring core
    only when its confidence reaches that boundary. The same learned boundary
    and scoring rule are used for long and short contigs. This pass
    never moves an already binned contig and does not merge bins. Disable it with
@@ -366,6 +367,7 @@ older caches must be rebuilt to preserve the low-sample graph semantics.
 | `--audit-graph-gold` | — | Audit production candidate and abundance-retained edges against CAMI gold without changing binning |
 | `--audit-graph-out` | `<output>.graph_audit.tsv` | Output TSV for `--audit-graph-gold` |
 | `--no-recruit` | off | Disable the post-split long/short-contig coverage recruitment |
+| `--recruit-max-fpr` | 0.05 | Maximum leave-one-out ROC false-positive rate used to select the recruitment threshold; use 1 for unconstrained Youden |
 | `--no-singleton-rescue` | off | Disable promotion of output-sized unassigned long contigs |
 | `--no-split` | off | Disable abundance-guided bin splitting |
 | `--split-silhouette` | 0.70 | Minimum mean silhouette to accept a split |

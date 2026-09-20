@@ -114,7 +114,7 @@ if(NOT TWO_SAMPLE_RC EQUAL 0)
 endif()
 set(TWO_SAMPLE_LOG "${TWO_SAMPLE_STDOUT}${TWO_SAMPLE_STDERR}")
 if(NOT TWO_SAMPLE_LOG MATCHES
-   "Post-split coverage recruit .*mean coverage ratio, leave-one-out ROC/Youden")
+   "Post-split coverage recruit .*mean coverage ratio, leave-one-out FPR-constrained ROC/Youden")
   message(FATAL_ERROR
     "Two-sample fixture did not use mean-ratio recruitment\n${TWO_SAMPLE_LOG}")
 endif()

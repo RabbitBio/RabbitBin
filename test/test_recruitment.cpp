@@ -56,5 +56,29 @@ int main() {
               std::nan(""), 0.7, 0.6, evidence),
           "invalid source-core score was accepted");
 
+  const std::vector<double> positives{0.9, 0.8, 0.7, 0.4};
+  const std::vector<double> negatives{0.85, 0.6, 0.3, 0.2};
+  RbRecruitThreshold threshold =
+      rb_select_recruit_threshold(positives, negatives, 0.25);
+  require(std::abs(threshold.value - 0.7) < 1e-12 &&
+              std::abs(threshold.tpr - 0.75) < 1e-12 &&
+              std::abs(threshold.fpr - 0.25) < 1e-12,
+          "FPR-constrained Youden selected the wrong ROC point");
+
+  threshold = rb_select_recruit_threshold(positives, negatives, 0.0);
+  require(std::abs(threshold.value - 0.9) < 1e-12 &&
+              threshold.fpr == 0.0,
+          "zero-FPR constraint was not enforced");
+
+  // J=0.5 at thresholds 0.9 and 0.7; the larger threshold must win.
+  threshold = rb_select_recruit_threshold({0.9, 0.7}, {0.8, 0.6}, 1.0);
+  require(std::abs(threshold.value - 0.9) < 1e-12,
+          "equal-Youden tie did not choose the largest threshold");
+
+  threshold = rb_select_recruit_threshold({0.4}, {0.9}, 0.05);
+  require(std::isinf(threshold.value) && threshold.tpr == 0.0 &&
+              threshold.fpr == 0.0,
+          "non-discriminating ROC did not retain the reject-all origin");
+
   std::cout << "Recruitment calibration regression checks passed\n";
 }

@@ -125,6 +125,7 @@ static bool        g_no_singleton_rescue  = false; // single-factor ablation con
 // Final selective recruitment into frozen output-sized cores.  The decision
 // boundary is learned within each run from leave-one-out core predictions.
 static bool        g_bin_recruit          = true;
+static double      g_recruit_max_fpr      = 0.05;
 static double      g_split_sil      = 0.70;  // silhouette threshold (RABBIT_SPLIT_SIL)
 static size_t      g_sil_sample_cap = 600;   // sample cap for O(n^2) silhouette
 static std::vector<float> g_large_means;  // nobs  × num_depth_samples (means, pre-rank)
@@ -3436,6 +3437,7 @@ static int rb_cmd_bin(int ac, char *av[]) {
       ("audit-graph-gold", po::value<std::string>(&g_audit_graph_gold), "Diagnostic only: audit production candidate/retained edges against CAMI gold without affecting binning")
       ("audit-graph-out", po::value<std::string>(&g_audit_graph_out), "[--audit-graph-gold] Output TSV (default: <output>.graph_audit.tsv)")
       ("no-recruit", po::value<bool>(&no_recruit)->zero_tokens(), "Disable post-split coverage recruitment")
+      ("recruit-max-fpr", po::value<double>(&g_recruit_max_fpr)->default_value(0.05), "Maximum leave-one-out ROC false-positive rate for recruitment threshold selection")
       ("no-singleton-rescue", po::value<bool>(&g_no_singleton_rescue)->zero_tokens(), "Ablation: do not promote unassigned long contigs to singleton bins")
       ("no_gold", po::value<bool>(&no_gold)->zero_tokens(), "Label-free multi-resolution: sweep edge power on the reused graph, auto-select max-modularity partition (no ground truth needed)")
       ("depth-no-variance", po::value<bool>(&cvExt)->zero_tokens(), "Depth file has no variance columns")
@@ -3646,6 +3648,10 @@ static int rb_cmd_bin(int ac, char *av[]) {
   }
   if (splitKmeansRestarts < 1) {
     cerr << "[Error!] --split-kmeans-restarts must be >= 1\n"; return 1;
+  }
+  if (!std::isfinite(g_recruit_max_fpr) || g_recruit_max_fpr < 0.0 ||
+      g_recruit_max_fpr > 1.0) {
+    cerr << "[Error!] --recruit-max-fpr must be in [0, 1]\n"; return 1;
   }
   if (g_no_split_abundance) g_split_abundance = false;  // explicit opt-out
   minCVSum = std::max(minCV, minCVSum);
