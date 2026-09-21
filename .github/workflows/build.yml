@@ -1,0 +1,83 @@
+name: build-and-test
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  compilers:
+    name: ${{ matrix.compiler }} / Ubuntu 24.04
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - compiler: gcc
+            cc: gcc
+            cxx: g++
+          - compiler: clang
+            cc: clang
+            cxx: clang++
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build libboost-all-dev zlib1g-dev \
+            libhts-dev libdeflate-dev libomp-dev
+      - name: Configure
+        env:
+          CC: ${{ matrix.cc }}
+          CXX: ${{ matrix.cxx }}
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$PWD/install"
+      - name: Build
+        run: cmake --build build --parallel 2
+      - name: Test
+        run: ctest --test-dir build --output-on-failure -j2
+      - name: Install and smoke test
+        run: |
+          cmake --install build
+          ./install/bin/rabbitbin --version
+          ./install/bin/rabbitbin --help >/dev/null
+          ./install/bin/rabbitbin bin --assembly test/contigs.fa \
+            --output smoke/out --threads 2 --min-bin-size 0
+
+  bundled-dependencies:
+    name: Pinned dependency fallback
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install only required build tools and Boost
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake ninja-build git autoconf \
+            automake libtool pkg-config libboost-all-dev
+      - name: Configure with all bundled fallbacks
+        run: >-
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          -DRABBITBIN_USE_SYSTEM_ZLIB=OFF
+          -DRABBITBIN_USE_SYSTEM_HTSLIB=OFF
+          -DRABBITBIN_USE_SYSTEM_LIBDEFLATE=OFF
+      - name: Build and smoke test
+        run: |
+          cmake --build build --parallel 2
+          ./build/src/rabbitbin --version
+          ./build/src/rabbitbin bin --assembly test/contigs.fa \
+            --output smoke/out --threads 2 --min-bin-size 0
+
+  container:
+    name: Docker image
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: >-
+          docker build
+          --build-arg RABBITBIN_SOURCE_REVISION="${GITHUB_SHA::12}"
+          -t rabbitbin:ci .
+      - name: Smoke test image
+        run: docker run --rm rabbitbin:ci rabbitbin --version

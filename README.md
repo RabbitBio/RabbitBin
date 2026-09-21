@@ -28,24 +28,72 @@ configured with `-DRABBITBIN_ENABLE_MAP=ON`.
 
 ## Requirements
 
-- C++17 compiler with **OpenMP** (GCC ≥ 7 recommended)
-- **CMake** ≥ 3.5
-- **Boost** ≥ 1.66 (`program_options filesystem system graph serialization iostreams`)
-- **zlib** ≥ 1.2.11 and **HTSlib** ≥ 1.13 — auto-downloaded if not found on the system
+- C++17 compiler with **OpenMP** (GCC ≥ 7 or a recent Clang)
+- **CMake** ≥ 3.16
+- **Boost** ≥ 1.66 (`program_options filesystem system graph serialization iostreams regex`)
+- `git`, `make`, and Autotools when dependencies must be downloaded
+- **zlib** ≥ 1.2.11, **HTSlib** ≥ 1.13, and **libdeflate** — pinned copies
+  are downloaded automatically when development packages are unavailable
 
 ## Build
 
+On Ubuntu/Debian, the complete system-dependency route is:
+
 ```bash
-mkdir build && cd build
-cmake ..
-make rabbitbin -j
+sudo apt-get update
+sudo apt-get install -y build-essential cmake git autoconf automake libtool \
+  pkg-config libboost-all-dev zlib1g-dev libhts-dev libdeflate-dev
+```
+
+On Rocky/RHEL, zlib, HTSlib and libdeflate may instead be left to the automatic
+dependency build:
+
+```bash
+sudo dnf install -y gcc gcc-c++ cmake git make autoconf automake libtool \
+  pkgconf-pkg-config boost-devel
+```
+
+Then clone and build. Conda and Docker are not required.
+
+```bash
+git clone https://github.com/RabbitBio/RabbitBin.git
+cd RabbitBin
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --parallel
+ctest --test-dir build --output-on-failure
 # binary: build/src/rabbitbin
 ```
 
-After pulling new changes, rebuild from a clean tree:
+An optional per-user installation is:
 
 ```bash
-rm -rf build && mkdir build && cd build && cmake .. && make -j
+cmake --install build --prefix "$HOME/.local"
+"$HOME/.local/bin/rabbitbin" --version
+```
+
+The default binary uses a portable CPU baseline. For a binary that will only
+run on the machine where it is compiled, enable local CPU tuning explicitly:
+
+```bash
+cmake -S . -B build-native -DRABBITBIN_NATIVE_ARCH=ON
+cmake --build build-native --parallel
+```
+
+Conda can be used as an optional dependency manager:
+
+```bash
+conda create -n rabbitbin -c conda-forge \
+  cmake make compilers boost-cpp zlib htslib libdeflate
+conda activate rabbitbin
+cmake -S . -B build-conda -DCMAKE_BUILD_TYPE=Release
+cmake --build build-conda --parallel
+```
+
+After pulling new changes, configure a fresh build directory:
+
+```bash
+cmake -S . -B build-new -DCMAKE_BUILD_TYPE=Release
+cmake --build build-new --parallel
 ```
 
 ## Input modes
@@ -86,11 +134,13 @@ reads available; expect materially lower bin quality on multi-sample datasets.
 ### 1. Bin from BAMs in one shot (depth computed internally)
 
 The pipeline takes coordinate-sorted BAMs directly; a `.bai` index is optional.
+The BAM-list file contains one sorted BAM or CRAM path per line; alternatively,
+repeat `--bam` with one or more paths.
 
 ```bash
 rabbitbin bin \
   --fasta contigs.fa \
-  --bam-list bams.txt \      # one sorted-BAM path per line (or repeat --bam s1.bam s2.bam)
+  --bam-list bams.txt \
   --percent-identity 97 \
   --threads 64 \
   --output results/out
@@ -122,9 +172,11 @@ rabbitbin depth --fasta contigs.fa --bam s1.bam s2.bam -o depth.tsv
 ### 5. Evaluate against a gold standard (AMBER-compatible)
 
 ```bash
+# CAMI bioboxes gold mapping; the gold file must provide _LENGTH.
+# Use --binning preds.binning instead of --members for a two-column prediction.
 rabbitbin amber \
-  --gold gsa_mapping.binning \           # CAMI bioboxes, needs _LENGTH
-  --members results/out.members.tsv \    # or --binning preds.binning (bioboxes / 2-col)
+  --gold gsa_mapping.binning \
+  --members results/out.members.tsv \
   --output metrics_per_bin.tsv \
   --threads 64
 ```
@@ -384,6 +436,11 @@ older caches must be rebuilt to preserve the low-sample graph semantics.
 Run `rabbitbin <command> --help` for the full option list, including the `qc`
 and `refine` subcommands.
 
+Marker-based options additionally require Prodigal, HMMER's `hmmsearch`, and a
+single-copy marker HMM collection. Set `RABBITBIN_MARKER_HMM` to that HMM file,
+then generate the reusable map with
+`rabbitbin_markers.sh contigs.fa contigs.markers.tsv 32`.
+
 ## Key options (`depth`)
 
 | Option | Default | Meaning |
@@ -467,7 +524,22 @@ Measured results, cache conditions and equivalence checks are documented in
 run_rabbitbin.sh assembly.fa sample1.bam sample2.bam
 ```
 
+## Optional Docker build
+
+Docker is not required. It is provided as an alternative reproducible build:
+
+```bash
+docker build \
+  --build-arg RABBITBIN_SOURCE_REVISION="$(git rev-parse --short=12 HEAD)" \
+  -t rabbitbin:local .
+docker run --rm rabbitbin:local rabbitbin --version
+```
+
+Mount input and output directories when running analyses, for example
+`-v "$PWD:/work" -w /work`.
+
 ## License
 
-RabbitBin is released under the LBNL BSD license. Portions of the graph-clustering
-pipeline derive from earlier open-source metagenome binning work; see `license.txt`.
+RabbitBin is distributed under the BSD 3-Clause license in `LICENSE`. Portions
+derive from earlier BSD-licensed metagenome-binning work; attribution and
+third-party notices are recorded in `license.txt`.

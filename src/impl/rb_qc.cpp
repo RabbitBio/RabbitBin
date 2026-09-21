@@ -7,7 +7,7 @@
 // Design (matches RabbitBin's "expensive once, cheap many" philosophy):
 //   * The EXPENSIVE part — ORF prediction (Prodigal) + HMM search (hmmsearch)
 //     against a single-copy marker set — is run ONCE per assembly by an external
-//     helper (scripts/rabbitbin_markers.sh), producing a contig->marker map.
+//     helper (rabbitbin_markers.sh), producing a contig->marker map.
 //   * `rabbitbin qc` then scores ANY binning of that assembly in milliseconds:
 //     it never touches sequences, only the (binning, marker-map) pair.
 //
@@ -469,7 +469,7 @@ static int rb_cmd_qc(int ac, char *av[]) {
          << "Usage: rabbitbin qc --members out.members.tsv --markers contigs.markers.tsv\n"
          << "       rabbitbin qc -i prediction.binning -k contigs.markers.tsv -o qc/\n\n"
          << "Generate the marker map once per assembly:\n"
-         << "       scripts/rabbitbin_markers.sh contigs.fa contigs.markers.tsv\n\n"
+         << "       rabbitbin_markers.sh contigs.fa contigs.markers.tsv\n\n"
          << desc << "\n";
     return vm.count("help") ? 0 : 1;
   }

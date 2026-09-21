@@ -85,3 +85,7 @@ add_test(NAME run_rabbitbin.sh
          COMMAND  ${CMAKE_BINARY_DIR}/src/run_rabbitbin.sh --min-bin-size 0 ${CMAKE_CURRENT_SOURCE_DIR}/contigs.fa ${CMAKE_CURRENT_SOURCE_DIR}/contigs-1000.fastq.bam
          WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/test-runRabbitBin
         )
+
+add_test(NAME rabbitbin_version COMMAND ${CMAKE_BINARY_DIR}/src/rabbitbin --version)
+set_tests_properties(rabbitbin_version PROPERTIES
+  PASS_REGULAR_EXPRESSION "RabbitBin [0-9]+\\.[0-9]+\\.[0-9]+ \\(commit [0-9a-f]+(-dirty)?\\)")

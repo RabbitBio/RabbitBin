@@ -3461,7 +3461,7 @@ static int rb_cmd_bin(int ac, char *av[]) {
       ("auto", po::value<bool>(&g_auto_select)->zero_tokens(), "Build the graph once, sweep configs, and auto-select the partition with the most near-complete bins (needs --markers)")
       ("autotune", po::value<bool>(&g_autotune)->zero_tokens(), "Self-tuning: search edge-power x split-silhouette by SCG quality and use the best (needs --markers)")
       ("ensemble", po::value<bool>(&g_ensemble)->zero_tokens(), "[experimental] Consensus over the swept configs: greedily keep the highest-quality non-overlapping bins (needs --markers). The swept configs share one graph and are highly correlated; intended for diverse/independent partitions.")
-      ("markers", po::value<std::string>(&g_markers_file), "Contig->marker map for --auto/--autotune/--qc/--purify (from scripts/rabbitbin_markers.sh)")
+      ("markers", po::value<std::string>(&g_markers_file), "Contig->marker map for --auto/--autotune/--qc/--purify (from rabbitbin_markers.sh)")
       ("qc", po::value<bool>(&g_qc_annotate)->zero_tokens(), "Annotate bins.tsv with SCG completeness/contamination + MIMAG tier (needs --markers)")
       ("keep-hq-only", po::value<bool>(&g_keep_hq_only)->zero_tokens(), "Only output high-quality bins (comp>90,cont<5) (implies --qc; needs --markers)")
       ("purify", po::value<bool>(&g_purify)->zero_tokens(), "Remove depth-outlier contigs carrying duplicated single-copy markers (needs --markers)")
@@ -5139,7 +5139,7 @@ static int rb_cmd_bin(int ac, char *av[]) {
         if (qc_auto) {
           if (g_markers_file.empty()) {
             cerr << "[Error!] --auto/--ensemble require --markers FILE "
-                    "(generate once via scripts/rabbitbin_markers.sh)\n";
+                    "(generate once via rabbitbin_markers.sh)\n";
             return 1;
           }
           qc_ready = rb_load_markers_for_contigs(g_markers_file);
@@ -5968,6 +5968,11 @@ static int rb_cmd_depth(int ac, char *av[]) {
 int main(int ac, char *av[]) {
   if (ac >= 2) {
     std::string sub = av[1];
+    if (sub == "--version" || sub == "-V") {
+      cout << "RabbitBin " << RabbitBin_VERSION
+           << " (commit " << RabbitBin_GIT_COMMIT << ")\n";
+      return 0;
+    }
     if (sub == "bin")   return rb_cmd_bin(ac - 1, av + 1);
     if (sub == "depth") return rb_cmd_depth(ac - 1, av + 1);
     if (sub == "amber") return rb_cmd_amber(ac - 1, av + 1);
@@ -5980,7 +5985,7 @@ int main(int ac, char *av[]) {
     if (sub == "map")     return rb_cmd_map(ac - 1, av + 1);
 #endif
     if (sub == "--help" || sub == "-h") {
-      cerr << "RabbitBin " << version << " (" << DATE << ")\n\n"
+      cout << "RabbitBin " << version << " (commit " << RabbitBin_GIT_COMMIT << ")\n\n"
            << "Sketch-based metagenome binning pipeline. One binary covers binning,\n"
            << "depth summarization, quality control, evaluation, and consensus.\n\n"
            << "Usage: rabbitbin <command> [options]\n"
@@ -6003,7 +6008,7 @@ int main(int ac, char *av[]) {
 #endif
            << "\n"
            << "Typical workflow:\n"
-           << "  scripts/rabbitbin_markers.sh contigs.fa contigs.markers.tsv   # once per assembly\n"
+           << "  rabbitbin_markers.sh contigs.fa contigs.markers.tsv   # once per assembly\n"
            << "  rabbitbin depth --bam-list bams.txt -o depth.tsv\n"
            << "  rabbitbin bin --fasta contigs.fa --depth depth.tsv --markers contigs.markers.tsv \\\n"
            << "                --qc --bioboxes --save-cache run.cache -o mags\n"

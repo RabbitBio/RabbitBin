@@ -10,7 +10,7 @@ PCTID=${PCTID:=97}
 MINDEPTH=${MINDEPTH:=1.0}
 RB_LABEL=${RB_LABEL:="bins"}
 
-if ! $RB --help 2>/dev/null; then
+if ! $RB --help >/dev/null 2>&1; then
   echo "Please ensure RabbitBin is in PATH: could not find $RB" 1>&2
   exit 1
 fi

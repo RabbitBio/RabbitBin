@@ -5,6 +5,7 @@
 #include "BamRead.h"
 #include "BamCompleteBlock.h"
 #include "BamCompress.h"
+#include <string>
 #include <thread>
 
 

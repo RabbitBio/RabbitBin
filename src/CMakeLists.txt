@@ -1,20 +1,14 @@
 # find and use Boost
 set(Boost_NO_BOOST_CMAKE ON) # for backwards comptibility of cmake and boost >= 1.70
-set(Boost_USE_STATIC_LIBS   OFF)
-find_package(Boost 1.66.0 COMPONENTS program_options filesystem system graph serialization iostreams REQUIRED)
+option(RABBITBIN_STATIC_BOOST "Link Boost libraries statically" OFF)
+set(Boost_USE_STATIC_LIBS ${RABBITBIN_STATIC_BOOST})
+find_package(Boost 1.66.0 COMPONENTS program_options filesystem system graph
+  serialization iostreams regex REQUIRED)
 include_directories( ${Boost_INCLUDE_DIRS} )
 
 # find and use OpenMP
-find_package(OpenMP)
-
-if (OPENMP_FOUND)
-    set (CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${OpenMP_C_FLAGS}")
-    set (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${OpenMP_CXX_FLAGS}")
-    set (CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} ${OpenMP_EXE_LINKER_FLAGS}")
-    message("Using OpenMP")
-else()
-    message(WARNING "OpenMP must be available to your compiler or it will be REALLLLLLLLLLY slow: ${CMAKE_C_COMPILER} ${CMAKE_CXX_COMPILER}")
-endif()
+find_package(OpenMP REQUIRED COMPONENTS C CXX)
+message(STATUS "Using OpenMP ${OpenMP_CXX_VERSION}")
 
 if(APPLE)
 	#full Single Unix Standard v3 (SUSv3) conformance (the Unix API)
@@ -38,8 +32,8 @@ message("Boost lib dir:" ${Boost_LIBRARY_DIRS})
 # Used by both rabbit_depth (standalone) and rabbitbin (in-process BAM→depth).
 # Disable with -DRABBITBIN_USE_VENDORED_BAM=OFF.
 option(RABBITBIN_USE_VENDORED_BAM "Use the vendored RabbitBAM parallel reader" ON)
-find_library(DEFLATE_LIB NAMES deflate)
-if(RABBITBIN_USE_VENDORED_BAM AND DEFLATE_LIB)
+set(DEFLATE_LIB ${LIBDEFLATE_LIBRARY})
+if(RABBITBIN_USE_VENDORED_BAM)
   file(GLOB RABBITBAM_SRC ${CMAKE_CURRENT_SOURCE_DIR}/rabbitbam/*.cpp)
 endif()
 
@@ -48,18 +42,15 @@ endif()
 # BAMs are given, rabbitbin computes coverage depth in-process (rabbit_depth.cpp
 # linked in with its main() dropped via RABBIT_DEPTH_NO_MAIN — the only symbol
 # the two .cpp files share) so BAM decompression overlaps the FASTA/sketch pass
-# and no depth file is written. Falls back to depth-file mode when libdeflate is
-# absent. The standalone rabbit_depth binary is built from the same source
-# without RABBIT_DEPTH_NO_MAIN, so its behavior is unchanged.
+# and no depth file is written. The standalone rabbit_depth binary is built
+# from the same source without
+# RABBIT_DEPTH_NO_MAIN, so its behavior is unchanged.
 set(RABBITBIN_SRC rabbitbin.cpp probmh.cpp)
-set(RABBITBIN_CAN_FUSE FALSE)
-if(DEFLATE_LIB)
-  list(APPEND RABBITBIN_SRC rabbit_depth.cpp)
-  if(RABBITBIN_USE_VENDORED_BAM)
-    list(APPEND RABBITBIN_SRC ${RABBITBAM_SRC})
-  endif()
-  set(RABBITBIN_CAN_FUSE TRUE)
+list(APPEND RABBITBIN_SRC rabbit_depth.cpp)
+if(RABBITBIN_USE_VENDORED_BAM)
+  list(APPEND RABBITBIN_SRC ${RABBITBAM_SRC})
 endif()
+set(RABBITBIN_CAN_FUSE TRUE)
 
 # ── Vendored strobealign alignment engine (MIT, Kristoffer Sahlin) ──────────
 # src/align/strobe/ holds the strobealign 0.17.0 alignment engine (randstrobe
@@ -90,8 +81,11 @@ if(RABBITBIN_ENABLE_STROBE AND HTSlib_FOUND)
   target_compile_features(strobe_engine PUBLIC cxx_std_17)
   find_package(Threads REQUIRED)
   target_link_libraries(strobe_engine PUBLIC Threads::Threads ${ZLIB_LIBRARIES} ${HTSlib_LIBRARIES})
+  if(NOT "${EXTRA_DEPENDENCIES}" STREQUAL "")
+    add_dependencies(strobe_engine ${EXTRA_DEPENDENCIES})
+  endif()
   check_cxx_compiler_flag("-march=native" STROBE_MARCH_NATIVE)
-  if(STROBE_MARCH_NATIVE)
+  if(RABBITBIN_NATIVE_ARCH AND STROBE_MARCH_NATIVE)
     target_compile_options(strobe_engine PRIVATE -march=native)
   endif()
   set(RABBITBIN_STROBE_OK TRUE)
@@ -120,6 +114,7 @@ add_executable(rabbitbin ${RABBITBIN_SRC})
 if(NOT "${EXTRA_DEPENDENCIES}" STREQUAL "")
   add_dependencies(rabbitbin ${EXTRA_DEPENDENCIES})
 endif()
+target_include_directories(rabbitbin PRIVATE ${LIBDEFLATE_INCLUDE_DIR})
 if(RABBITBIN_MAP_OK)
   target_compile_definitions(rabbitbin PRIVATE RABBITBIN_ENABLE_MAP)
   target_include_directories(rabbitbin PRIVATE
@@ -140,13 +135,9 @@ if(RABBITBIN_MAP_OK)
 else()
   message(STATUS "rabbitbin: align/sort/index subcommands disabled (need htslib)")
 endif()
-target_link_libraries(rabbitbin ${ZLIB_LIBRARIES} ${Boost_LIBRARIES} ${EXTRALIBS} RabbitBin_VERSION_LIB)
-if(DEFLATE_LIB)
-  # Link the exact library resolved by find_library().  Using the bare name
-  # `deflate` loses the non-system search directory (for example a pixi/conda
-  # prefix) and makes an otherwise valid clean build fail at the final link.
-  target_link_libraries(rabbitbin ${DEFLATE_LIB})
-endif()
+target_link_libraries(rabbitbin ${ZLIB_LIBRARIES} ${Boost_LIBRARIES} ${EXTRALIBS}
+  RabbitBin_VERSION_LIB OpenMP::OpenMP_CXX)
+target_link_libraries(rabbitbin ${LIBDEFLATE_LIBRARY})
 if(RABBITBIN_CAN_FUSE)
   # RABBITBIN_FUSE      → rabbitbin.cpp enables the BAM input path
   # RABBIT_DEPTH_NO_MAIN→ rabbit_depth.cpp drops main() (only shared symbol)
@@ -162,8 +153,6 @@ if(RABBITBIN_CAN_FUSE)
     target_include_directories(rabbitbin PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/rabbitbam)
   endif()
   message(STATUS "rabbitbin: in-process BAM→depth enabled (BAM input auto-detected)")
-else()
-  message(STATUS "rabbitbin: libdeflate not found; BAM input disabled (depth-file only)")
 endif()
 
 # ── ISA-L (igzip) fast gzip inflate for the streaming large-.gz reader ──────
@@ -208,18 +197,16 @@ else()
 endif()
 
 include(CheckCXXCompilerFlag)
-check_cxx_compiler_flag("-march=native" COMPILER_SUPPORTS_MARCH_NATIVE)
-if(COMPILER_SUPPORTS_MARCH_NATIVE)
-  target_compile_options(rabbitbin PRIVATE -march=native)
-  message("rabbitbin: -march=native enabled (AVX-512 VPOPCNTDQ if available)")
-else()
-  check_cxx_compiler_flag("-mavx2" COMPILER_SUPPORTS_AVX2)
-  if(COMPILER_SUPPORTS_AVX2)
-    target_compile_options(rabbitbin PRIVATE -mavx2)
-    message("rabbitbin: AVX2 SIMD enabled")
+if(RABBITBIN_NATIVE_ARCH)
+  check_cxx_compiler_flag("-march=native" COMPILER_SUPPORTS_MARCH_NATIVE)
+  if(COMPILER_SUPPORTS_MARCH_NATIVE)
+    target_compile_options(rabbitbin PRIVATE -march=native)
+    message(STATUS "rabbitbin: native CPU tuning enabled")
   else()
-    message("rabbitbin: AVX2 not supported, using scalar fallback")
+    message(WARNING "RABBITBIN_NATIVE_ARCH requested, but -march=native is unsupported")
   endif()
+else()
+  message(STATUS "rabbitbin: portable CPU build (set -DRABBITBIN_NATIVE_ARCH=ON for local tuning)")
 endif()
 # Link-time optimization: rabbitbin is split across rabbitbin.cpp + probmh.cpp,
 # so the hot ProbMinHash methods (addHashFromRng, tracker update, jaccard) live
@@ -234,7 +221,7 @@ if(COMPILER_SUPPORTS_LTO)
   # on the link line because LTO performs code generation at link time.
   target_compile_options(rabbitbin PRIVATE -flto)
   target_link_options(rabbitbin PRIVATE -flto)
-  if(COMPILER_SUPPORTS_MARCH_NATIVE)
+  if(RABBITBIN_NATIVE_ARCH AND COMPILER_SUPPORTS_MARCH_NATIVE)
     target_link_options(rabbitbin PRIVATE -march=native)
   endif()
   message("rabbitbin: LTO enabled")
@@ -265,23 +252,22 @@ foreach(target ${targets})
    # include dir explicitly so the build matches HTSlib_LIBRARIES (e.g. a newer
    # htslib supplied via -DHTSLIB_ROOT).
    target_include_directories(${target} PRIVATE ${HTSlib_INCLUDE_DIRS})
-   target_link_libraries(${target} ${HTSlib_LIBRARIES} ${ZLIB_LIBRARIES} ${Boost_LIBRARIES} RabbitBin_VERSION_LIB) 
+   target_link_libraries(${target} ${HTSlib_LIBRARIES} ${ZLIB_LIBRARIES}
+     ${Boost_LIBRARIES} RabbitBin_VERSION_LIB OpenMP::OpenMP_CXX)
 endforeach()
 
 # ── Vendored RabbitBAM parallel reader for the standalone rabbit_depth ──────
 # Same vendored reader configured above for rabbitbin; here it is added to the
 # standalone rabbit_depth binary. BamReader::getBam1_t() yields records in the
 # SAME order as sam_read1, so the emitted depth table is byte-identical.
-if(RABBITBIN_USE_VENDORED_BAM AND DEFLATE_LIB)
+if(RABBITBIN_USE_VENDORED_BAM)
   message(STATUS "rabbit_depth: vendored RabbitBAM parallel reader enabled")
   target_sources(rabbit_depth PRIVATE ${RABBITBAM_SRC})
   target_compile_definitions(rabbit_depth PRIVATE USE_RABBITBAM)
-  target_include_directories(rabbit_depth PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/rabbitbam)
-  target_link_libraries(rabbit_depth ${DEFLATE_LIB})
-else()
-  if(RABBITBIN_USE_VENDORED_BAM)
-    message(WARNING "libdeflate not found; building rabbit_depth without the vendored RabbitBAM reader")
-  endif()
+  target_include_directories(rabbit_depth PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/rabbitbam
+    ${LIBDEFLATE_INCLUDE_DIR})
+  target_link_libraries(rabbit_depth ${LIBDEFLATE_LIBRARY})
 endif()
 
 install(TARGETS ${targets}

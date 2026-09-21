@@ -1,0 +1,10 @@
+cff-version: 1.2.0
+message: "If you use RabbitBin, please cite the software release used in your analysis."
+title: RabbitBin
+type: software
+authors:
+  - name: RabbitBin contributors
+version: 1.0.0
+repository-code: "https://github.com/RabbitBio/RabbitBin"
+url: "https://github.com/RabbitBio/RabbitBin"
+license: BSD-3-Clause

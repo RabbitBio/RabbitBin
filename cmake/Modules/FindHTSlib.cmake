@@ -138,7 +138,17 @@ if(HTSlib_USE_STATIC_LIBS)
   endif()
 endif()
 
+# pkg-config is the authoritative version source for normal HTSlib development
+# installations.  Reject an older installation so the top-level build can use
+# its pinned fallback instead of failing later against an incompatible API.
+set(HTSlib_VERSION "${HTSLIB_PKGCONF_VERSION}")
 libfind_process(HTSlib)
+
+if(HTSlib_FOUND AND HTSlib_FIND_VERSION AND HTSlib_VERSION AND
+   HTSlib_VERSION VERSION_LESS HTSlib_FIND_VERSION)
+  message(STATUS "Found HTSlib ${HTSlib_VERSION}, but ${HTSlib_FIND_VERSION} or newer is required")
+  set(HTSlib_FOUND FALSE)
+endif()
 
 message(STATUS "   HTSlib include dirs: ${HTSlib_INCLUDE_DIRS}")
 message(STATUS "   HTSlib libraries: ${HTSlib_LIBRARIES}")
