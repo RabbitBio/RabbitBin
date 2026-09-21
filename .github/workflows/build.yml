@@ -80,4 +80,6 @@ jobs:
           --build-arg RABBITBIN_SOURCE_REVISION="${GITHUB_SHA::12}"
           -t rabbitbin:ci .
       - name: Smoke test image
-        run: docker run --rm rabbitbin:ci rabbitbin --version
+        run: |
+          docker run --rm rabbitbin:ci sh -c \
+            'ldd /usr/local/bin/rabbitbin && rabbitbin --version'

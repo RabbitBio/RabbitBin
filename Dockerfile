@@ -7,6 +7,7 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         libgomp1 \
         libhts3t64 \
+        libnuma1 \
         libboost-filesystem1.83.0 \
         libboost-graph1.83.0 \
         libboost-iostreams1.83.0 \
