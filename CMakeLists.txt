@@ -57,6 +57,9 @@ else()
   include(${PROJECT_SOURCE_DIR}/cmake/libdeflate.cmake)
   list(APPEND EXTRA_DEPENDENCIES libdeflate_external)
 endif()
+# Keep this compatibility name in the top-level directory scope so both src/
+# and test/ link libdeflate when HTSlib is a static bundled archive.
+set(DEFLATE_LIB ${LIBDEFLATE_LIBRARY})
 
 option(RABBITBIN_USE_SYSTEM_HTSLIB "Try to find and use system HTSLIB" ON)
 if(RABBITBIN_USE_SYSTEM_HTSLIB)

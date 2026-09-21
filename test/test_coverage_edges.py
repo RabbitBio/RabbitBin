@@ -199,7 +199,8 @@ def main():
         run_env = dict(env, RB_PAIR_DUMP=str(dump))
         run_env.update(overrides or {})
         completed = subprocess.run(cmd, env=run_env, stdout=subprocess.PIPE,
-                                   stderr=subprocess.STDOUT, text=True, timeout=60)
+                                   stderr=subprocess.STDOUT,
+                                   universal_newlines=True, timeout=60)
         (work / f"{label}.log").write_text(completed.stdout)
         if expect_ok != (completed.returncode == 0):
             raise AssertionError(f"{label}: exit {completed.returncode}\n{completed.stdout}")
@@ -303,7 +304,7 @@ def main():
 
     help_text = subprocess.run([str(binary), "bin", "--help"],
                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                               text=True, timeout=60).stdout
+                               universal_newlines=True, timeout=60).stdout
     if "--bam" in help_text:
         bams = [work / f"sample{s}.bam" for s in (0, 1)]
         for s, bam in enumerate(bams):

@@ -252,8 +252,13 @@ foreach(target ${targets})
    # include dir explicitly so the build matches HTSlib_LIBRARIES (e.g. a newer
    # htslib supplied via -DHTSLIB_ROOT).
    target_include_directories(${target} PRIVATE ${HTSlib_INCLUDE_DIRS})
+   # A static HTSlib configured with libdeflate does not carry that transitive
+   # dependency in the archive itself.  Keep libdeflate after HTSlib on the
+   # link line so the fully bundled build works as well as a shared system
+   # HTSlib build.
    target_link_libraries(${target} ${HTSlib_LIBRARIES} ${ZLIB_LIBRARIES}
-     ${Boost_LIBRARIES} RabbitBin_VERSION_LIB OpenMP::OpenMP_CXX)
+     ${LIBDEFLATE_LIBRARY} ${Boost_LIBRARIES} RabbitBin_VERSION_LIB
+     OpenMP::OpenMP_CXX)
 endforeach()
 
 # ── Vendored RabbitBAM parallel reader for the standalone rabbit_depth ──────
@@ -267,7 +272,6 @@ if(RABBITBIN_USE_VENDORED_BAM)
   target_include_directories(rabbit_depth PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/rabbitbam
     ${LIBDEFLATE_INCLUDE_DIR})
-  target_link_libraries(rabbit_depth ${LIBDEFLATE_LIBRARY})
 endif()
 
 install(TARGETS ${targets}

@@ -57,7 +57,8 @@ def main():
                        "--max-edges", str(edges), "--min-edge-score", str(cutoff),
                        "--min-bin-size", "5600", "--no-bin-fasta"]
                 result = subprocess.run(cmd, env=run_env, stdout=subprocess.PIPE,
-                                        stderr=subprocess.STDOUT, text=True, timeout=90)
+                                        stderr=subprocess.STDOUT,
+                                        universal_newlines=True, timeout=90)
                 (work / f"{label}.log").write_text(result.stdout)
                 if result.returncode:
                     raise AssertionError(f"{label}: {result.stdout}")
