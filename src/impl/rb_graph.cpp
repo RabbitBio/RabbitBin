@@ -646,6 +646,12 @@ static void gen_fused_graph(Graph &g) {
   const bool abdfirst = (getenv("RABBIT_NO_ABDFIRST") == nullptr) &&
                         g_coverage_samples >= 3 && corr_bounds_weight &&
                         rb_env_edge_cut_mode() == 0;
+  // Experimental ordering ablation: the *existing* full coverage gate must
+  // pass before a pair may occupy a bounded PMH neighbour slot. No new score,
+  // cutoff or fusion coefficient; retain PMH ordering and mutual selection.
+  const bool coverage_first = getenv("RABBIT_CANDIDATE_COVERAGE") != nullptr;
+  if (coverage_first)
+    verbose_message("Candidate coverage: full existing edge gate before PMH top-N\n");
   const double abd_corr_min = abdfirst ? (double)min_edge_weight : -2.0;
   // Precompute per-contig unit rank vectors u_i so the abundance correlation
   // corr(i,j) = Σ_k u_i[k]·u_j[k] is a single length-S dot product — bit-equal
@@ -1095,6 +1101,14 @@ static void gen_fused_graph(Graph &g) {
         if (graphProfileOn) ++my_prof.graphSimCalls;
         sv = (StoredDistance)graph_sim(i, j);
       }
+      if (coverage_first) {
+        // A losing candidate needs no expensive coverage calculation. Heap
+        // thresholds only increase, so concurrent stale reads are conservative.
+        if (!(sv > 0.0f)) return;
+        if (Edge32::pack(sv, (uint32_t)j) <= rowsync[i].thresh_key.load(std::memory_order_relaxed) &&
+            Edge32::pack(sv, (uint32_t)i) <= rowsync[j].thresh_key.load(std::memory_order_relaxed)) return;
+        if (!(depth_graph_edge_score(i, j, sv) > 0.0f)) return;
+      }
       update_row(i, j, sv, t_i);
       update_row(j, i, sv, t_j);
     };
@@ -1370,6 +1384,22 @@ static void gen_fused_graph(Graph &g) {
 
   { std::vector<RowSync>().swap(rowsync); }
 
+  if (g_audit_candidate_stages) {
+    const uint32_t unknown = std::numeric_limits<uint32_t>::max();
+    g_stage_row_cutoff.assign(nobs, 0);
+    g_stage_row_foreign.assign(nobs, 0);
+    for (size_t i = 0; i < nobs; ++i) {
+      const auto &row = heaps[i];
+      if (row.size() == maxEdges) g_stage_row_cutoff[i] = row.top().key;
+      const uint32_t lab = g_stage_gold.label[i];
+      if (lab == unknown) continue;
+      for (const auto &e : row.v) {
+        const uint32_t other = g_stage_gold.label[e.id()];
+        if (other != unknown && other != lab) ++g_stage_row_foreign[i];
+      }
+    }
+  }
+
   // Emit positive-similarity top-k candidates; no absolute PMH cutoff.
   verbose_message("Starting Building Similarity Graph (Fusion D). "
                   "nobs=%zu maxEdges=%zu\n", nobs, maxEdges);
@@ -1452,4 +1482,120 @@ static void gen_fused_graph(Graph &g) {
                   g.getEdgeCount(), getUsedPhysMem(),
                   getTotalPhysMem() / 1024 / 1024);
   g.sComp.shrink_to_fit(); g.to.shrink_to_fit(); g.from.shrink_to_fit();
+}
+
+// Diagnostic only: evaluate every labelled same-genome long-contig pair against
+// the exact final coverage gate and the saved directed PMH heap cutoffs. Gold
+// labels are never fed back into graph construction or clustering.
+static void rb_audit_candidate_stages(const Graph &g,
+                                      const std::string &report_path) {
+  const uint32_t unknown = std::numeric_limits<uint32_t>::max();
+  if (g_stage_row_cutoff.size() != nobs || g_stage_gold.label.size() != nobs)
+    throw std::runtime_error("candidate stage audit missing graph state");
+
+  struct Row {
+    uint32_t nonzero = 0, feasible = 0, pmh_positive = 0;
+    uint32_t rho_ge_cut = 0, jcov_ge_cut = 0, both_ge_cut = 0;
+    uint32_t directed = 0, mutual = 0, candidate = 0, retained = 0;
+  };
+  std::vector<Row> rows(nobs);
+  std::vector<std::vector<uint32_t>> groups(g_stage_gold.genomes);
+  std::vector<uint64_t> genome_bp(g_stage_gold.genomes, 0);
+  for (size_t i = 0; i < nobs; ++i) {
+    const uint32_t lab = g_stage_gold.label[i];
+    if (lab == unknown) continue;
+    groups[lab].push_back((uint32_t)i);
+    genome_bp[lab] += seq_lens[i];
+  }
+
+  auto packed_key = [](StoredDistance sv, uint32_t other) {
+    uint32_t bits = 0;
+    std::memcpy(&bits, &sv, sizeof(bits));
+    return ((uint64_t)bits << 32) | (uint32_t)~other;
+  };
+  // Each genome owns disjoint rows, so this parallel loop needs no atomics.
+#pragma omp parallel for schedule(dynamic, 1) num_threads(numThreads)
+  for (size_t gi = 0; gi < groups.size(); ++gi) {
+    const auto &ids = groups[gi];
+    for (size_t a = 0; a < ids.size(); ++a) {
+      const uint32_t i = ids[a];
+      for (size_t b = a + 1; b < ids.size(); ++b) {
+        const uint32_t j = ids[b];
+        if (!is_nz(i, j)) continue;
+        ++rows[i].nonzero; ++rows[j].nonzero;
+        const bool rho_ok = depth_corr_fast(i, j) >= (double)min_edge_weight;
+        const bool jcov_ok = cal_depth_wjac(i, j) >= (double)min_edge_weight;
+        if (rho_ok) { ++rows[i].rho_ge_cut; ++rows[j].rho_ge_cut; }
+        if (jcov_ok) { ++rows[i].jcov_ge_cut; ++rows[j].jcov_ge_cut; }
+        if (rho_ok && jcov_ok) {
+          ++rows[i].both_ge_cut; ++rows[j].both_ge_cut;
+        }
+        // The default BAM path scores surviving graph edges with coverage;
+        // passing the early Spearman bound alone is not sufficient here.
+        if (!(depth_graph_edge_score(i, j, 0.0f) > 0.0f)) continue;
+        ++rows[i].feasible; ++rows[j].feasible;
+        const StoredDistance sv = (StoredDistance)graph_sim(i, j);
+        if (!(sv > 0.0f)) continue;
+        ++rows[i].pmh_positive; ++rows[j].pmh_positive;
+        // The weakest entry itself remains in a full heap.
+        const bool i_kept = packed_key(sv, j) >= g_stage_row_cutoff[i];
+        const bool j_kept = packed_key(sv, i) >= g_stage_row_cutoff[j];
+        if (i_kept) ++rows[i].directed;
+        if (j_kept) ++rows[j].directed;
+        if (i_kept && j_kept) {
+          ++rows[i].mutual; ++rows[j].mutual;
+        }
+      }
+    }
+  }
+
+  std::vector<uint32_t> parent(nobs);
+  std::iota(parent.begin(), parent.end(), 0);
+  auto root = [&](uint32_t x) {
+    while (parent[x] != x) {
+      parent[x] = parent[parent[x]];
+      x = parent[x];
+    }
+    return x;
+  };
+  for (size_t e = 0; e < g.from.size(); ++e) {
+    if (edge_is_gfa(g.sComp[e])) continue;
+    const uint32_t i = (uint32_t)g.from[e], j = (uint32_t)g.to[e];
+    if (g_stage_gold.label[i] == unknown ||
+        g_stage_gold.label[i] != g_stage_gold.label[j]) continue;
+    ++rows[i].candidate; ++rows[j].candidate;
+    if (e >= g.edgeScore.size() || !(g.edgeScore[e] > 0.0f)) continue;
+    ++rows[i].retained; ++rows[j].retained;
+    uint32_t ri = root(i), rj = root(j);
+    if (ri != rj) parent[rj] = ri;
+  }
+
+  std::vector<uint64_t> component_bp(nobs, 0);
+  for (size_t i = 0; i < nobs; ++i)
+    if (g_stage_gold.label[i] != unknown)
+      component_bp[root((uint32_t)i)] += seq_lens[i];
+
+  std::ofstream out(report_path);
+  if (!out) throw std::runtime_error("cannot write " + report_path);
+  out << "contig\tgenome_id\tlength_bp\tgenome_large_bp\tgenome_large_contigs"
+         "\tnonzero_same\trho_ge_cut_same\tjcov_ge_cut_same"
+         "\tboth_ge_cut_same\tcoverage_feasible_same\tpmh_positive_same"
+         "\town_top_same\tmutual_top_same\tcandidate_same\tretained_same"
+         "\tforeign_in_top\ttrue_component_id\ttrue_component_bp\n";
+  for (size_t i = 0; i < nobs; ++i) {
+    const uint32_t lab = g_stage_gold.label[i];
+    if (lab == unknown) continue;
+    const Row &r = rows[i];
+    out << contig_names[i] << '\t' << lab << '\t' << seq_lens[i] << '\t'
+        << genome_bp[lab] << '\t' << g_stage_gold.genome_size[lab] << '\t'
+        << r.nonzero << '\t' << r.rho_ge_cut << '\t' << r.jcov_ge_cut
+        << '\t' << r.both_ge_cut << '\t' << r.feasible << '\t'
+        << r.pmh_positive
+        << '\t' << r.directed << '\t' << r.mutual << '\t'
+        << r.candidate << '\t' << r.retained << '\t'
+        << g_stage_row_foreign[i] << '\t' << root((uint32_t)i) << '\t'
+        << component_bp[root((uint32_t)i)] << '\n';
+  }
+  verbose_message("Candidate-stage audit: %zu labelled large contigs; %s\n",
+                  g_stage_gold.labelled, report_path.c_str());
 }

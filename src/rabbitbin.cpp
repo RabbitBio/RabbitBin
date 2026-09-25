@@ -103,6 +103,12 @@ static size_t      g_validate_pmh_top     = 400;
 // PMH representation diagnostic above, this never contributes to binning.
 static std::string g_audit_graph_gold;
 static std::string g_audit_graph_out;
+static bool g_audit_candidate_stages = false;
+static std::string g_export_retained_graph;
+static std::string g_external_labels;
+static std::string g_external_graph;
+static std::string g_fragment_depth_prefix;
+static bool g_external_graph_coverage = false;
 
 // ── Marker-guided bin splitting (Phase 2; --marker-seed <file>) ─────────────
 // Seed file (MetaDecoder format): one line per single-copy marker:
@@ -124,6 +130,32 @@ static bool        g_no_singleton_rescue  = false; // single-factor ablation con
 // Final selective recruitment into frozen output-sized cores.  The decision
 // boundary is learned within each run from leave-one-out core predictions.
 static bool        g_bin_recruit          = true;
+static bool        g_seq_recruit          = false; // opt-in short-contig sequence rescue
+static bool        g_seq_recruit_agree    = false; // require independent coverage-best agreement
+static std::vector<int> g_seq_recruit_coverage_best;
+// The optional sequence recruiter can cache only the features it uses, then
+// release the assembly mapping before graph construction in no-FASTA runs.
+static constexpr size_t RB_SEQ_K4_DIM = 256;
+static std::vector<float> g_seq_k4_long, g_seq_k4_pseudo, g_seq_k4_small;
+static size_t g_seq_k4_pseudo_length = 0;
+static inline void rb_seq_k4_profile(std::string_view sequence, float *out) {
+  std::fill(out, out + RB_SEQ_K4_DIM, 0.0f);
+  uint32_t forward = 0, reverse = 0;
+  unsigned valid = 0;
+  for (char ch : sequence) {
+    int b;
+    switch (ch) {
+      case 'A': case 'a': b = 0; break;
+      case 'C': case 'c': b = 1; break;
+      case 'G': case 'g': b = 2; break;
+      case 'T': case 't': b = 3; break;
+      default: forward = reverse = valid = 0; continue;
+    }
+    forward = ((forward << 2) | (uint32_t)b) & 255u;
+    reverse = (reverse >> 2) | ((uint32_t)(3 - b) << 6);
+    if (++valid >= 4) out[std::min(forward, reverse)] += 1.0f;
+  }
+}
 static double      g_recruit_max_fpr      = 0.05;
 static double      g_split_sil      = 0.70;  // silhouette threshold (RABBIT_SPLIT_SIL)
 static size_t      g_sil_sample_cap = 600;   // sample cap for O(n^2) silhouette
@@ -160,9 +192,10 @@ static bool               g_depth_wjac_gate = false;
 static std::vector<float> g_depth_raw;             // nobs × num_depth_samples (raw, pre-rank)
 static std::vector<double> g_depth_colnorm;        // num_depth_samples (empty = no norm)
 // Per-contig non-negative coverage totals T_i = Σ_s max(0, d̃_is) on the same
-// column-normalised scale as cal_depth_wjac. Used only after mutual top-N, to
+// column-normalised scale as cal_depth_wjac. By default used after mutual top-N to
 // drop candidate edges whose Jaccard upper bound min(T_i,T_j)/max(T_i,T_j)
-// is already below τ_F. Must not be applied during PMH neighbourhood selection.
+// is already below τ_F. Moving it before selection changes the graph and is
+// permitted only in the explicit RABBIT_CANDIDATE_COVERAGE ordering ablation.
 static std::vector<double> g_depth_wjac_tot;
 static bool g_wjac_bound_on = true;
 static double g_wjac_bound_cut_adj = 0.0;  // τ with a conservative float margin
@@ -998,7 +1031,8 @@ static inline double depth_graph_raw_weight(size_t i, size_t j,
 
 static inline StoredDistance depth_graph_edge_score(size_t i, size_t j,
                                                     StoredDistance composition) {
-  // Bound is applied here (post mutual top-N), never during PMH heap selection.
+  // By default post mutual top-N; the candidate-coverage ablation also invokes
+  // this same scorer before allowing a candidate into a PMH heap.
   if (num_depth_samples > 0 && wjac_total_bound_rejects(i, j)) return 0.0f;
   double w = depth_graph_raw_weight(i, j, composition);
   if (num_depth_samples > 0 &&
@@ -3389,6 +3423,97 @@ static std::vector<int> rb_kmeans(const float *X, size_t n, size_t d,
 // Gold-aware production candidate/retained-edge audit (diagnostic-only).
 #include "impl/rb_graph_audit.cpp"
 
+// Optional gold-labelled diagnostics. These are never consulted by the
+// production scoring or clustering path.
+static RbGraphAuditGold g_stage_gold;
+static std::vector<uint64_t> g_stage_row_cutoff;
+static std::vector<uint16_t> g_stage_row_foreign;
+static bool rb_lsh_on();
+static void rb_audit_candidate_stages(const Graph &g,
+                                      const std::string &report_path);
+
+// Experimental graph-only clustering comparison. The export contains no gold
+// labels; external cluster IDs enter at the same point as LPA membership.
+static bool rb_export_retained_graph(const Graph &g, const std::string &path) {
+  std::ofstream edges(path, std::ios::binary);
+  std::ofstream nodes(path + ".nodes.tsv");
+  if (!edges || !nodes) return false;
+  const char magic[8] = {'R','B','E','D','G','E','1','\0'};
+  uint64_t nv = nobs, ne = 0;
+  for (size_t e = 0; e < g.from.size(); ++e)
+    ne += e < g.edgeScore.size() && g.edgeScore[e] > 0.0f;
+  edges.write(magic, sizeof(magic));
+  edges.write(reinterpret_cast<const char *>(&nv), sizeof(nv));
+  edges.write(reinterpret_cast<const char *>(&ne), sizeof(ne));
+  nodes << "index\tcontig\tlength_bp\n";
+  for (size_t i = 0; i < nobs; ++i)
+    nodes << i << '\t' << contig_names[i] << '\t' << seq_lens[i] << '\n';
+  for (size_t e = 0; e < g.from.size(); ++e) {
+    if (e >= g.edgeScore.size() || !(g.edgeScore[e] > 0.0f)) continue;
+    const uint32_t i = (uint32_t)g.from[e], j = (uint32_t)g.to[e];
+    const float w = g.edgeScore[e];
+    edges.write(reinterpret_cast<const char *>(&i), sizeof(i));
+    edges.write(reinterpret_cast<const char *>(&j), sizeof(j));
+    edges.write(reinterpret_cast<const char *>(&w), sizeof(w));
+  }
+  return (bool)edges && (bool)nodes;
+}
+
+static bool rb_load_external_labels(const std::string &path,
+                                    std::vector<size_t> &membership) {
+  std::ifstream in(path);
+  if (!in) return false;
+  membership.assign(nobs, 0);
+  for (size_t i = 0; i < nobs; ++i) {
+    size_t index = 0, cluster = 0;
+    std::string name;
+    if (!(in >> index >> name >> cluster) || index != i ||
+        name != contig_names[i]) return false;
+    membership[i] = cluster;
+  }
+  std::string extra;
+  return !(in >> extra);
+}
+
+// Experimental graph input in exactly the export format. Node order, names,
+// lengths, endpoints and weights must agree before the graph is accepted.
+static bool rb_load_external_graph(const std::string &path, Graph &g) {
+  std::ifstream in(path, std::ios::binary);
+  std::ifstream nodes(path + ".nodes.tsv");
+  char magic[8]{};
+  uint64_t nv = 0, ne = 0;
+  in.read(magic, 8);
+  in.read(reinterpret_cast<char *>(&nv), sizeof(nv));
+  in.read(reinterpret_cast<char *>(&ne), sizeof(ne));
+  if (!in || !nodes || std::memcmp(magic, "RBEDGE1\0", 8) != 0 ||
+      nv != nobs || ne > nv * (nv - (nv > 0)) / 2) return false;
+  std::string line;
+  std::getline(nodes, line);
+  for (size_t i = 0; i < nobs; ++i) {
+    size_t index = 0, length = 0;
+    std::string name;
+    if (!(nodes >> index >> name >> length) || index != i ||
+        name != contig_names[i] || length != seq_lens[i]) return false;
+  }
+  if (nodes >> line) return false;
+  g.from.resize(ne); g.to.resize(ne); g.sComp.resize(ne);
+  uint64_t previous = 0;
+  for (size_t e = 0; e < ne; ++e) {
+    uint32_t i = 0, j = 0;
+    float w = 0.0f;
+    in.read(reinterpret_cast<char *>(&i), sizeof(i));
+    in.read(reinterpret_cast<char *>(&j), sizeof(j));
+    in.read(reinterpret_cast<char *>(&w), sizeof(w));
+    const uint64_t key = (uint64_t)i * nv + j;
+    if (!in || i >= j || j >= nv || !std::isfinite(w) || w <= 0.0f ||
+        w > 1.0f || (e && key <= previous)) return false;
+    previous = key;
+    g.from[e] = i; g.to[e] = j; g.sComp[e] = w;
+  }
+  char extra;
+  return !in.read(&extra, 1);
+}
+
 // ── cache I/O (before main; used by both the save hook and the load path) ──
 #include "impl/rb_cache.cpp"
 
@@ -3435,7 +3560,15 @@ static int rb_cmd_bin(int ac, char *av[]) {
       ("validate-pmh-top", po::value<size_t>(&g_validate_pmh_top)->default_value(400), "[--validate-pmh-gold] Largest top-N neighbourhood retained")
       ("audit-graph-gold", po::value<std::string>(&g_audit_graph_gold), "Diagnostic only: audit production candidate/retained edges against CAMI gold without affecting binning")
       ("audit-graph-out", po::value<std::string>(&g_audit_graph_out), "[--audit-graph-gold] Output TSV (default: <output>.graph_audit.tsv)")
+      ("audit-candidate-stages", po::bool_switch(&g_audit_candidate_stages), "Diagnostic only: report coverage/PMH top-N/retained-edge stages for gold-labelled pairs; requires --audit-graph-gold")
+      ("export-retained-graph", po::value<std::string>(&g_export_retained_graph), "Experimental: export coverage-retained graph as RBEDGE1 binary plus node map")
+      ("external-labels", po::value<std::string>(&g_external_labels), "Experimental: use index/name/cluster labels in place of LPA on the identical scored graph")
+      ("external-graph", po::value<std::string>(&g_external_graph), "Experimental: import a weighted RBEDGE1 graph (node names/lengths must match)")
+      ("export-fragment-depth", po::value<std::string>(&g_fragment_depth_prefix), "Experimental: export actual BAM coverage of non-overlapping contig halves for self-supervised metric learning")
+      ("external-graph-coverage", po::bool_switch(&g_external_graph_coverage), "Experimental: rescore imported graph topology using the original coverage filter")
       ("no-recruit", po::value<bool>(&no_recruit)->zero_tokens(), "Disable post-split coverage recruitment")
+      ("seq-recruit", po::bool_switch(&g_seq_recruit), "Experimental: calibrate a 4-mer short-contig rescue from held-out long-contig fragments")
+      ("seq-recruit-agree", po::bool_switch(&g_seq_recruit_agree), "Experimental: sequence rescue only when sequence and coverage choose the same core")
       ("recruit-max-fpr", po::value<double>(&g_recruit_max_fpr)->default_value(0.05), "Maximum leave-one-out ROC false-positive rate for recruitment threshold selection")
       ("no-singleton-rescue", po::value<bool>(&g_no_singleton_rescue)->zero_tokens(), "Ablation: do not promote unassigned long contigs to singleton bins")
       ("no_gold", po::value<bool>(&no_gold)->zero_tokens(), "Label-free multi-resolution: sweep edge power on the reused graph, auto-select max-modularity partition (no ground truth needed)")
@@ -3535,6 +3668,34 @@ static int rb_cmd_bin(int ac, char *av[]) {
   if (!g_add_depth_file.empty() && cache_load_file.empty()) {
     cerr << "[Error!] --add-depth requires --load-cache (incremental binning "
             "folds new samples into a cached composition graph).\n";
+    return 1;
+  }
+  if (g_seq_recruit_agree) g_seq_recruit = true;
+  if (g_seq_recruit && !cache_load_file.empty()) {
+    cerr << "[Error!] --seq-recruit needs the assembly sequence; "
+            "--load-cache does not store sequence bytes\n";
+    return 1;
+  }
+  if (g_external_graph_coverage && g_external_graph.empty()) {
+    cerr << "[Error!] --external-graph-coverage requires --external-graph\n";
+    return 1;
+  }
+  if (!g_fragment_depth_prefix.empty()) {
+#ifdef RABBITBIN_FUSE
+    if (fuse_bams.empty() || !cache_load_file.empty() || fuse_dual_depth <= 0 ||
+        !g_reference_file.empty() || g_strain_scan) {
+      cerr << "[Error!] --export-fragment-depth requires fresh BAM input, --dual-depth, and no SNV/reference/CRAM mode\n";
+      return 1;
+    }
+#else
+    cerr << "[Error!] --export-fragment-depth requires a fused-BAM build\n";
+    return 1;
+#endif
+  }
+  if (!g_external_graph.empty() &&
+      (no_gold || g_audit_candidate_stages || !cache_save_file.empty())) {
+    cerr << "[Error!] --external-graph cannot be combined with --no_gold, "
+            "candidate-stage auditing, or --save-cache\n";
     return 1;
   }
 
@@ -3831,6 +3992,8 @@ static int rb_cmd_bin(int ac, char *av[]) {
         DepthAsyncResult result;
         // CRAM/generic still goes through the TSV (no structured path there).
         if (any_cram) {
+          if (!g_fragment_depth_prefix.empty())
+            throw std::runtime_error("fragment depth does not support CRAM");
           std::string tsv = compute_depth_tsv_generic(
               bams, pctid, mcl, (float)mcd, medge,
               /*includeEdgeBases=*/false, /*intraDepthVariance=*/true, nt, ref);
@@ -3842,6 +4005,8 @@ static int rb_cmd_bin(int ac, char *av[]) {
         // builds a non-owning name->row index after FASTA parsing, avoiding a
         // separately allocated vector of sample values for every contig.
         auto cols = std::make_unique<DepthMatrixOut>();
+        cols->fragment_output_prefix = g_fragment_depth_prefix;
+        cols->fragment_min_length = minContig;
         // intraDepthVariance=false: the structured fill computes per-sample means
         // directly from the raw depth sums (identical to variance.mean), so the
         // full num_bams × n_targets variance matrix (~1 GB on million-contig
@@ -4012,6 +4177,9 @@ static int rb_cmd_bin(int ac, char *av[]) {
     //     and the uncompressed mmap path untouched.
     if (!parsed_ok) {
       const bool stream_pmh_mmap = rb_env_pmh_on();
+      const bool seq_profiles_only = g_seq_recruit && stream_pmh_mmap &&
+          noBinOut && !outUnbinned && getenv("RB_SEQHASH") == nullptr &&
+          !g_mge_scan && !(g_certify && g_cert_core_fasta);
       const bool no_store_seqs_mmap = [&]() -> bool {
         if (const char *e = rb_getenv("RABBIT_NOSTORE_SEQS")) return e[0] == '1';
         // Auto-drop: the stored contig bytes (≈ the whole assembly — the single
@@ -4020,7 +4188,7 @@ static int rb_cmd_bin(int ac, char *av[]) {
         // debug.  When PMH winners are built during this parse and none of those
         // consumers is active, the bytes are dead weight, so we skip storing them
         // and cut peak RSS by roughly the input size.  Bit-identical results.
-        return stream_pmh_mmap && noBinOut && !outUnbinned &&
+        return stream_pmh_mmap && noBinOut && !outUnbinned && !g_seq_recruit &&
                getenv("RB_SEQHASH") == nullptr &&
                !g_mge_scan &&  // --mge-scan needs sequences resident for DTR detection
                !(g_certify && g_cert_core_fasta);  // core_bins/ FASTA needs sequences
@@ -4185,6 +4353,38 @@ static int rb_cmd_bin(int ac, char *av[]) {
           if (!no_store_seqs_mmap) small_seqs.push_back(rec_view(rec));
           small_seq_lens.push_back(rec.len);
           nobs1++;
+        }
+        if (seq_profiles_only && seqs.size() == nobs &&
+            small_seqs.size() == nobs1 && nobs1 > 0) {
+          std::vector<size_t> lengths = small_seq_lens;
+          const size_t mid = lengths.size() / 2;
+          std::nth_element(lengths.begin(), lengths.begin() + mid, lengths.end());
+          g_seq_k4_pseudo_length = lengths[mid];
+          g_seq_k4_long.resize(nobs * RB_SEQ_K4_DIM);
+          g_seq_k4_pseudo.resize(nobs * RB_SEQ_K4_DIM);
+          g_seq_k4_small.resize(nobs1 * RB_SEQ_K4_DIM);
+#pragma omp parallel for schedule(dynamic, 64) num_threads(numThreads)
+          for (size_t i = 0; i < nobs; ++i) {
+            rb_seq_k4_profile(seqs[i], g_seq_k4_long.data() + i * RB_SEQ_K4_DIM);
+            if (seqs[i].size() >= g_seq_k4_pseudo_length) {
+              const size_t offset = (seqs[i].size() - g_seq_k4_pseudo_length) / 2;
+              rb_seq_k4_profile(seqs[i].substr(offset, g_seq_k4_pseudo_length),
+                                g_seq_k4_pseudo.data() + i * RB_SEQ_K4_DIM);
+            }
+          }
+#pragma omp parallel for schedule(dynamic, 64) num_threads(numThreads)
+          for (size_t i = 0; i < nobs1; ++i)
+            rb_seq_k4_profile(small_seqs[i],
+                              g_seq_k4_small.data() + i * RB_SEQ_K4_DIM);
+          std::vector<std::string_view>().swap(seqs);
+          std::vector<std::string_view>().swap(small_seqs);
+          if (g_fasta_mmap) {
+            munmap((void *)g_fasta_mmap, g_fasta_mmap_len);
+            g_fasta_mmap = nullptr; g_fasta_mmap_len = 0;
+          }
+          std::vector<std::string>().swap(g_seq_arenas);
+          verbose_message("Sequence rescue: cached 4-mer profiles; assembly bytes released "
+                          "before graph construction\n");
         }
         // If no single-line view referenced the mmap (e.g. a fully multi-line
         // assembly, where every sequence lives in an arena), release the
@@ -5067,6 +5267,37 @@ static int rb_cmd_bin(int ac, char *av[]) {
     }
   }
 
+  if (getenv("RABBIT_CANDIDATE_COVERAGE") != nullptr &&
+      (from_cache || !g_external_graph.empty() || !has_depth ||
+       !g_pmh_mode || !g_mutual_knn || low_sample_coverage() ||
+       g_depth_sim != 2 || g_depth_fuse != 1 ||
+       g_dual_conj || g_snv_edge || rb_env_edge_cut_mode() != 0 ||
+       !g_gfa_file.empty() || nobs <= 25000 || rb_lsh_on() ||
+       g_audit_candidate_stages)) {
+    cerr << "[Error!] RABBIT_CANDIDATE_COVERAGE requires fresh default mutual "
+            "PMH + fused coverage graph (>=3 samples, >25000 long contigs, no cache, "
+            "external graph, candidate audit, LSH/GFA/SNV)\n";
+    return 1;
+  }
+  // This opt-in path consumes the coverage scorer during candidate selection,
+  // earlier than its normal post-graph preparation point (including Jaccard
+  // totals used by the exact-safe upper bound).
+  if (getenv("RABBIT_CANDIDATE_COVERAGE") != nullptr)
+    prepare_coverage_edge_scoring();
+  if (g_audit_candidate_stages) {
+    if (g_audit_graph_gold.empty() || from_cache || !has_depth ||
+        !g_pmh_mode || !g_mutual_knn || g_depth_sim != 2 ||
+        g_depth_fuse != 1 || g_dual_conj || g_snv_edge ||
+        rb_env_edge_cut_mode() != 0 || !g_gfa_file.empty() ||
+        nobs <= 25000 || rb_lsh_on()) {
+      cerr << "[Error!] --audit-candidate-stages requires --audit-graph-gold, "
+              "BAM depth, and the default mutual PMH + fused-coverage "
+              "all-pairs graph (>25000 long contigs, no LSH/GFA/SNV)\n";
+      return 1;
+    }
+    if (!rb_load_graph_audit_gold(g_audit_graph_gold, g_stage_gold)) return 1;
+  }
+
   BinMap cls;
   do {
     std::vector<size_t> mems;
@@ -5075,7 +5306,19 @@ static int rb_cmd_bin(int ac, char *av[]) {
 
       // Large PMH datasets use one tiled O(N²/2) pass to maintain each
       // contig's bounded top-neighbour heap before mutual filtering.
-      if (from_cache) {
+      if (!g_external_graph.empty()) {
+        if (!rb_load_external_graph(g_external_graph, g)) {
+          cerr << "[Error!] invalid external graph or mismatching nodes: "
+               << g_external_graph << "\n";
+          return 1;
+        }
+        std::vector<GraphNodeId>().swap(g_cache_from);
+        std::vector<GraphNodeId>().swap(g_cache_to);
+        std::vector<StoredDistance>().swap(g_cache_scomp);
+        verbose_message("External joint graph: %zu edges; %s\n", g.getEdgeCount(),
+                        g_external_graph_coverage ? "original coverage scoring" :
+                                                    "imported joint affinity");
+      } else if (from_cache) {
         // Topology (from/to/sComp) was loaded from the cache. Skip graph build.
         g.from  = std::move(g_cache_from);
         g.to    = std::move(g_cache_to);
@@ -5091,8 +5334,10 @@ static int rb_cmd_bin(int ac, char *av[]) {
 
       // PMH winner arrays fed only graph construction and can be released
       // before edge scoring, clustering, and refinement.
-      if (!g_win16.empty()) std::vector<uint16_t>().swap(g_win16);
-      if (!g_win_flat.empty()) std::vector<uint32_t>().swap(g_win_flat);
+      if (!g_audit_candidate_stages) {
+        if (!g_win16.empty()) std::vector<uint16_t>().swap(g_win16);
+        if (!g_win_flat.empty()) std::vector<uint32_t>().swap(g_win_flat);
+      }
 
       // ── Save hook: persist the post-graph state, then continue normally so
       // the same invocation also emits its bins. ───────────────────────────
@@ -5447,7 +5692,9 @@ static int rb_cmd_bin(int ac, char *av[]) {
 
       // ── 3. Score candidate edges using coverage whenever available ─────────
       if (!used_no_gold) {
-      if (has_depth) {
+      if (!g_external_graph.empty() && !g_external_graph_coverage) {
+        g.edgeScore = g.sComp;
+      } else if (has_depth) {
         verbose_message("Calculating depth_matrix graph [%.1fGb / %.1fGb]               "
                         "                           \n",
                         getUsedPhysMem(), getTotalPhysMem() / 1024 / 1024);
@@ -5542,6 +5789,14 @@ static int rb_cmd_bin(int ac, char *av[]) {
         if (rb_audit_production_graph(g, g_audit_graph_gold, report) != 0)
           return 1;
       }
+      if (g_audit_candidate_stages) {
+        rb_audit_candidate_stages(g, outFile + ".candidate_stages.tsv");
+        std::vector<uint16_t>().swap(g_win16);
+        std::vector<uint32_t>().swap(g_win_flat);
+        std::vector<uint64_t>().swap(g_stage_row_cutoff);
+        std::vector<uint16_t>().swap(g_stage_row_foreign);
+        g_stage_gold = RbGraphAuditGold{};
+      }
 
       // ── 3b. Optional SNN edge reinforcement (RABBIT_SNN=1) ──────────────
       // Multiply each surviving edge weight by (Jaccard overlap of the two
@@ -5625,6 +5880,13 @@ static int rb_cmd_bin(int ac, char *av[]) {
       size_t n_connected = 0;
       for (size_t i = 0; i < nobs; ++i) if (!g.incs[i].empty()) ++n_connected;
 
+      if (!g_export_retained_graph.empty() &&
+          !rb_export_retained_graph(g, g_export_retained_graph)) {
+        cerr << "[Error!] cannot export retained graph to "
+             << g_export_retained_graph << "\n";
+        return 1;
+      }
+
       // g.sComp (raw composition similarity, 4·E bytes) has no reader left on the
       // production path now that edgeScore + incidence exist: LP, confidence and
       // bin collection all use edgeScore/incs.  The cache (if any) was written
@@ -5651,7 +5913,15 @@ static int rb_cmd_bin(int ac, char *av[]) {
       // remains the original single seeded pass.
       int seed_ens_n = 0;
       if (const char *se = getenv("RABBIT_SEED_ENSEMBLE")) seed_ens_n = std::atoi(se);
-      if (seed_ens_n > 1) {
+      if (!g_external_labels.empty()) {
+        if (!rb_load_external_labels(g_external_labels, membership)) {
+          cerr << "[Error!] invalid --external-labels file: "
+               << g_external_labels << "\n";
+          return 1;
+        }
+        verbose_message("External graph-clustering labels loaded: %s\n",
+                        g_external_labels.c_str());
+      } else if (seed_ens_n > 1) {
         const size_t E = g.getEdgeCount();
         std::vector<uint32_t> agree(E, 0);
         std::vector<char> was_positive(E, 0);
@@ -5763,6 +6033,10 @@ static int rb_cmd_bin(int ac, char *av[]) {
     if (g_bin_recruit) {
       recruit_unbinned_to_cores(c, min_bin_bp);
       rb_phase("  recruit: long+short post-split cores");
+    }
+    if (g_seq_recruit) {
+      recruit_short_by_sequence(c, min_bin_bp);
+      rb_phase("  recruit: short sequence rescue");
     }
     if (g_purify) {
       verbose_message("Contamination-aware purification...\n");

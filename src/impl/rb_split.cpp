@@ -710,6 +710,8 @@ static void recruit_unbinned_to_cores(BinMap &cls, size_t floor) {
   };
 
   std::vector<int> assignments(candidate_count, -1);
+  if (g_seq_recruit_agree)
+    g_seq_recruit_coverage_best.assign(nobs1, -1);
   size_t candidates = 0, rejected = 0;
 #pragma omp parallel num_threads(numThreads) reduction(+ : candidates, rejected)
   {
@@ -745,6 +747,9 @@ static void recruit_unbinned_to_cores(BinMap &cls, size_t floor) {
       } else {
         choice = choose_core(c);
       }
+      if (g_seq_recruit_agree && c >= nobs && choice.core >= 0)
+        g_seq_recruit_coverage_best[c - nobs] =
+            (int)core_bins[(size_t)choice.core];
       const double confidence =
           rb_recruit_confidence(choice.best, choice.second);
       if (choice.core < 0 || !(confidence >= boundary)) {
@@ -773,4 +778,192 @@ static void recruit_unbinned_to_cores(BinMap &cls, size_t floor) {
       recruited, candidates,
       recruited_large, recruited_small, rejected,
       positives.size(), negatives.size());
+}
+
+// Experimental self-calibrated sequence rescue for the 1,000–2,499 bp
+// contigs that never entered the main graph. Long contigs are cut to the
+// observed median short-contig length to calibrate the *same* score used for
+// the short queries. No reference genome, marker labels, or gold are used.
+static void recruit_short_by_sequence(BinMap &cls, size_t floor) {
+  const bool cached = g_seq_k4_long.size() == nobs * RB_SEQ_K4_DIM &&
+      g_seq_k4_pseudo.size() == nobs * RB_SEQ_K4_DIM &&
+      g_seq_k4_small.size() == nobs1 * RB_SEQ_K4_DIM &&
+      g_seq_k4_pseudo_length > 0;
+  if ((!cached && (seqs.size() != nobs || small_seqs.size() != nobs1)) ||
+      nobs1 == 0) {
+    cerr << "[Warn] --seq-recruit: sequence bytes unavailable; skipped\n";
+    return;
+  }
+  constexpr size_t D = RB_SEQ_K4_DIM;  // canonical 4-mers use 136 of these slots
+  std::vector<ContigVector *> bins;
+  bins.reserve(cls.size());
+  for (auto &entry : cls) bins.push_back(&entry.second);
+  std::vector<size_t> core_bins;
+  std::vector<uint8_t> binned(nobs + nobs1, 0);
+  for (size_t b = 0; b < bins.size(); ++b) {
+    size_t bp = 0;
+    for (size_t c : *bins[b]) {
+      bp += c < nobs ? seq_lens[c] : small_seq_lens[c - nobs];
+      if (c < binned.size()) binned[c] = 1;
+    }
+    if (bp >= floor) core_bins.push_back(b);
+  }
+  const size_t K = core_bins.size();
+  if (K < 2) return;
+  if (g_seq_recruit_agree && g_seq_recruit_coverage_best.size() != nobs1) {
+    cerr << "[Warn] --seq-recruit-agree: coverage choices unavailable; skipped\n";
+    return;
+  }
+
+  auto sqnorm = [](const double *a) {
+    double s = 0.0;
+    for (size_t k = 0; k < D; ++k) s += a[k] * a[k];
+    return s;
+  };
+  auto score = [&](const float *query, double q2, const double *core,
+                   double core2) {
+    if (!(q2 > 0.0) || !(core2 > 0.0))
+      return -std::numeric_limits<double>::infinity();
+    double dot = 0.0;
+    for (size_t k = 0; k < D; ++k) dot += (double)query[k] * core[k];
+    return std::min(1.0, dot / std::sqrt(q2 * core2));
+  };
+
+  size_t pseudo_length = g_seq_k4_pseudo_length;
+  if (!cached) {
+    std::vector<size_t> lengths = small_seq_lens;
+    const size_t mid = lengths.size() / 2;
+    std::nth_element(lengths.begin(), lengths.begin() + mid, lengths.end());
+    pseudo_length = lengths[mid];
+  }
+  std::vector<float> long_counts(cached ? 0 : nobs * D, 0.0f);
+  std::vector<std::array<double, D>> core_sum(K);
+  std::vector<double> core2(K, 0.0);
+#pragma omp parallel for schedule(dynamic, 4) num_threads(numThreads)
+  for (size_t ci = 0; ci < K; ++ci) {
+    auto &sum = core_sum[ci];
+    sum.fill(0.0);
+    for (size_t c : *bins[core_bins[ci]]) {
+      if (c >= nobs) continue;
+      float *counts = cached ? g_seq_k4_long.data() + c * D
+                             : long_counts.data() + c * D;
+      if (!cached) rb_seq_k4_profile(seqs[c], counts);
+      for (size_t k = 0; k < D; ++k) sum[k] += counts[k];
+    }
+    core2[ci] = sqnorm(sum.data());
+  }
+
+  std::vector<std::vector<RbRecruitEvidence>> evidence(K);
+#pragma omp parallel for schedule(dynamic, 4) num_threads(numThreads)
+  for (size_t ci = 0; ci < K; ++ci) {
+    std::array<float, D> query;
+    std::array<double, D> leave_one_out;
+    for (size_t c : *bins[core_bins[ci]]) {
+      if (c >= nobs || seq_lens[c] < pseudo_length) continue;
+      if (cached) {
+        std::memcpy(query.data(), g_seq_k4_pseudo.data() + c * D,
+                    D * sizeof(float));
+      } else {
+        const size_t offset = (seqs[c].size() - pseudo_length) / 2;
+        rb_seq_k4_profile(seqs[c].substr(offset, pseudo_length), query.data());
+      }
+      double q2 = 0.0;
+      for (float v : query) q2 += (double)v * v;
+      const float *parent = (cached ? g_seq_k4_long.data() : long_counts.data()) + c * D;
+      for (size_t k = 0; k < D; ++k)
+        leave_one_out[k] = core_sum[ci][k] - parent[k];
+      const double own = score(query.data(), q2, leave_one_out.data(),
+                               sqnorm(leave_one_out.data()));
+      double best_other = -std::numeric_limits<double>::infinity();
+      double second_other = best_other;
+      for (size_t cj = 0; cj < K; ++cj) {
+        if (cj == ci) continue;
+        const double s = score(query.data(), q2, core_sum[cj].data(), core2[cj]);
+        if (s > best_other) {
+          second_other = best_other;
+          best_other = s;
+        } else if (s > second_other) {
+          second_other = s;
+        }
+      }
+      RbRecruitEvidence item;
+      if (rb_make_recruit_evidence(own, best_other, second_other, item))
+        evidence[ci].push_back(item);
+    }
+  }
+  std::vector<float>().swap(long_counts);
+  if (cached) {
+    std::vector<float>().swap(g_seq_k4_long);
+    std::vector<float>().swap(g_seq_k4_pseudo);
+  }
+
+  std::vector<double> positives, negatives;
+  std::vector<double> fallback_pos, fallback_neg;
+  for (const auto &group : evidence)
+    for (const auto &item : group) {
+      if (item.outcome > 0) positives.push_back(item.winner);
+      if (item.outcome < 0) negatives.push_back(item.winner);
+      fallback_pos.push_back(item.source_counterfactual);
+      fallback_neg.push_back(item.wrong_counterfactual);
+    }
+  if (positives.empty()) positives.swap(fallback_pos);
+  if (negatives.empty()) negatives.swap(fallback_neg);
+  const RbRecruitThreshold selected = rb_select_recruit_threshold(
+      positives, negatives, g_recruit_max_fpr);
+  if (!std::isfinite(selected.value)) {
+    verbose_message("Short sequence rescue: no discriminative calibration; skipped\n");
+    return;
+  }
+
+  std::vector<int> assignments(nobs1, -1);
+  size_t candidates = 0, agreed = 0, recruited = 0;
+#pragma omp parallel for schedule(dynamic, 128) num_threads(numThreads) \
+    reduction(+:candidates,agreed,recruited)
+  for (size_t s = 0; s < nobs1; ++s) {
+    if (binned[nobs + s]) continue;
+    ++candidates;
+    std::array<float, D> query;
+    if (cached)
+      std::memcpy(query.data(), g_seq_k4_small.data() + s * D,
+                  D * sizeof(float));
+    else
+      rb_seq_k4_profile(small_seqs[s], query.data());
+    double q2 = 0.0;
+    for (float v : query) q2 += (double)v * v;
+    double best = -std::numeric_limits<double>::infinity();
+    double second = best;
+    int winner = -1;
+    for (size_t ci = 0; ci < K; ++ci) {
+      const double value = score(query.data(), q2, core_sum[ci].data(), core2[ci]);
+      if (value > best) {
+        second = best;
+        best = value;
+        winner = (int)ci;
+      } else if (value > second) {
+        second = value;
+      }
+    }
+    if (winner >= 0 && g_seq_recruit_agree &&
+        g_seq_recruit_coverage_best[s] == (int)core_bins[(size_t)winner])
+      ++agreed;
+    if (winner >= 0 &&
+        (!g_seq_recruit_agree ||
+         g_seq_recruit_coverage_best[s] == (int)core_bins[(size_t)winner]) &&
+        rb_recruit_confidence(best, second) >= selected.value) {
+      assignments[s] = (int)core_bins[(size_t)winner];
+      ++recruited;
+    }
+  }
+  for (size_t s = 0; s < nobs1; ++s)
+    if (assignments[s] >= 0)
+      bins[(size_t)assignments[s]]->push_back(nobs + s);
+  if (cached) std::vector<float>().swap(g_seq_k4_small);
+  verbose_message("Short sequence rescue%s: median pseudo-fragment=%zu bp, "
+                  "FPR<=%.3g, boundary=%.4g [TPR=%.3g,FPR=%.3g], "
+                  "recruited=%zu/%zu (coverage-best agreement=%zu; "
+                  "calibration=%zu positive/%zu negative)\n",
+                  g_seq_recruit_agree ? " [coverage agreement]" : "",
+                  pseudo_length, g_recruit_max_fpr, selected.value,
+                  selected.tpr, selected.fpr, recruited, candidates, agreed,
+                  positives.size(), negatives.size());
 }

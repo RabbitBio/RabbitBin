@@ -1,5 +1,7 @@
 // RabbitBin module: rb_cluster.cpp
 
+#include "rb_fisher_log.h"
+
 // Closed-form CDF of a chi-squared distribution with 2·m degrees of freedom,
 // evaluated at x (here m = neighbour count, x = -2·Σlog(1-sim)).  For integer
 // shape the regularized lower incomplete gamma reduces to a finite Poisson sum:
@@ -33,11 +35,12 @@ static inline double chi2_2dof_cdf(int m, double x) {
 //   tail              same ordering via the upper tail Q, which does not
 //                     saturate: 1-Q is indistinguishable from 1.0 once Q drops
 //                     below ~1e-16, while Q itself stays comparable to ~1e-308
+//   logtail           stable -log Q, with one-ULP log-domain tie retention
 //   logsum            Sum of -log(1-w)                   (same evidence, no CDF)
 //   sum               Sum of w                            (standard weighted LPA)
 //   mean              Sum of w / m
 //   max               max w
-enum class LpaScore { Fisher, Tail, LogSum, Sum, Mean, Max };
+enum class LpaScore { Fisher, Tail, LogTail, LogSum, Sum, Mean, Max };
 static LpaScore rb_lpa_score_init() {
   const char *e = getenv("RABBIT_LPA_SCORE");
   if (!e || !*e) return LpaScore::Fisher;
@@ -46,6 +49,7 @@ static LpaScore rb_lpa_score_init() {
   if (std::strcmp(e, "max") == 0)    return LpaScore::Max;
   if (std::strcmp(e, "logsum") == 0) return LpaScore::LogSum;
   if (std::strcmp(e, "tail") == 0)   return LpaScore::Tail;
+  if (std::strcmp(e, "logtail") == 0) return LpaScore::LogTail;
   return LpaScore::Fisher;
 }
 static const LpaScore g_lpa_score = rb_lpa_score_init();
@@ -63,6 +67,7 @@ static inline double lpa_combine(int m, double acc) {
     // Maximising -Q is the same ordering as maximising the CDF 1-Q, but stays
     // discriminative in the range where 1-Q has already rounded to 1.0.
     case LpaScore::Tail:   return -chi2_2dof_sf(m, -2.0 * acc);
+    case LpaScore::LogTail: return rb_fisher_neg_log_sf(m, -2.0 * acc);
     case LpaScore::LogSum: return -acc;                      // acc <= 0
     case LpaScore::Mean:   return m > 0 ? acc / (double)m : 0.0;
     default:               return acc;                       // Sum, Max
@@ -74,6 +79,10 @@ static inline double lpa_combine(int m, double acc) {
 // score-equivalent labels from generating spurious updates and lets the main
 // propagation loop stop on a full sweep with zero actual label changes.
 static constexpr double LPA_SCORE_EPS = 1e-12;
+static inline bool lpa_retain_current(double current, double best) {
+  if (g_lpa_score == LpaScore::LogTail) return rb_fisher_log_tie(current, best);
+  return current >= best - LPA_SCORE_EPS;
+}
 // RB_LPA_PROF: how often does the chi-squared CDF comparison actually lose
 // information?  Counts decisions whose winning score has already rounded to 1.0,
 // and among those, decisions where two or more candidate labels are tied there --
@@ -84,6 +93,7 @@ static std::array<std::atomic<uint64_t>, 3> g_lpa_dec;  // total, saturated, tie
 static const char *lpa_score_name() {
   switch (g_lpa_score) {
     case LpaScore::Tail:   return "tail(-chi2 sf)";
+    case LpaScore::LogTail: return "logtail(-log chi2 sf; one-ULP ties)";
     case LpaScore::LogSum: return "logsum(-log(1-w))";
     case LpaScore::Sum:    return "sum(w)";
     case LpaScore::Mean:   return "mean(w)";
@@ -559,7 +569,7 @@ int cluster_by_propagation(Graph &g, std::vector<size_t> &membership,
             nscore[k] = 0.0; ncount[k] = 0;
           }
           if (current_is_candidate &&
-              current_val >= best_val - LPA_SCORE_EPS)
+              lpa_retain_current(current_val, best_val))
             best_k = current_k;
           prop_k[v1] = best_k;
           prop_set[v1] = 1;
@@ -625,6 +635,13 @@ int cluster_by_propagation(Graph &g, std::vector<size_t> &membership,
   std::unordered_map<size_t, std::unordered_set<size_t>> visited;
   std::unordered_set<size_t> blacklist;
 
+  // Read-only shadow decisions on the *same evolving production partition*.
+  // No gold labels and no changes to the selected propagation rule.
+  const bool lpa_audit = getenv("RB_LPA_AUDIT") != nullptr && !g_lpa_raw_w;
+  uint64_t audit_decisions = 0, audit_different = 0, audit_unique = 0,
+           audit_epsilon_retained = 0, audit_frozen_move = 0;
+  std::vector<uint8_t> audit_seen(lpa_audit ? no_of_nodes : 0, 0);
+
   size_t round = 0;
   while (true) {
     ++round;
@@ -672,6 +689,9 @@ int cluster_by_propagation(Graph &g, std::vector<size_t> &membership,
         double best_val = -std::numeric_limits<double>::infinity();
         size_t best_k = touched[0];
         int n_at_one = 0;
+        double stable_best = -std::numeric_limits<double>::infinity();
+        double stable_current = stable_best;
+        size_t stable_k = touched[0];
         for (size_t k : touched) {
           double val = lpa_combine((int)ncount[k], nscore[k]);
           if (k == current_k) {
@@ -680,11 +700,28 @@ int cluster_by_propagation(Graph &g, std::vector<size_t> &membership,
           }
           if (g_lpa_prof && val >= 1.0) ++n_at_one;
           if (val > best_val) { best_val = val; best_k = k; }
+          if (lpa_audit) {
+            const double lv = rb_fisher_neg_log_sf((int)ncount[k], -2.0 * nscore[k]);
+            if (k == current_k) stable_current = lv;
+            if (lv > stable_best) { stable_best = lv; stable_k = k; }
+          }
           nscore[k] = 0.0; ncount[k] = 0;   // reset for the next node
         }
-        if (current_is_candidate &&
-            current_val >= best_val - LPA_SCORE_EPS)
+        if (lpa_audit && current_is_candidate && best_k != current_k &&
+            lpa_retain_current(current_val, best_val)) ++audit_epsilon_retained;
+        if (current_is_candidate && lpa_retain_current(current_val, best_val))
           best_k = current_k;
+        if (lpa_audit) {
+          ++audit_decisions;
+          if (current_is_candidate && rb_fisher_log_tie(stable_current, stable_best))
+            stable_k = current_k;
+          if (stable_k != best_k) {
+            ++audit_different;
+            if (!audit_seen[v1]) { audit_seen[v1] = 1; ++audit_unique; }
+          }
+          if (best_k != current_k && blacklist.find(v1) != blacklist.end())
+            ++audit_frozen_move;
+        }
         if (g_lpa_prof) {
           g_lpa_dec[0].fetch_add(1, std::memory_order_relaxed);
           if (n_at_one >= 1) g_lpa_dec[1].fetch_add(1, std::memory_order_relaxed);
@@ -731,6 +768,13 @@ int cluster_by_propagation(Graph &g, std::vector<size_t> &membership,
   // the level-0 LPA left split, using the same Fisher statistic + a high gate.
   // Its tau gate is calibrated on the chi-squared CDF, so it needs the log(1-w)
   // accumuland even when the propagation above was ablated onto another rule.
+  if (lpa_audit)
+    fprintf(stderr, "[RB_LPA_AUDIT] decisions=%llu logtail_diff=%llu "
+            "different_nodes=%llu epsilon_retained=%llu frozen_move_blocked=%llu "
+            "frozen_nodes=%zu\n", (unsigned long long)audit_decisions,
+            (unsigned long long)audit_different, (unsigned long long)audit_unique,
+            (unsigned long long)audit_epsilon_retained,
+            (unsigned long long)audit_frozen_move, blacklist.size());
   if (do_mlpa) {
     if (g_lpa_raw_w)
       for (size_t e = 0; e < no_of_edges; ++e)

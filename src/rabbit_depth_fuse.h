@@ -89,6 +89,10 @@ std::string depth_format_table(const std::vector<DepthColumn> &cols,
 // contiguous row-major allocation: row i starts at means[i * num_samples].
 // This avoids one allocation and one vector object per contig.
 struct DepthMatrixOut {
+  // Experimental read-only side channel. Empty prefix leaves production
+  // depth unchanged; minimum fragment length is inherited from graph minContig.
+  std::string fragment_output_prefix;
+  size_t fragment_min_length = 0;
   std::vector<std::string> names;
   std::vector<int32_t> lens;
   size_t num_samples = 0;

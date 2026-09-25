@@ -13,6 +13,7 @@
 
 #include "rabbit_depth.h"
 #include "rabbit_depth_fuse.h"
+#include "impl/rb_fragment_depth.h"
 #include "version.h"
 
 #include "IOThreadBuffer.h"
@@ -960,7 +961,10 @@ static bool process_depth_byterange(
     std::vector<std::pair<int32_t, CountType>> &out,
     std::vector<std::pair<int32_t, CountType>> *outU = nullptr, int dualQ = 0,
     const int32_t *tid2compact = nullptr,
-    CountType *interiorDepth = nullptr, CountType *interiorDepthU = nullptr) {
+    CountType *interiorDepth = nullptr, CountType *interiorDepthU = nullptr,
+    const int32_t *tid2fragment = nullptr,
+    RbFragmentCounts *interiorFragments = nullptr,
+    std::vector<std::pair<int32_t, RbFragmentCounts>> *fragmentBoundary = nullptr) {
   htsFile *fp = open_depth_bam(bamPath);
   if (!fp)
     return false;
@@ -1010,6 +1014,7 @@ static bool process_depth_byterange(
   int32_t curTid = -1;
   CountType curSum = 0;
   CountType curSumU = 0;   // unique-read (MAPQ>=dualQ) accumulator (dual mode)
+  RbFragmentCounts curFragments{{0, 0, 0, 0}};
   bool firstFlushed = false;
   auto flushContig = [&](bool last) {
     if (curTid < 0) return;
@@ -1026,6 +1031,13 @@ static bool process_depth_byterange(
     } else {
       out.emplace_back(curTid, curSum);
       if (outU) outU->emplace_back(curTid, curSumU);
+    }
+    if (tid2fragment && tid2fragment[curTid] >= 0) {
+      const int32_t fi = tid2fragment[curTid];
+      if (interiorDepth && firstFlushed && !last)
+        interiorFragments[fi] = curFragments;
+      else
+        fragmentBoundary->emplace_back(fi, curFragments);
     }
     firstFlushed = true;
   };
@@ -1072,11 +1084,19 @@ static bool process_depth_byterange(
         curTid = tid;
         curSum = 0;
         curSumU = 0;
+        curFragments.fill(0);
       }
       curSum += ov;
       // Same decoded read feeds the unique-read block in one pass — no second
       // BAM scan. Only reads that map uniquely (MAPQ>=dualQ) count here.
       if (outU && b->core.qual >= dualQ) curSumU += ov;
+      if (tid2fragment && tid2fragment[tid] >= 0) {
+        const auto bases = rb_fragment_bases(b, header->target_len[tid], edge);
+        curFragments[0] += bases[0]; curFragments[1] += bases[1];
+        if (outU && b->core.qual >= dualQ) {
+          curFragments[2] += bases[0]; curFragments[3] += bases[1];
+        }
+      }
     }
   }
   flushContig(true);
@@ -1189,6 +1209,10 @@ std::string compute_depth_tsv_inmem(const StringVector &bamFilePaths,
 
   const char *b2env = getenv("RABBIT_DEPTH_B2");
   const bool useB2 = (snv == nullptr) && (!b2env || atoi(b2env) != 0);
+  const bool fragmentsOn = outCols && !outCols->fragment_output_prefix.empty();
+  if (fragmentsOn && (!useB2 || !dualOn || intraDepthVariance ||
+                      outCols->fragment_min_length == 0))
+    throw std::runtime_error("fragment depth requires B2, dual depth, means-only structured output");
   if (!useB2) {
     int budget = std::max(1, g_full_threads / num_bams);
     if (const char *e = getenv("RABBIT_DEPTH_BAM_MT")) {
@@ -1284,6 +1308,23 @@ std::string compute_depth_tsv_inmem(const StringVector &bamFilePaths,
   }
   const int32_t depthN = compactMode ? n_kept : header->n_targets;
   const int32_t *t2c = compactMode ? tid2compact.data() : nullptr;
+
+  std::vector<int32_t> tid2fragment, fragmentTids;
+  std::vector<std::vector<RbFragmentCounts>> bamFragments;
+  if (fragmentsOn) {
+    tid2fragment.assign(header->n_targets, -1);
+    for (int32_t t = 0; t < header->n_targets; ++t) {
+      if (contigLengthPass[t] &&
+          header->target_len[t] / 2 >= outCols->fragment_min_length) {
+        tid2fragment[t] = (int32_t)fragmentTids.size();
+        fragmentTids.push_back(t);
+      }
+    }
+    bamFragments.resize(num_bams);
+    for (auto &v : bamFragments) v.resize(fragmentTids.size(), RbFragmentCounts{{0, 0, 0, 0}});
+    fprintf(stderr, "[fragment] %zu parents, two halves >=%zu bp, same BAM pass\n",
+            fragmentTids.size(), outCols->fragment_min_length);
+  }
 
   CountTypeMatrix bamContigDepthsU(dualOn ? num_bams : 0);
   int minAvgRead = INT_MAX;
@@ -1392,6 +1433,8 @@ std::string compute_depth_tsv_inmem(const StringVector &bamFilePaths,
         b2shards.size());
     std::vector<std::vector<std::pair<int32_t, CountType>>> b2localU(
         dualOn ? b2shards.size() : 0);
+    std::vector<std::vector<std::pair<int32_t, RbFragmentCounts>>> fragmentLocal(
+        fragmentsOn ? b2shards.size() : 0);
     // Each worker owns one status byte. Reduce to per-BAM failure flags after
     // the parallel region instead of racing concurrent writes to bamFailed.
     std::vector<char> shardOk(b2shards.size(), 0);
@@ -1405,7 +1448,10 @@ std::string compute_depth_tsv_inmem(const StringVector &bamFilePaths,
           averageReadSize[sh.bamIdx], minMapQual, b2local[s],
           dualOn ? &b2localU[s] : nullptr, dualMapQual, t2c,
           bamContigDepths[sh.bamIdx].get(),
-          dualOn ? bamContigDepthsU[sh.bamIdx].get() : nullptr);
+          dualOn ? bamContigDepthsU[sh.bamIdx].get() : nullptr,
+          fragmentsOn ? tid2fragment.data() : nullptr,
+          fragmentsOn ? bamFragments[sh.bamIdx].data() : nullptr,
+          fragmentsOn ? &fragmentLocal[s] : nullptr);
       shardOk[s] = ok ? 1 : 0;
     }
     std::vector<char> bamFailed(num_bams, 0);
@@ -1441,6 +1487,10 @@ std::string compute_depth_tsv_inmem(const StringVector &bamFilePaths,
             }
           }
         }
+        if (fragmentsOn)
+          for (const auto &kv : fragmentLocal[s])
+            for (size_t h = 0; h < 4; ++h)
+              bamFragments[bi][kv.first][h] += kv.second[h];
       }
     }
     // Whole-file fallback (route A) for any BAM whose re-sync failed.
@@ -1453,6 +1503,7 @@ std::string compute_depth_tsv_inmem(const StringVector &bamFilePaths,
               "[depth] B2 re-sync failed on %zu BAM(s); whole-file fallback\n",
               failedBams.size());
       const int budget = std::max(1, g_full_threads / (int)failedBams.size());
+      std::atomic<bool> fragmentFallbackOk{true};
       omp_set_num_threads(std::min(g_full_threads, (int)failedBams.size()));
 #pragma omp parallel for schedule(dynamic, 1)
       for (int fi = 0; fi < (int)failedBams.size(); fi++) {
@@ -1463,6 +1514,23 @@ std::string compute_depth_tsv_inmem(const StringVector &bamFilePaths,
         std::fill_n(bamContigDepths[bi].get(), depthN, CountType(0));
         if (dualOn)
           std::fill_n(bamContigDepthsU[bi].get(), depthN, CountType(0));
+        if (fragmentsOn) {
+          std::fill(bamFragments[bi].begin(), bamFragments[bi].end(), RbFragmentCounts{{0, 0, 0, 0}});
+          std::vector<std::pair<int32_t, CountType>> boundary, boundaryU;
+          std::vector<std::pair<int32_t, RbFragmentCounts>> boundaryF;
+          const bool ok = process_depth_byterange(
+              bamFilePaths[bi], header, bamHdrVoff[bi], UINT64_MAX, false,
+              percentIdentity, maxEdgeBases, includeEdgeBases, averageReadSize[bi],
+              minMapQual, boundary, &boundaryU, dualMapQual, t2c,
+              bamContigDepths[bi].get(), bamContigDepthsU[bi].get(),
+              tid2fragment.data(), bamFragments[bi].data(), &boundaryF);
+          if (!ok) { fragmentFallbackOk = false; continue; }
+          for (const auto &kv : boundary) bamContigDepths[bi][t2c[kv.first]] += kv.second;
+          for (const auto &kv : boundaryU) bamContigDepthsU[bi][t2c[kv.first]] += kv.second;
+          for (const auto &kv : boundaryF)
+            for (size_t h = 0; h < 4; ++h) bamFragments[bi][kv.first][h] += kv.second[h];
+          continue;
+        }
         process_depth_shard(
             DepthShard{bi, 0, header->n_targets, bamHdrVoff[bi], true, budget},
             bamFilePaths[bi], header, bamContigDepths[bi].get(), percentIdentity,
@@ -1470,6 +1538,8 @@ std::string compute_depth_tsv_inmem(const StringVector &bamFilePaths,
             nullptr, 5, 0.05, 0, nullptr, 0, t2c,
             dualOn ? bamContigDepthsU[bi].get() : nullptr, dualMapQual);
       }
+      if (!fragmentFallbackOk)
+        throw std::runtime_error("fragment depth whole-file fallback failed");
     }
   }
   if (!b2shards.empty()) depthProfileMark("bam_byte_range_scan_and_merge");
@@ -1545,6 +1615,43 @@ std::string compute_depth_tsv_inmem(const StringVector &bamFilePaths,
       }
     }
     depthProfileMark("matrix_materialize");
+    if (fragmentsOn) {
+      const std::string prefix = outCols->fragment_output_prefix;
+      std::ofstream nodes(prefix + ".depth.nodes.tsv");
+      std::ofstream samples(prefix + ".depth.samples.tsv");
+      std::ofstream binary(prefix + ".depth.f32", std::ios::binary);
+      if (!nodes || !samples || !binary) throw std::runtime_error("cannot open fragment depth outputs");
+      nodes << "index\tcontig\tlength_bp\tleft_bp\tright_bp\n";
+      samples << "sample\tbam\tedge_trim\n";
+      for (int bi = 0; bi < num_bams; ++bi)
+        samples << bi << '\t' << bamFilePaths[bi] << '\t' << bamEdge[bi] << '\n';
+      std::vector<float> fragmentMeans(fragmentTids.size() * 2 * outCols->num_samples);
+#pragma omp parallel for schedule(static) num_threads(g_full_threads)
+      for (size_t r = 0; r < fragmentTids.size(); ++r) {
+        const int32_t cl = header->target_len[fragmentTids[r]];
+        for (int half = 0; half < 2; ++half) {
+          const int32_t len = half ? cl - cl / 2 : cl / 2;
+          float *row = fragmentMeans.data() + (r * 2 + half) * outCols->num_samples;
+          for (int bi = 0; bi < num_bams; ++bi) {
+            const int32_t adj = len - 2 * bamEdge[bi];
+            if (adj <= 2) continue;
+            row[bi] = (float)((double)bamFragments[bi][r][half] / adj);
+            row[num_bams + bi] = (float)((double)bamFragments[bi][r][half + 2] / adj);
+            if (row[bi] > 1000000.0f) row[bi] = 0.0f;
+            if (row[num_bams + bi] > 1000000.0f) row[num_bams + bi] = 0.0f;
+          }
+        }
+      }
+      for (size_t r = 0; r < fragmentTids.size(); ++r) {
+        const int32_t t = fragmentTids[r], cl = header->target_len[t];
+        nodes << r << '\t' << header->target_name[t] << '\t' << cl << '\t'
+              << cl / 2 << '\t' << cl - cl / 2 << '\n';
+      }
+      binary.write(reinterpret_cast<const char *>(fragmentMeans.data()),
+                   fragmentMeans.size() * sizeof(float));
+      if (!nodes || !samples || !binary) throw std::runtime_error("fragment depth write failed");
+      depthProfileMark("fragment_depth_output");
+    }
     // Self-check hook: dump the structured matrix (name, length, per-sample
     // means) so a run can be diffed against one taken with a different
     // --min-contig-length.  Rows are emitted in tid order, so two dumps differ
