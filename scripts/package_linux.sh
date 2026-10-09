@@ -36,6 +36,7 @@ is_system_lib() {
     *) return 1 ;;
   esac
 }
+declare -A dependency_paths=()
 for exe in rabbitbin rabbit_depth rabbit_overlap; do
   dependencies=$(ldd "$package/bin/$exe")
   if [[ "$dependencies" == *'not found'* ]]; then
@@ -45,6 +46,7 @@ for exe in rabbitbin rabbit_depth rabbit_overlap; do
   while read -r soname path; do
     if ! is_system_lib "$soname"; then
       cp -L -- "$path" "$package/lib/$soname"
+      dependency_paths["$soname"]=$path
     fi
   done < <(printf '%s\n' "$dependencies" | awk '$2 == "=>" && $3 ~ /^\// {print $1, $3}')
 done
@@ -70,6 +72,9 @@ while IFS= read -r notice; do
   mkdir -p -- "$package/licenses/project/$(dirname -- "$notice")"
   cp -- "$source_dir/$notice" "$package/licenses/project/$notice"
 done < <(git -C "$source_dir" ls-files '*LICENSE*' '*COPYING*' '*license*')
+# Several vendored extensions carry their notices inside source headers, not
+# separate LICENSE files. Preserve those originals as well.
+cp -R "$source_dir/src/align/strobe/ext" "$package/licenses/vendored-strobe-extensions"
 cp /usr/share/licenses/boost/LICENSE_1_0.txt "$package/licenses/Boost.txt"
 mkdir -p "$package/licenses/GCC"
 cp /usr/share/licenses/gcc/COPYING* "$package/licenses/GCC/"
@@ -81,7 +86,7 @@ cp "$build_dir/contrib/htslib-prefix/src/htslib/htscodecs/LICENSE.md" "$package/
 if command -v rpm >/dev/null; then
   for library in "$package"/lib/*; do
     soname=${library##*/}
-    system_path=$(ldconfig -p | awk -v n="$soname" '$1 == n && !seen++ {print $NF}')
+    system_path=${dependency_paths[$soname]}
     if [ -n "$system_path" ]; then
       rpm_name=$(rpm -qf "$system_path" 2>/dev/null || true)
       if rpm -q "$rpm_name" >/dev/null 2>&1; then
