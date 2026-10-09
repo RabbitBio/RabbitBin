@@ -50,9 +50,11 @@ jobs:
         run: |
           for log in "$RUNNER_TEMP"/release-*.log; do
             if [ -f "$log" ]; then
-              while IFS= read -r line; do
-                printf '::notice::%s\n' "${line//%/%25}"
-              done < <(tail -n 20 "$log")
+              message=$(tail -n 60 "$log")
+              message=${message//%/%25}
+              message=${message//$'\r'/%0D}
+              message=${message//$'\n'/%0A}
+              printf '::notice title=%s::%s\n' "${log##*/}" "$message"
             fi
           done
       - uses: actions/upload-artifact@v7

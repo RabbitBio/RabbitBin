@@ -95,7 +95,7 @@ jobs:
       - name: Build and smoke test
         run: |
           cmake --build build --parallel 2 2>&1 | tee "$RUNNER_TEMP/archive-build.log"
-          ctest --test-dir build --output-on-failure -j2
+          ctest --test-dir build --output-on-failure -j2 2>&1 | tee "$RUNNER_TEMP/archive-test.log"
           actual=$(./build/src/rabbitbin --version)
           expected="RabbitBin $(tr -d '\n' < VERSION) (commit ${GITHUB_SHA::12})"
           if [ "$actual" != "$expected" ]; then
@@ -103,15 +103,17 @@ jobs:
             exit 1
           fi
           cmake --install build
-          python3 test/test_installation.py --prefix "$PWD/install" --source "$PWD"
+          python3 test/test_installation.py --prefix "$PWD/install" --source "$PWD" 2>&1 | tee "$RUNNER_TEMP/archive-smoke.log"
       - name: Expose archive failure diagnostics
         if: failure()
         run: |
-          for log in "$RUNNER_TEMP/archive-build.log" build/Testing/Temporary/LastTest.log; do
+          for log in "$RUNNER_TEMP"/archive-*.log; do
             if [ -f "$log" ]; then
-              while IFS= read -r line; do
-                printf '::notice::%s\n' "${line//%/%25}"
-              done < <(tail -n 35 "$log")
+              message=$(tail -n 80 "$log")
+              message=${message//%/%25}
+              message=${message//$'\r'/%0D}
+              message=${message//$'\n'/%0A}
+              printf '::notice title=%s::%s\n' "${log##*/}" "$message"
             fi
           done
 
