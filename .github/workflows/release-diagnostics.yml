@@ -22,3 +22,9 @@ jobs:
           message=${message//$'\r'/%0D}
           message=${message//$'\n'/%0A}
           printf '::notice title=Runtime failure details::%s\n' "$message"
+          gh run download 37914866905 --repo "$GITHUB_REPOSITORY" \
+            --name linux-release --dir "$RUNNER_TEMP/recovered"
+          message=$(find "$RUNNER_TEMP/recovered" -type f -printf '%P\n')
+          message=${message//%/%25}
+          message=${message//$'\n'/%0A}
+          printf '::notice title=Artifact layout::%s\n' "$message"
