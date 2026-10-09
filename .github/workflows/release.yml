@@ -2,12 +2,13 @@ name: linux-binary-release
 
 on:
   push:
-    branches: ['fix/install-compatibility-20261009']
+    branches: ['main']
     tags: ['v[0-9]*']
   workflow_dispatch:
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: linux-release-${{ github.ref }}
@@ -15,7 +16,27 @@ concurrency:
   cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
 jobs:
+  verified-artifact:
+    runs-on: ubuntu-24.04
+    outputs:
+      run_id: ${{ steps.lookup.outputs.run_id }}
+    steps:
+      - name: Reuse the exact commit's fully validated main-branch artifact
+        id: lookup
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [[ "$GITHUB_REF" != refs/tags/* ]]; then
+            exit 0
+          fi
+          run_id=$(gh api --method GET "repos/$GITHUB_REPOSITORY/actions/workflows/release.yml/runs" \
+            -f head_sha="$GITHUB_SHA" -f event=push -f status=success \
+            --jq '[.workflow_runs[] | select(.head_branch == "main")][0].id // empty')
+          printf 'run_id=%s\n' "$run_id" >> "$GITHUB_OUTPUT"
+
   build:
+    needs: verified-artifact
+    if: needs.verified-artifact.outputs.run_id == ''
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     container: rockylinux:8
@@ -94,22 +115,33 @@ jobs:
             "$TEST_IMAGE" bash /opt/rabbitbin/test/binary_smoke.sh
 
   publish:
-    if: startsWith(github.ref, 'refs/tags/')
-    needs: [build, clean-runtime]
+    if: >-
+      always() && !cancelled() && startsWith(github.ref, 'refs/tags/') &&
+      needs.verified-artifact.result == 'success' &&
+      (needs.verified-artifact.outputs.run_id != '' ||
+       (needs.build.result == 'success' && needs.clean-runtime.result == 'success'))
+    needs: [verified-artifact, build, clean-runtime]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
+      actions: read
     steps:
       - uses: actions/checkout@v7
       - uses: actions/download-artifact@v8
         with:
           name: linux-release
           path: dist
+          github-token: ${{ github.token }}
+          run-id: ${{ needs.verified-artifact.outputs.run_id || github.run_id }}
       - name: Publish verified assets
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
+          test "$RELEASE_TAG" = "v$(tr -d '\r\n' < VERSION)"
+          (cd dist && sha256sum -c ./*linux*.sha256 && sha256sum -c source.sha256)
+          tar -xOf dist/*linux*.tar.gz "rabbitbin-$(tr -d '\r\n' < VERSION)-linux-x86_64-glibc2.28/BUILDINFO.txt" \
+            | grep -Fx "commit=$GITHUB_SHA"
           gh release create "$RELEASE_TAG" dist/*.tar.gz dist/*.sha256 \
             --verify-tag --title "RabbitBin $RELEASE_TAG — Linux x86-64" \
             --notes-file packaging/RELEASE_NOTES.md
