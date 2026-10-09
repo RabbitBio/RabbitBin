@@ -94,11 +94,26 @@ jobs:
           -DRABBITBIN_USE_SYSTEM_LIBDEFLATE=OFF
       - name: Build and smoke test
         run: |
-          cmake --build build --parallel 2
+          cmake --build build --parallel 2 2>&1 | tee "$RUNNER_TEMP/archive-build.log"
           ctest --test-dir build --output-on-failure -j2
-          test "$(./build/src/rabbitbin --version)" = "RabbitBin $(tr -d '\n' < VERSION) (commit ${GITHUB_SHA::12})"
+          actual=$(./build/src/rabbitbin --version)
+          expected="RabbitBin $(tr -d '\n' < VERSION) (commit ${GITHUB_SHA::12})"
+          if [ "$actual" != "$expected" ]; then
+            echo "::error::Archive version mismatch: actual=$actual expected=$expected"
+            exit 1
+          fi
           cmake --install build
           python3 test/test_installation.py --prefix "$PWD/install" --source "$PWD"
+      - name: Expose archive failure diagnostics
+        if: failure()
+        run: |
+          for log in "$RUNNER_TEMP/archive-build.log" build/Testing/Temporary/LastTest.log; do
+            if [ -f "$log" ]; then
+              while IFS= read -r line; do
+                printf '::notice::%s\n' "${line//%/%25}"
+              done < <(tail -n 35 "$log")
+            fi
+          done
 
   container:
     name: Docker image

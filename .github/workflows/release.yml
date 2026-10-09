@@ -9,9 +9,14 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: linux-release-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
 jobs:
   build:
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     container: rockylinux:8
     defaults:
       run:
@@ -34,12 +39,22 @@ jobs:
             -DRABBITBIN_USE_SYSTEM_HTSLIB=OFF -DRABBITBIN_USE_SYSTEM_LIBDEFLATE=OFF
       - name: Build, test and package
         run: |
-          cmake --build "$RUNNER_TEMP/build" --parallel 2
-          (cd "$RUNNER_TEMP/build" && ctest --output-on-failure --timeout 180 -j2)
-          bash scripts/package_linux.sh "$RUNNER_TEMP/build" "$RUNNER_TEMP/dist"
+          cmake --build "$RUNNER_TEMP/build" --parallel 2 2>&1 | tee "$RUNNER_TEMP/release-build.log"
+          (cd "$RUNNER_TEMP/build" && ctest --output-on-failure --timeout 180 -j2) 2>&1 | tee "$RUNNER_TEMP/release-test.log"
+          bash scripts/package_linux.sh "$RUNNER_TEMP/build" "$RUNNER_TEMP/dist" 2>&1 | tee "$RUNNER_TEMP/release-package.log"
           git archive --format=tar.gz --prefix="rabbitbin-$(tr -d '\r\n' < VERSION)-source/" \
             --output="$RUNNER_TEMP/dist/rabbitbin-$(tr -d '\r\n' < VERSION)-source.tar.gz" HEAD
           (cd "$RUNNER_TEMP/dist" && sha256sum *-source.tar.gz > source.sha256)
+      - name: Expose build failure diagnostics
+        if: failure()
+        run: |
+          for log in "$RUNNER_TEMP"/release-*.log; do
+            if [ -f "$log" ]; then
+              while IFS= read -r line; do
+                printf '::notice::%s\n' "${line//%/%25}"
+              done < <(tail -n 20 "$log")
+            fi
+          done
       - uses: actions/upload-artifact@v7
         with:
           name: linux-release
