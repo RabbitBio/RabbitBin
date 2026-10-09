@@ -85,6 +85,11 @@ jobs:
           git archive --format=tar --output="$RUNNER_TEMP/rabbitbin-source.tar" HEAD
           tar -xf "$RUNNER_TEMP/rabbitbin-source.tar" -C "$RUNNER_TEMP/rabbitbin-source"
           test "$(tr -d '\n' < "$RUNNER_TEMP/rabbitbin-source/SOURCE_REVISION")" = "$GITHUB_SHA"
+          # Archives preserve commit timestamps. A developer clock ahead of
+          # the runner can otherwise make Ninja regenerate its manifest forever.
+          date -u
+          stat -c '%y %n' "$RUNNER_TEMP/rabbitbin-source/CMakeLists.txt"
+          find "$RUNNER_TEMP/rabbitbin-source" -type f -exec touch -m {} +
       - name: Configure with all bundled fallbacks
         run: >-
           cmake -S "$RUNNER_TEMP/rabbitbin-source" -B build -G Ninja
