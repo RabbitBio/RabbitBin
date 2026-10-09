@@ -75,7 +75,16 @@ done < <(git -C "$source_dir" ls-files '*LICENSE*' '*COPYING*' '*license*')
 # Several vendored extensions carry their notices inside source headers, not
 # separate LICENSE files. Preserve those originals as well.
 cp -R "$source_dir/src/align/strobe/ext" "$package/licenses/vendored-strobe-extensions"
-cp /usr/share/licenses/boost/LICENSE_1_0.txt "$package/licenses/Boost.txt"
+# boost-devel may install individual component RPMs without the boost meta-RPM.
+boost_notice=
+for candidate in /usr/share/licenses/boost*/LICENSE_1_0.txt; do
+  if [ -f "$candidate" ]; then
+    boost_notice=$candidate
+    break
+  fi
+done
+test -n "$boost_notice"
+cp "$boost_notice" "$package/licenses/Boost.txt"
 mkdir -p "$package/licenses/GCC"
 cp /usr/share/licenses/gcc/COPYING* "$package/licenses/GCC/"
 cp "$build_dir/contrib/zlib-prefix/src/zlib/LICENSE" "$package/licenses/zlib.txt"

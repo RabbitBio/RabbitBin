@@ -31,6 +31,9 @@ jobs:
       - uses: actions/checkout@v7
       - name: Verify version and configure
         run: |
+          # The container runs as root while checkout files belong to the host
+          # runner. Trust only this checkout, never all mounted repositories.
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
           if [[ "$GITHUB_REF" == refs/tags/* ]]; then
             test "$GITHUB_REF_NAME" = "v$(tr -d '\r\n' < VERSION)"
           fi
