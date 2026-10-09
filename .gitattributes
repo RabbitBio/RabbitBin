@@ -1,0 +1,2 @@
+# Embed provenance in git archive / GitHub source archives without .git.
+SOURCE_REVISION export-subst

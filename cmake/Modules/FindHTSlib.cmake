@@ -72,13 +72,16 @@ macro(libfind_process PREFIX)
   endif(NOT ${PREFIX}_FOUND)
 endmacro(libfind_process)
 
-set(HTSLIB_SEARCH_DIRS ${HTSLIB_SEARCH_DIRS} $ENV{HTSLIB_ROOT} ${HTSLIB_ROOT})
-
-if(NOT HTSlib_NO_SYSTEM_PATHS)
-  set(HTSLIB_SEARCH_DIRS ${HTSLIB_SEARCH_DIRS} /usr /usr/local)
+set(_htslib_roots ${HTSLIB_ROOT} $ENV{HTSLIB_ROOT} ${HTSLIB_SEARCH_DIRS})
+set(_htslib_find_options "")
+if(HTSlib_NO_SYSTEM_PATHS)
+  # Keep explicitly supplied prefixes usable even when system lookup is off.
+  file(TO_CMAKE_PATH "$ENV{CMAKE_PREFIX_PATH}" _htslib_env_prefixes)
+  list(APPEND _htslib_roots ${CMAKE_PREFIX_PATH} ${_htslib_env_prefixes})
+  set(_htslib_find_options NO_DEFAULT_PATH)
 endif()
 
-set(_htslib_ver_path "htslib-${htslib_FIND_VERSION}")
+set(_htslib_ver_path "htslib-${HTSlib_FIND_VERSION}")
 
 # Use pkg-config to get hints about paths
 libfind_pkg_check_modules(HTSLIB_PKGCONF htslib)
@@ -87,9 +90,9 @@ libfind_pkg_check_modules(HTSLIB_PKGCONF htslib)
 find_path(
   HTSlib_INCLUDE_DIR
   NAMES ${HTSLIB_ADDITIONAL_HEADERS} htslib/sam.h
-  PATHS ${HTSLIB_SEARCH_DIRS} ${HTSLIB_PKGCONF_INCLUDE_DIRS}
+  HINTS ${_htslib_roots} ${HTSLIB_PKGCONF_INCLUDE_DIRS}
   PATH_SUFFIXES include htslib/${_htslib_ver_path}
-  NO_DEFAULT_PATH
+  ${_htslib_find_options}
 )
 
 if(HTSlib_USE_STATIC_LIBS)
@@ -115,9 +118,9 @@ endif()
 find_library(
   HTSlib_LIBRARY
   NAMES ${HTSlib_LIBRARY_names}
-  PATHS ${HTSlib_INCLUDE_DIR} ${HTSLIB_SEARCH_DIRS} ${HTSLIB_PKGCONF_LIBRARY_DIRS}
-  NO_DEFAULT_PATH
+  HINTS ${_htslib_roots} ${HTSLIB_PKGCONF_LIBRARY_DIRS}
   PATH_SUFFIXES lib lib64 lib/x86_64-linux-gnu ${_htslib_ver_path}
+  ${_htslib_find_options}
 )
 
 # Set the include dir variables and the libraries and let libfind_process do the rest. NOTE:
@@ -138,10 +141,20 @@ if(HTSlib_USE_STATIC_LIBS)
   endif()
 endif()
 
-# pkg-config is the authoritative version source for normal HTSlib development
-# installations.  Reject an older installation so the top-level build can use
-# its pinned fallback instead of failing later against an incompatible API.
-set(HTSlib_VERSION "${HTSLIB_PKGCONF_VERSION}")
+# Read the selected headers, not a possibly unrelated system pkg-config file.
+# HTS_VERSION encodes X.Y.Z as XYYYZZ (including development snapshots).
+set(HTSlib_VERSION "")
+if(EXISTS "${HTSlib_INCLUDE_DIR}/htslib/hts.h")
+  file(STRINGS "${HTSlib_INCLUDE_DIR}/htslib/hts.h" _htslib_version_line
+       REGEX "^[ \t]*#[ \t]*define[ \t]+HTS_VERSION[ \t]+[0-9]+")
+  if(_htslib_version_line MATCHES "HTS_VERSION[ \t]+([0-9]+)")
+    set(_htslib_version_number "${CMAKE_MATCH_1}")
+    math(EXPR _htslib_major "${_htslib_version_number} / 100000")
+    math(EXPR _htslib_minor "(${_htslib_version_number} / 100) % 1000")
+    math(EXPR _htslib_patch "${_htslib_version_number} % 100")
+    set(HTSlib_VERSION "${_htslib_major}.${_htslib_minor}.${_htslib_patch}")
+  endif()
+endif()
 libfind_process(HTSlib)
 
 if(HTSlib_FOUND AND HTSlib_FIND_VERSION AND HTSlib_VERSION AND

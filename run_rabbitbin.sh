@@ -10,12 +10,12 @@ PCTID=${PCTID:=97}
 MINDEPTH=${MINDEPTH:=1.0}
 RB_LABEL=${RB_LABEL:="bins"}
 
-if ! $RB --help >/dev/null 2>&1; then
+if ! "$RB" --help >/dev/null 2>&1; then
   echo "Please ensure RabbitBin is in PATH: could not find $RB" 1>&2
   exit 1
 fi
 
-if ! $SUM 2>/dev/null; then
+if ! "$SUM" 2>/dev/null; then
   echo "Please ensure depth utility is in PATH: could not find $SUM" 1>&2
   exit 1
 fi
@@ -33,12 +33,12 @@ Depth-stage environment variables:
 Full options: $RB --help
 "
 
-rbopts=""
+rbopts=()
 for arg in "$@"; do
   if [ -f "$arg" ]; then
     break
   fi
-  rbopts="$rbopts $arg"
+  rbopts+=("$arg")
   shift
 done
 
@@ -65,6 +65,7 @@ set -e
 
 depth=${assembly##*/}.depth.txt
 lock=$depth.BUILDING
+owns_lock=0
 
 waitforlock() {
   while [ -L "$lock" ]; do
@@ -73,30 +74,60 @@ waitforlock() {
   done
 }
 
-cleanup() { rm -f $lock; }
-trap cleanup 0 1 2 3 15
+cleanup() {
+  if [ "$owns_lock" = 1 ]; then
+    rm -f -- "$lock"
+  fi
+}
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
-waitforlock
 badmap=${assembly##*/}.d
-badmapopts=
+badmapopts=()
 if [ "$BADMAP" != '0' ]; then
   mkdir -p "${badmap}"
-  badmapopts="--unmappedFastq ${badmap}/badmap"
+  badmapopts=(--unmappedFastq "${badmap}/badmap")
 fi
 
-if [ ! -f "${depth}" ] && ln -s "$(uname -n) $$" $lock; then
-  if [ ! -f "${depth}" ]; then
-    sumopts="--outputDepth ${depth}.tmp --percentIdentity ${PCTID} --minContigLength 1000 --minContigDepth ${MINDEPTH} ${badmapopts} --referenceFasta ${assembly}"
-    echo "Running depth: $SUM $sumopts $* ($(date))"
-    $SUM $sumopts "$@" && mv ${depth}.tmp ${depth}
-  fi
-  rm -f $lock
-else
+while :; do
   waitforlock
-  echo "Using existing depth file: $depth"
-fi
+  if [ -f "$depth" ]; then
+    echo "Using existing depth file: $depth"
+    break
+  fi
+  if ln -s -- "$(uname -n) $$" "$lock"; then
+    owns_lock=1
+    # Another process may have finished between our existence check and lock.
+    if [ ! -f "$depth" ]; then
+      sumopts=(--outputDepth "${depth}.tmp" --percentIdentity "$PCTID"
+               --minContigLength 1000 --minContigDepth "$MINDEPTH"
+               "${badmapopts[@]}" --referenceFasta "$assembly")
+      printf 'Running depth:'
+      printf ' %q' "$SUM" "${sumopts[@]}" "$@"
+      printf '\n'
+      if ! "$SUM" "${sumopts[@]}" "$@"; then
+        echo "Depth generation failed; binning was not started." >&2
+        exit 1
+      fi
+      mv -- "${depth}.tmp" "$depth"
+    fi
+    cleanup
+    owns_lock=0
+    break
+  fi
+  # A concurrent writer owns a symlink lock; wait and retry. Other failures
+  # (permissions, a non-lock file at this path) must not masquerade as a cache.
+  if [ ! -L "$lock" ]; then
+    echo "Cannot acquire depth lock: $lock" >&2
+    exit 1
+  fi
+done
 
 outname=${assembly##*/}.rabbitbin-${RB_LABEL}-$(date '+%Y%m%d_%H%M%S')/out
-echo "Running RabbitBin: $RB $rbopts -a $assembly -o $outname -d ${depth} ($(date))"
-$RB $rbopts --assembly "$assembly" --output "$outname" --depth "${depth}"
+printf 'Running RabbitBin:'
+printf ' %q' "$RB" "${rbopts[@]}" --assembly "$assembly" --output "$outname" --depth "$depth"
+printf '\n'
+"$RB" "${rbopts[@]}" --assembly "$assembly" --output "$outname" --depth "$depth"
 echo "Finished RabbitBin ($(date))"

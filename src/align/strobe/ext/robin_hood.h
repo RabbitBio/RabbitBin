@@ -39,6 +39,7 @@
 #define ROBIN_HOOD_VERSION_PATCH 1  // for backwards-compatible bug fixes
 
 #include <algorithm>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <functional>
@@ -2528,4 +2529,3 @@ struct hash<std::basic_string_view<CharT>> {
 } // namespace robin_hood
 
 #endif
-

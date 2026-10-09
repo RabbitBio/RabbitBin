@@ -36,6 +36,21 @@ function(GET_VERSION PREFIX)
     endif()
   endif()
 
+  # git archive expands SOURCE_REVISION through .gitattributes. Plain source
+  # copies may retain the placeholder; do not mistake it for a real revision.
+  if(RB_GIT_COMMIT STREQUAL "unknown" AND
+     EXISTS "${CMAKE_SOURCE_DIR}/SOURCE_REVISION")
+    file(READ "${CMAKE_SOURCE_DIR}/SOURCE_REVISION" _ARCHIVE_REVISION)
+    string(STRIP "${_ARCHIVE_REVISION}" _ARCHIVE_REVISION)
+    string(LENGTH "${_ARCHIVE_REVISION}" _ARCHIVE_REVISION_LENGTH)
+    if(_ARCHIVE_REVISION MATCHES "^[0-9a-fA-F]+$" AND
+       (_ARCHIVE_REVISION_LENGTH EQUAL 40 OR _ARCHIVE_REVISION_LENGTH EQUAL 64))
+      string(SUBSTRING "${_ARCHIVE_REVISION}" 0 12 RB_GIT_COMMIT)
+    endif()
+  endif()
+
+  set(${PREFIX}_VERSION_STRING "${RB_VERSION_STRING}" PARENT_SCOPE)
+  set(${PREFIX}_GIT_COMMIT "${RB_GIT_COMMIT}" PARENT_SCOPE)
   set(VERSION_DIR "${PROJECT_BINARY_DIR}/makeVersionFile")
   file(MAKE_DIRECTORY "${VERSION_DIR}")
 

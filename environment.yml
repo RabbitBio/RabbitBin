@@ -1,0 +1,19 @@
+name: rabbitbin
+channels:
+  - conda-forge
+  - bioconda
+  - nodefaults
+dependencies:
+  - cmake >=3.16
+  - make
+  - c-compiler
+  - cxx-compiler
+  - boost-cpp >=1.66
+  - zlib >=1.2.11
+  - htslib >=1.13
+  - libdeflate
+  - pkg-config
+  - git
+  # These are for the complete regression suite, not core binning.
+  - python >=3.6
+  - samtools >=1.13

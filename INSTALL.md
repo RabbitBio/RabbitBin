@@ -11,6 +11,8 @@ installation route.
   `serialization`, `iostreams`, and `regex`)
 - Git, Make, Autoconf, Automake, Libtool, and pkg-config
 - zlib 1.2.11+, HTSlib 1.13+, and libdeflate
+- Python 3.6+ and samtools for all regression tests; the core executable does
+  not require either interpreter or external samtools at runtime
 
 RabbitBin first uses installed zlib, HTSlib and libdeflate development
 packages. Missing copies are downloaded at pinned revisions and built locally;
@@ -26,7 +28,7 @@ cmake -S . -B build \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_INSTALL_PREFIX="$HOME/.local"
 cmake --build build --parallel
-ctest --test-dir build --output-on-failure
+(cd build && ctest --output-on-failure)
 cmake --install build
 "$HOME/.local/bin/rabbitbin" --version
 ```
@@ -51,13 +53,51 @@ make their `lib` directory available to the dynamic loader.
 ## Optional Conda environment
 
 ```bash
-conda create -n rabbitbin -c conda-forge \
-  cmake make compilers boost-cpp zlib htslib libdeflate
+CONDA_CHANNEL_PRIORITY=strict conda env create -f environment.yml
 conda activate rabbitbin
-cmake -S . -B build-conda -DCMAKE_BUILD_TYPE=Release
+cmake -S . -B build-conda -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_PREFIX_PATH="$CONDA_PREFIX" -DCMAKE_INSTALL_PREFIX="$CONDA_PREFIX"
 cmake --build build-conda --parallel
-ctest --test-dir build-conda --output-on-failure
+(cd build-conda && ctest --output-on-failure)
+cmake --install build-conda
+rabbitbin --version
 ```
+
+`environment.yml` includes `conda-forge`, `bioconda` and `nodefaults`; HTSlib
+and samtools come from bioconda. It installs C/C++ compilers and all test
+dependencies. Always configure a fresh build directory after changing the
+dependency environment: CMake caches previously selected library locations.
+`CMAKE_PREFIX_PATH` is also supported for non-Conda dependency prefixes;
+`HTSLIB_ROOT` can locate an HTSlib-only installation.
+
+## Source archives and version provenance
+
+Git source archives have no `.git` directory. `git archive` substitutes the
+commit into `SOURCE_REVISION` via `.gitattributes`, and CMake uses it when Git
+checkout metadata is absent. Build and test the extracted directory with the
+same commands as above; cloning is not required for this route.
+
+Plain source copies with no revision metadata report `commit unknown` and
+still build and test. A release packager can explicitly supply a known source
+revision with `-DRABBITBIN_SOURCE_REVISION=<commit>`. Do not label modified
+sources with the revision of an unmodified release.
+
+## Installation smoke test
+
+After installing, check the installed executables from outside the source
+directory. From the checkout, for a per-user install:
+
+```bash
+python3 test/test_installation.py --prefix "$HOME/.local" --source .
+```
+
+For the Conda install, use `--prefix "$CONDA_PREFIX"`. The test creates a
+temporary working directory, clears RabbitBin tuning and dynamic-loader
+overrides, and checks version/help, BAM binning, compressed FASTA + depth,
+and the convenience wrapper with space-containing paths. It uses only the
+repository's small fixtures and does not run CAMI2 benchmarks. Python tests
+are skipped with a configure message when their prerequisites are absent;
+install Python and samtools to run the complete suite.
 
 ## Optional Docker image
 

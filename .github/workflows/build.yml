@@ -28,7 +28,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y cmake ninja-build libboost-all-dev zlib1g-dev \
-            libhts-dev libdeflate-dev libomp-dev
+            libhts-dev libdeflate-dev libomp-dev python3 samtools
       - name: Configure
         env:
           CC: ${{ matrix.cc }}
@@ -37,17 +37,40 @@ jobs:
       - name: Build
         run: cmake --build build --parallel 2
       - name: Test
-        run: ctest --test-dir build --output-on-failure -j2
+        run: |
+          ctest --test-dir build --output-on-failure -R '^test_rabbitbin$'
+          ctest --test-dir build --output-on-failure -j2
       - name: Install and smoke test
         run: |
           cmake --install build
-          ./install/bin/rabbitbin --version
-          ./install/bin/rabbitbin --help >/dev/null
-          ./install/bin/rabbitbin bin --assembly test/contigs.fa \
-            --output smoke/out --threads 2 --min-bin-size 0
+          python3 test/test_installation.py --prefix "$PWD/install" --source "$PWD"
+
+  conda:
+    name: Current Conda C/C++ toolchain
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        shell: bash -el {0}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: conda-incubator/setup-miniconda@v4
+        with:
+          activate-environment: rabbitbin
+          environment-file: environment.yml
+          channel-priority: strict
+          miniforge-version: latest
+      - name: Configure, build and test
+        run: |
+          cmake -S . -B build-conda -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_PREFIX_PATH="$CONDA_PREFIX" -DCMAKE_INSTALL_PREFIX="$PWD/install"
+          cmake --build build-conda --parallel 2
+          ctest --test-dir build-conda --output-on-failure -j2
+          cmake --install build-conda
+          python3 test/test_installation.py --prefix "$PWD/install" --source "$PWD" \
+            --build-dir build-conda --dependency-prefix "$CONDA_PREFIX"
 
   bundled-dependencies:
-    name: Pinned dependency fallback
+    name: Source archive and pinned dependency fallback
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
@@ -55,19 +78,27 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential cmake ninja-build git autoconf \
-            automake libtool pkg-config libboost-all-dev
+            automake libtool pkg-config libboost-all-dev python3 samtools
+      - name: Export a source archive without Git metadata
+        run: |
+          mkdir "$RUNNER_TEMP/rabbitbin-source"
+          git archive --format=tar --output="$RUNNER_TEMP/rabbitbin-source.tar" HEAD
+          tar -xf "$RUNNER_TEMP/rabbitbin-source.tar" -C "$RUNNER_TEMP/rabbitbin-source"
+          test "$(tr -d '\n' < "$RUNNER_TEMP/rabbitbin-source/SOURCE_REVISION")" = "$GITHUB_SHA"
       - name: Configure with all bundled fallbacks
         run: >-
-          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake -S "$RUNNER_TEMP/rabbitbin-source" -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$PWD/install"
           -DRABBITBIN_USE_SYSTEM_ZLIB=OFF
           -DRABBITBIN_USE_SYSTEM_HTSLIB=OFF
           -DRABBITBIN_USE_SYSTEM_LIBDEFLATE=OFF
       - name: Build and smoke test
         run: |
           cmake --build build --parallel 2
-          ./build/src/rabbitbin --version
-          ./build/src/rabbitbin bin --assembly test/contigs.fa \
-            --output smoke/out --threads 2 --min-bin-size 0
+          ctest --test-dir build --output-on-failure -j2
+          test "$(./build/src/rabbitbin --version)" = "RabbitBin $(tr -d '\n' < VERSION) (commit ${GITHUB_SHA::12})"
+          cmake --install build
+          python3 test/test_installation.py --prefix "$PWD/install" --source "$PWD"
 
   container:
     name: Docker image

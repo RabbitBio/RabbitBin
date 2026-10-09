@@ -34,6 +34,7 @@ configured with `-DRABBITBIN_ENABLE_MAP=ON`.
 - `git`, `make`, and Autotools when dependencies must be downloaded
 - **zlib** ≥ 1.2.11, **HTSlib** ≥ 1.13, and **libdeflate** — pinned copies
   are downloaded automatically when development packages are unavailable
+- Python 3.6+ and `samtools` for the complete test suite (not core binning)
 
 ## Build
 
@@ -60,7 +61,7 @@ git clone https://github.com/RabbitBio/RabbitBin.git
 cd RabbitBin
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --parallel
-ctest --test-dir build --output-on-failure
+(cd build && ctest --output-on-failure)
 # binary: build/src/rabbitbin
 ```
 
@@ -82,12 +83,21 @@ cmake --build build-native --parallel
 Conda can be used as an optional dependency manager:
 
 ```bash
-conda create -n rabbitbin -c conda-forge \
-  cmake make compilers boost-cpp zlib htslib libdeflate
+CONDA_CHANNEL_PRIORITY=strict conda env create -f environment.yml
 conda activate rabbitbin
-cmake -S . -B build-conda -DCMAKE_BUILD_TYPE=Release
+cmake -S . -B build-conda -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_PREFIX_PATH="$CONDA_PREFIX" -DCMAKE_INSTALL_PREFIX="$CONDA_PREFIX"
 cmake --build build-conda --parallel
+(cd build-conda && ctest --output-on-failure)
+cmake --install build-conda
+rabbitbin --version
 ```
+
+The environment file specifies both `conda-forge` and `bioconda` (HTSlib and
+samtools), plus the full test dependencies. The explicit CMake prefix keeps
+the build pointed at this environment. Use a fresh build directory when
+switching environments so cached system-library paths are not reused.
+See [INSTALL.md](INSTALL.md) for source archives and installation smoke tests.
 
 After pulling new changes, configure a fresh build directory:
 
