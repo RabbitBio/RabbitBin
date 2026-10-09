@@ -3,6 +3,22 @@
 Conda and Docker are optional. A normal system compiler build is the primary
 installation route.
 
+## Precompiled Linux release
+
+Reviewers can use the Linux x86-64 / glibc 2.28+ archive from
+[GitHub Releases](https://github.com/RabbitBio/RabbitBin/releases). It bundles
+non-glibc runtime libraries and does not require compilation or Conda. Keep
+`bin/` and `lib/` together, verify the accompanying SHA-256 file, then run
+`bin/rabbitbin --version`. The package includes tiny test inputs and
+`bash test/binary_smoke.sh` for an offline installation check.
+
+See [binary instructions](packaging/README.binary.md) and
+[known limitations](packaging/RELEASE_NOTES.md). Source builds remain available
+for other environments. Maintainers can reproduce packaging with
+`bash scripts/package_linux.sh BUILD_DIR OUTPUT_DIR` after a clean, tested
+Rocky Linux 8 build with all three bundled dependency options enabled; the
+release workflow records the complete recipe and tests fresh runtime images.
+
 ## Requirements
 
 - CMake 3.16 or newer

@@ -1,0 +1,94 @@
+name: linux-binary-release
+
+on:
+  push:
+    branches: ['fix/install-compatibility-20261009']
+    tags: ['v[0-9]*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    container: rockylinux:8
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Install build and test tools
+        run: |
+          dnf install -y dnf-plugins-core epel-release
+          dnf config-manager --set-enabled powertools
+          dnf install -y gcc gcc-c++ cmake make git autoconf automake libtool \
+            pkgconf-pkg-config boost-devel python3 samtools patchelf binutils tar gzip which findutils
+      - uses: actions/checkout@v7
+      - name: Verify version and configure
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            test "$GITHUB_REF_NAME" = "v$(tr -d '\r\n' < VERSION)"
+          fi
+          cmake -S . -B "$RUNNER_TEMP/build" -DCMAKE_BUILD_TYPE=Release \
+            -DRABBITBIN_NATIVE_ARCH=OFF -DRABBITBIN_USE_SYSTEM_ZLIB=OFF \
+            -DRABBITBIN_USE_SYSTEM_HTSLIB=OFF -DRABBITBIN_USE_SYSTEM_LIBDEFLATE=OFF
+      - name: Build, test and package
+        run: |
+          cmake --build "$RUNNER_TEMP/build" --parallel 2
+          (cd "$RUNNER_TEMP/build" && ctest --output-on-failure --timeout 180 -j2)
+          bash scripts/package_linux.sh "$RUNNER_TEMP/build" "$RUNNER_TEMP/dist"
+          git archive --format=tar.gz --prefix="rabbitbin-$(tr -d '\r\n' < VERSION)-source/" \
+            --output="$RUNNER_TEMP/dist/rabbitbin-$(tr -d '\r\n' < VERSION)-source.tar.gz" HEAD
+          (cd "$RUNNER_TEMP/dist" && sha256sum *-source.tar.gz > source.sha256)
+      - uses: actions/upload-artifact@v7
+        with:
+          name: linux-release
+          path: |
+            ${{ runner.temp }}/dist/*.tar.gz
+            ${{ runner.temp }}/dist/*.sha256
+          if-no-files-found: error
+
+  clean-runtime:
+    needs: build
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ['rockylinux:8', 'ubuntu:22.04', 'ubuntu:24.04']
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: linux-release
+          path: dist
+      - name: Verify and test without installing dependencies
+        env:
+          TEST_IMAGE: ${{ matrix.image }}
+        run: |
+          cd dist
+          sha256sum -c ./*linux*.sha256
+          mkdir unpacked
+          tar -xzf ./*linux*.tar.gz -C unpacked
+          package=$(find "$PWD/unpacked" -mindepth 1 -maxdepth 1 -type d)
+          docker run --rm --network none -v "$package:/opt/rabbitbin:ro" \
+            "$TEST_IMAGE" bash /opt/rabbitbin/test/binary_smoke.sh
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [build, clean-runtime]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: linux-release
+          path: dist
+      - name: Publish verified assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$RELEASE_TAG" dist/*.tar.gz dist/*.sha256 \
+            --verify-tag --title "RabbitBin $RELEASE_TAG — Linux x86-64" \
+            --notes-file packaging/RELEASE_NOTES.md
