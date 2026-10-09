@@ -54,8 +54,10 @@ for library in "$package"/lib/*; do
   "$patchelf" --set-rpath '$ORIGIN' "$library"
 done
 for exe in rabbitbin rabbit_depth rabbit_overlap; do
-  "$patchelf" --set-rpath '$ORIGIN/../lib' "$package/bin/$exe"
+  # Older binutils can corrupt relocated .dynstr sections if strip is run
+  # after patchelf. Strip the original ELF first; patching must be the last edit.
   strip --strip-unneeded "$package/bin/$exe"
+  "$patchelf" --set-rpath '$ORIGIN/../lib' "$package/bin/$exe"
 done
 
 # A newer build host or accidentally selected runtime must not silently raise
@@ -118,6 +120,8 @@ cp "$source_dir/test/contigs.fa" "$source_dir/test/contigs-1000.fastq.bam" \
   printf 'native_arch=OFF\n'
   gcc --version | head -n 1
   cmake --version | head -n 1
+  "$patchelf" --version
+  strip --version | head -n 1
   for dep in zlib-prefix/src/zlib htslib-prefix/src/htslib libdeflate-prefix/src/libdeflate_external; do
     printf '%s=' "$dep"
     git -C "$build_dir/contrib/$dep" rev-parse HEAD
