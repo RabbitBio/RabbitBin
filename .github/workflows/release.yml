@@ -70,6 +70,18 @@ jobs:
           git archive --format=tar.gz --prefix="rabbitbin-$(tr -d '\r\n' < VERSION)-source/" \
             --output="$RUNNER_TEMP/dist/rabbitbin-$(tr -d '\r\n' < VERSION)-source.tar.gz" HEAD
           (cd "$RUNNER_TEMP/dist" && sha256sum *-source.tar.gz > source.sha256)
+      - name: Stage the complete release artifact
+        run: |
+          # Upload one workspace-relative directory, not multiple absolute
+          # container paths. Assert every asset before transferring it.
+          version=$(tr -d '\r\n' < VERSION)
+          mkdir release-assets
+          cp -- "$RUNNER_TEMP/dist/rabbitbin-$version-linux-x86_64-glibc2.28.tar.gz" \
+            "$RUNNER_TEMP/dist/rabbitbin-$version-linux-x86_64-glibc2.28.tar.gz.sha256" \
+            "$RUNNER_TEMP/dist/rabbitbin-$version-source.tar.gz" \
+            "$RUNNER_TEMP/dist/source.sha256" release-assets/
+          (cd release-assets && sha256sum -c ./*.sha256)
+          test "$(find release-assets -type f | wc -l)" -eq 4
       - name: Expose build failure diagnostics
         if: failure()
         run: |
@@ -85,9 +97,8 @@ jobs:
       - uses: actions/upload-artifact@v7
         with:
           name: linux-release
-          path: |
-            ${{ runner.temp }}/dist/*.tar.gz
-            ${{ runner.temp }}/dist/*.sha256
+          path: release-assets/
+          archive: true
           if-no-files-found: error
 
   clean-runtime:
@@ -106,13 +117,27 @@ jobs:
         env:
           TEST_IMAGE: ${{ matrix.image }}
         run: |
-          cd dist
-          sha256sum -c ./*linux*.sha256
-          mkdir unpacked
-          tar -xzf ./*linux*.tar.gz -C unpacked
-          package=$(find "$PWD/unpacked" -mindepth 1 -maxdepth 1 -type d)
-          docker run --rm --network none -v "$package:/opt/rabbitbin:ro" \
-            "$TEST_IMAGE" bash /opt/rabbitbin/test/binary_smoke.sh
+          {
+            cd dist
+            find . -type f
+            sha256sum -c ./*linux*.sha256
+            sha256sum -c source.sha256
+            mkdir unpacked
+            tar -xzf ./*linux*.tar.gz -C unpacked
+            package=$(find "$PWD/unpacked" -mindepth 1 -maxdepth 1 -type d)
+            docker run --rm --network none -v "$package:/opt/rabbitbin:ro" \
+              "$TEST_IMAGE" bash /opt/rabbitbin/test/binary_smoke.sh
+          } 2>&1 | tee "$RUNNER_TEMP/release-runtime.log"
+      - name: Expose runtime failure diagnostics
+        if: failure()
+        run: |
+          if [ -f "$RUNNER_TEMP/release-runtime.log" ]; then
+            message=$(tail -n 50 "$RUNNER_TEMP/release-runtime.log")
+            message=${message//%/%25}
+            message=${message//$'\r'/%0D}
+            message=${message//$'\n'/%0A}
+            printf '::notice title=Runtime failure details::%s\n' "$message"
+          fi
 
   publish:
     if: >-
