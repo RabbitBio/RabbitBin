@@ -7,16 +7,13 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         libgomp1 \
         libhts3t64 \
-        libnuma1 \
         libboost-filesystem1.83.0 \
         libboost-graph1.83.0 \
         libboost-iostreams1.83.0 \
         libboost-program-options1.83.0 \
         libboost-regex1.83.0 \
         libboost-serialization1.83.0 \
-        libboost-system1.83.0 \
-        perl \
-        python3 && \
+        libboost-system1.83.0 && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
@@ -30,11 +27,16 @@ RUN apt-get update && \
         autoconf \
         automake \
         git \
-        libboost-all-dev \
+        libboost-program-options-dev \
+        libboost-filesystem-dev \
+        libboost-system-dev \
+        libboost-graph-dev \
+        libboost-serialization-dev \
+        libboost-iostreams-dev \
+        libboost-regex-dev \
         libdeflate-dev \
         libtool \
         cmake \
-        libncurses-dev \
         pkg-config \
         zlib1g-dev \
         libhts-dev && \
@@ -46,7 +48,8 @@ RUN cd /src/RabbitBin && \
     mkdir build && cd build && \
     cmake -DCMAKE_INSTALL_PREFIX=/usr/local \
           -DRABBITBIN_SOURCE_REVISION="${RABBITBIN_SOURCE_REVISION}" \
-          -DRABBITBIN_NATIVE_ARCH=OFF .. && \
+          -DRABBITBIN_NATIVE_ARCH=OFF \
+          -DNO_TESTING=ON .. && \
     make -j$(nproc) rabbitbin rabbit_depth rabbit_overlap && \
     make install && \
     rm -rf build

@@ -59,9 +59,20 @@ jobs:
           environment-file: environment.yml
           channel-priority: strict
           miniforge-version: latest
-      - name: Configure, build and test
+      - name: Build and check the minimal user environment
         run: |
-          cmake -S . -B build-conda -DCMAKE_BUILD_TYPE=Release \
+          cmake -S . -B build-core -DCMAKE_BUILD_TYPE=Release -DNO_TESTING=ON \
+            -DCMAKE_PREFIX_PATH="$CONDA_PREFIX" -DCMAKE_INSTALL_PREFIX="$PWD/install-core"
+          cmake --build build-core --parallel 2
+          cmake --install build-core
+          bash test/core_smoke.sh "$PWD/install-core/bin/rabbitbin"
+      - name: Add optional regression tools
+        run: >-
+          conda install --yes --override-channels --strict-channel-priority
+          -c conda-forge -c bioconda 'python>=3.6' 'samtools>=1.13'
+      - name: Configure, build and run the full regression suite
+        run: |
+          cmake -S . -B build-conda -DCMAKE_BUILD_TYPE=Release -DNO_TESTING=OFF \
             -DCMAKE_PREFIX_PATH="$CONDA_PREFIX" -DCMAKE_INSTALL_PREFIX="$PWD/install"
           cmake --build build-conda --parallel 2
           ctest --test-dir build-conda --output-on-failure -j2
@@ -136,3 +147,5 @@ jobs:
         run: |
           docker run --rm rabbitbin:ci sh -c \
             'ldd /usr/local/bin/rabbitbin && rabbitbin --version'
+          docker run --rm --network none -v "$PWD/test:/fixtures:ro" rabbitbin:ci \
+            bash /fixtures/core_smoke.sh /usr/local/bin/rabbitbin

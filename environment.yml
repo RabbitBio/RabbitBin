@@ -1,3 +1,5 @@
+# Source-build dependencies only. Optional regression tools are documented in
+# docs/testing.md; core BAM binning needs neither Python nor external samtools.
 name: rabbitbin
 channels:
   - conda-forge
@@ -14,6 +16,3 @@ dependencies:
   - libdeflate
   - pkg-config
   - git
-  # These are for the complete regression suite, not core binning.
-  - python >=3.6
-  - samtools >=1.13
